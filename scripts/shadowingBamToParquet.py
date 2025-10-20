@@ -1,5 +1,5 @@
 '''
-July 2, 2025
+October 20, 2025
 LT
 
 This script processes a BAM file to extract per-read info and saves data efficiently using a generator,
