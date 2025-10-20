@@ -57,19 +57,19 @@ def parsePickleFile(pickleFile):
     ##
     return bb
 
-def formatForMCA(dataDict,numReads,minEditFreq):
+def formatForPCA(dataDict,numReads,minEditFreq,smoothingWindow, positionWindow=(20,695)):
     """
     dataDict={bc:{readID:{position:1/0}}}
     numReads is an integer.
     minEditFreq is a frequency (e.g., 0.7)
     Will sort each bc's readIDs by longest -> shortest, and then select the
     numReads longest reads with at least minEditFreq of 1's
-    Will then convert to a list-of-lists like:
+    Will then convert to a list-of-lists like:  
     [[0,1,1,0,...,1],
      [1,1,0,1,...,1],
      ...
      [1,0,0,0,...,0]]
-     where each row represents a different readID. Will also return a list
+     where each row represents a different readID. I'll then smooth the data using a rolling window. This will transform the data from binary to continuous values. Will also return a list
      of bcs, which are the row labels.
     """
     aa=[]
@@ -92,6 +92,7 @@ def formatForMCA(dataDict,numReads,minEditFreq):
                 break
         ##
         aa+=temp2
+    ##
     ##
     ##now get all the positions
     positions=[]
@@ -116,60 +117,72 @@ def formatForMCA(dataDict,numReads,minEditFreq):
                 v=numpy.nan##in case no value
             temp.append(v)
         ##
-        matrixOfEdits.append(temp)
+        ##now do smoothing using a rolling window
+        series = pd.Series(temp)
+        smoothed = series.rolling(window=smoothingWindow, min_periods=1, center=True).mean()
+        matrixOfEdits.append(smoothed.tolist())
     ##
     return matrixOfEdits,listOfBCs
 
-def doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
+def doPCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
     """
-    matrixOfEdits is a list of lists, where each list is a list of 1/0/nan
-    indicated edit status. listOfBCs are the labels associated with that.
-    Will run MCA and plot the first two components.
+    matrixOfEdits is a list of lists, where each list is a list of smoothed 1/0/nan
+    listOfBCs is a list of bc labels for each row in matrixOfEdits
+    outPrefix is the prefix for output files
     """
-    ##convert to DF
-    X = pd.DataFrame(matrixOfEdits,\
-        columns=['A%s'%(ii) for ii in range(len(matrixOfEdits[0]))])
-    ##initialize mca
-    mca = prince.MCA(n_components=5, n_iter=5, \
-        copy=True, check_input=True, engine='sklearn', \
-        random_state=42)
+    df = pd.DataFrame(matrixOfEdits)
+    # get indices of rows with any NaN values
+    nan_indices = df.index[df.isnull().any(axis=1)]
+    # drop rows with NaN values
+    df = df.drop(nan_indices)
+    listOfBCs = [listOfBCs[i] for i in range(len(listOfBCs)) if i not in nan_indices]
     ##
-    mca_fit = mca.fit(X)
-    X_mca = mca_fit.transform(X)
-    ##create labels, but don't actually attached them to the DF
+    pca = prince.PCA(
+        n_components=5,
+        n_iter=5,
+        copy=True,
+        check_input=True,
+        engine='sklearn',
+        random_state=42
+    )
+    pca = pca.fit(df)
+    X_pca = pca.transform(df)
+    ##
     labels = pd.Series(listOfBCs, name='label')
     ##add the labels
-    X_mca['label'] = labels.values
+    X_pca['label'] = labels.values
     ##print some results
-    print(mca.eigenvalues_summary)
-    print(mca.column_coordinates(X))
+    print(pca.eigenvalues_summary)
+    print(pca.column_coordinates_)
+    plt.figure(figsize=(8, 6))
     ##
     for ii in range(4):
         ##plot the data
         fig, ax = plt.subplots(figsize=(6, 6))
-        for label in X_mca['label'].unique():
-            subset = X_mca[X_mca['label'] == label]
+        for label in X_pca['label'].unique():
+            subset = X_pca[X_pca['label'] == label]
             ax.scatter(subset[ii], subset[ii+1], label=label)
         ##set axis labels
-        ax.set_title('MCA of Binary Vectors')
-        ax.set_xlabel('MCA Dimension %s'%(ii+1))##+1 b/c python 0-based
-        ax.set_ylabel('MCA Dimension %s'%(ii+2))
+        ax.set_title('PCA of Binary Vectors')
+        ax.set_xlabel('PCA Dimension %s'%(ii+1))##+1 b/c python 0-based
+        ax.set_ylabel('PCA Dimension %s'%(ii+2))
         ax.legend()
         ##save output
         plt.savefig('%s.%s.%s.png'%(outPrefix,ii,ii+1))
         plt.close()
 
+
 def main(args):
-    pickleFile,numReads,minEdit,outPrefix=args[0:]
+    pickleFile,numReads,minEdit,smoothingWindow,outPrefix=args[0:]
     ##
     dataDict=parsePickleFile(pickleFile)
     print(len(dataDict))
     ##
-    matrixOfEdits,listOfBCs=formatForMCA(dataDict,int(numReads),\
-        float(minEdit))
+    matrixOfEdits,listOfBCs=formatForPCA(dataDict,int(numReads), \
+        float(minEdit),int(smoothingWindow), positionWindow=(20,695))
     print(len(matrixOfEdits))
     ##
-    doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix)
+    doPCAandPlot(matrixOfEdits,listOfBCs,outPrefix)
 
 if __name__=='__main__':
     Tee()
