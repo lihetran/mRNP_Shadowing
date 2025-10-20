@@ -16,27 +16,50 @@ import pandas as pd
 import sys
 
 def get_absolute_positions(read):
-    '''Calculate absolute positions of the read in reference based on CIGAR and alignment start'''
-    start = read.reference_start
+    '''need to calculate absolute position of the read in the reference sequence, will do this by getting the start of 
+    the alignment (4th field in the sam file) and the CIGAR string (5th field in the sam file) to get the absolute positions.'''
+    # get the start position of the read
+    start = read.query_alignment_start
+    # get the CIGAR string
+    cigar_string = read.cigarstring
+    # get the aligned positions
     aligned_positions = []
     ref_pos = start
-    cigar_tuples = read.cigartuples  # list of (operation, length)
-
-    # CIGAR operation codes from pysam docs:
-    # 0:M, 1:I, 2:D, 3:N, 4:S, 5:H, 6:P, 7:=, 8:X
-    for op, length in cigar_tuples:
-        if op == 0 or op == 7 or op == 8:  # M, =, X -> aligned to reference
-            aligned_positions.extend(range(ref_pos, ref_pos + length))
-            ref_pos += length
-        elif op == 1:  # insertion to reference
-            aligned_positions.extend([None] * length)
-        elif op == 2 or op == 3:  # deletion or skipped region in reference
-            ref_pos += length
-        elif op in [4,5,6]:  # clipping or padding - no reference advance
-            pass
+    for i in range(len(cigar_string)):
+        if cigar_string[i].isdigit():
+            continue
         else:
-            pass
+            length = int(cigar_string[:i])
+            if cigar_string[i] == 'M':  # match or mismatch
+                aligned_positions.extend(range(ref_pos, ref_pos + length))
+                ref_pos += length
+            elif cigar_string[i] == 'I':  # insertion
+                aligned_positions.extend([None] * length)  # None for insertion
+            elif cigar_string[i] == 'D':  # deletion
+                ref_pos += length  # skip these positions in the reference
+            cigar_string = cigar_string[i + 1:]
+            break
+    # continue processing the remaining CIGAR string
+    while cigar_string:
+        for i in range(len(cigar_string)):
+            if cigar_string[i].isdigit():
+                continue
+            else:
+                length = int(cigar_string[:i])
+                if cigar_string[i] == 'M':  # match or mismatch
+                    aligned_positions.extend(range(ref_pos, ref_pos + length))
+                    ref_pos += length
+                elif cigar_string[i] == 'I':  # insertion
+                    aligned_positions.extend([None] * length)  # None for insertion
+                elif cigar_string[i] == 'D':  # deletion
+                    ref_pos += length  # skip these positions in the reference
+                cigar_string = cigar_string[i + 1:]
+                break
+    # print(f"Read {read.query_name} aligned positions: {aligned_positions}")
+    
+
     return aligned_positions
+
 
 def read_generator(bam_path, ref_sequence, chrom):
     '''Yield one read dict at a time'''
