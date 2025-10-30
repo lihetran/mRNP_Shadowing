@@ -1,7 +1,7 @@
 """
 October 20, 2025 - Liam Tran
 
-Script to perform Multiple Correspondence Analysis on an oligo shadowing
+Script to perform Multiple Correspondence Analysis on an ribosome shadowing
     expt.
 
 Input: pickle2 - a pickled file from Liam
@@ -12,9 +12,11 @@ Input: pickle2 - a pickled file from Liam
 Output: plot of first two components from PCA, colored by bc of the
     library they come from.
 
-run as python3 pcaPrinceOligoShadowing.py pickle2 numReads minEdit 
+run as python3 mcaPrinceRibosomeShadowing.py pickle2 numReads minEdit 
     outPrefix
 """
+from operator import pos
+from pathlib import Path
 import sys, common, pickle, collections, numpy
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -57,19 +59,63 @@ def parsePickleFile(pickleFile):
     ##
     return bb
 
-def formatForPCA(dataDict,numReads,minEditFreq,maxEditFreq,smoothingWindow,positionWindow=(20,695)):
+def parseParquetFile(parquetDir, pattern="*.parquet", sort=True, num_files=None):
+    """
+    Given a directory of parquet files, will output a dict of the format:
+    {bc:{readID:{position:edit}}} where position has to be an A in the ref
+    """
+    
+    directory = Path(parquetDir)
+    parquet_files = sorted(directory.glob(pattern)) if sort else list(directory.glob(pattern))
+    
+    if not parquet_files:
+        raise FileNotFoundError(f"No Parquet files found in {directory} matching pattern '{pattern}'")
+
+    if num_files is not None:
+        parquet_files = parquet_files[:num_files]
+
+    
+    dfs = [pd.read_parquet(f) for f in parquet_files]
+    ##
+    bb=collections.defaultdict(lambda:collections.defaultdict(dict))      
+    ##
+    for df in dfs:
+        for _, row in df.iterrows():
+            barCode = row['barcode']
+            readID = row['read_id']
+            position = row['absolute_indices']
+            editString = row['edit_string']
+            read_sequence = row['read_sequence_aligned']
+            ref_sequence = row['ref_sequence_aligned']
+            aligned_pairs = row['aligned_pairs']
+            for ii in range(len(aligned_pairs)-1):
+                entry=aligned_pairs[ii]
+                idx=entry[0]
+                absIdx=entry[1]
+                if idx!=None and absIdx!=None:
+                    seq=ref_sequence[ii]
+                    edit=editString[ii]
+                    if seq=='A' and edit!='2' and absIdx<=815:
+                        ##815 is where the RT primer binds--anything past this
+                        ##is artifact.
+                        bb[barCode][readID][absIdx]=int(edit)
+    ##
+    return bb
+
+
+def formatForMCA(dataDict,numReads,minEditFreq):
     """
     dataDict={bc:{readID:{position:1/0}}}
     numReads is an integer.
     minEditFreq is a frequency (e.g., 0.7)
     Will sort each bc's readIDs by longest -> shortest, and then select the
     numReads longest reads with at least minEditFreq of 1's
-    Will then convert to a list-of-lists like:  
+    Will then convert to a list-of-lists like:
     [[0,1,1,0,...,1],
      [1,1,0,1,...,1],
      ...
      [1,0,0,0,...,0]]
-     where each row represents a different readID. I'll then smooth the data using a rolling window. This will transform the data from binary to continuous values. Will also return a list
+     where each row represents a different readID. Will also return a list
      of bcs, which are the row labels.
     """
     aa=[]
@@ -92,7 +138,6 @@ def formatForPCA(dataDict,numReads,minEditFreq,maxEditFreq,smoothingWindow,posit
                 break
         ##
         aa+=temp2
-    ##
     ##
     ##now get all the positions
     positions=[]
@@ -117,80 +162,61 @@ def formatForPCA(dataDict,numReads,minEditFreq,maxEditFreq,smoothingWindow,posit
                 v=numpy.nan##in case no value
             temp.append(v)
         ##
-        ##now do smoothing using a rolling window
-        series = pd.Series(temp)
-        smoothed = []
-        half_window = smoothingWindow // 2
-        for i in range(len(series)):
-            start_index = max(0, i - half_window)
-            end_index = min(len(series), i + half_window + 1)
-            window = series[start_index:end_index]
-            window_mean = window.mean()
-            smoothed.append(window_mean)
-        # print(smoothed)
-        matrixOfEdits.append(smoothed)
+        matrixOfEdits.append(temp)
     ##
     return matrixOfEdits,listOfBCs
 
-def doPCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
+def doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
     """
-    matrixOfEdits is a list of lists, where each list is a list of smoothed 1/0/nan
-    listOfBCs is a list of bc labels for each row in matrixOfEdits
-    outPrefix is the prefix for output files
+    matrixOfEdits is a list of lists, where each list is a list of 1/0/nan
+    indicated edit status. listOfBCs are the labels associated with that.
+    Will run MCA and plot the first two components.
     """
-    df = pd.DataFrame(matrixOfEdits)
-    # get indices of rows with any NaN values
-    nan_indices = df.index[df.isnull().any(axis=1)]
-    # drop rows with NaN values
-    df = df.drop(nan_indices)
-    listOfBCs = [listOfBCs[i] for i in range(len(listOfBCs)) if i not in nan_indices]
+    ##convert to DF
+    X = pd.DataFrame(matrixOfEdits,\
+        columns=['A%s'%(ii) for ii in range(len(matrixOfEdits[0]))])
+    ##initialize mca
+    mca = prince.MCA(n_components=5, n_iter=5, \
+        copy=True, check_input=True, engine='sklearn', \
+        random_state=42)
     ##
-    pca = prince.PCA(
-        n_components=5,
-        n_iter=5,
-        copy=True,
-        check_input=True,
-        engine='sklearn',
-        random_state=42
-    )
-    pca = pca.fit(df)
-    X_pca = pca.transform(df)
-    ##
+    mca_fit = mca.fit(X)
+    X_mca = mca_fit.transform(X)
+    ##create labels, but don't actually attached them to the DF
     labels = pd.Series(listOfBCs, name='label')
     ##add the labels
-    X_pca['label'] = labels.values
+    X_mca['label'] = labels.values
     ##print some results
-    print(pca.eigenvalues_summary)
-    print(pca.column_coordinates_)
-    plt.figure(figsize=(8, 6))
+    print(mca.eigenvalues_summary)
+    print(mca.column_coordinates(X))
     ##
     for ii in range(4):
         ##plot the data
         fig, ax = plt.subplots(figsize=(6, 6))
-        for label in X_pca['label'].unique():
-            subset = X_pca[X_pca['label'] == label]
+        for label in X_mca['label'].unique():
+            subset = X_mca[X_mca['label'] == label]
             ax.scatter(subset[ii], subset[ii+1], label=label)
         ##set axis labels
-        ax.set_title('PCA of Binary Vectors')
-        ax.set_xlabel('PCA Dimension %s'%(ii+1))##+1 b/c python 0-based
-        ax.set_ylabel('PCA Dimension %s'%(ii+2))
+        ax.set_title('MCA of Binary Vectors')
+        ax.set_xlabel('MCA Dimension %s'%(ii+1))##+1 b/c python 0-based
+        ax.set_ylabel('MCA Dimension %s'%(ii+2))
         ax.legend()
         ##save output
         plt.savefig('%s.%s.%s.png'%(outPrefix,ii,ii+1))
         plt.close()
 
-
 def main(args):
-    pickleFile,numReads,minEdit,maxEdit,smoothingWindow,outPrefix=args[0:]
+    parquetDir,numReads,minEdit,numFiles,outPrefix=args[0:]
     ##
-    dataDict=parsePickleFile(pickleFile)
+    # dataDict=parsePickleFile(pickleFile)
+    dataDict=parseParquetFile(parquetDir,num_files=int(numFiles))
     print(len(dataDict))
     ##
-    matrixOfEdits,listOfBCs=formatForPCA(dataDict,int(numReads), \
-        float(minEdit),float(maxEdit),int(smoothingWindow), positionWindow=(20,695))
+    matrixOfEdits,listOfBCs=formatForMCA(dataDict,int(numReads),\
+        float(minEdit))
     print(len(matrixOfEdits))
     ##
-    doPCAandPlot(matrixOfEdits,listOfBCs,outPrefix)
+    doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix)
 
 if __name__=='__main__':
     Tee()

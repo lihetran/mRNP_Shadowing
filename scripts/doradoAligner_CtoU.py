@@ -89,7 +89,7 @@ def dorado_aligner(mutated_bam, ref_fasta, read_dict, out_bam):
     
     tmp_bam = out_bam.replace('.bam', '_tmp.bam')
     # output is a bam file
-    cmd = 'dorado aligner ' + str(ref_fasta) + ' ' + str(mutated_bam) + ' > ' + tmp_bam
+    cmd = 'dorado aligner ' + str(ref_fasta) + ' ' + str(mutated_bam) + ' > ' + tmp_bam + ' --mm2-opts "-x map-ont --secondary=no"'
     print(cmd)
     # run the command
     subprocess.call(cmd, shell=True)

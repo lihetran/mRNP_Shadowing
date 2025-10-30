@@ -116,10 +116,7 @@ def optimize_dataframe(df):
         df[col] = pd.to_numeric(df[col], downcast='integer')
     for col in df.select_dtypes(include=['float64']).columns:
         df[col] = pd.to_numeric(df[col], downcast='float')
-    # convert object columns with low unique values to category if beneficial
-    for col in df.select_dtypes(include=['object']).columns:
-        if df[col].nunique() / len(df) < 0.5:
-            df[col] = df[col].astype('category')
+
     return df
 
 def write_chunk(df, base_path, chunk_index):
@@ -142,38 +139,38 @@ def main(args):
     for chrom, ref_seq in ref_dict.items():
         print(f"Processing chromosome {chrom}...")
         parquet_path = output_dir / f"{bam_file.stem}_{chrom}.parquet"
-        shelve_path = output_dir / f"{bam_file.stem}_{chrom}_largefields.shelve"
+        # shelve_path = output_dir / f"{bam_file.stem}_{chrom}_largefields.shelve"
 
         rows = []
         chunk_index = 0
         total = 0
 
-        with shelve.open(str(shelve_path)) as db:
-            for record in read_generator(bam_file, ref_seq.seq, chrom):
-                # Store large fields in shelve
-                db[record['read_id']] = {
-                    'aligned_pairs': record['aligned_pairs'],
-                    'absolute_indices': record['absolute_indices']
-                }
-                # Remove bulky fields before putting into dataframe
-                del record['aligned_pairs']
-                del record['absolute_indices']
+        # with shelve.open(str(shelve_path)) as db:
+        for record in read_generator(bam_file, ref_seq.seq, chrom):
+            # # Store large fields in shelve
+            # db[record['read_id']] = {
+            #     'aligned_pairs': record['aligned_pairs'],
+            #     'absolute_indices': record['absolute_indices']
+            # }
+            # # Remove bulky fields before putting into dataframe
+            # del record['aligned_pairs']
+            # del record['absolute_indices']
 
-                rows.append(record)
-                total += 1
+            rows.append(record)
+            total += 1
 
-                if len(rows) >= chunk_size:
-                    df = pd.DataFrame(rows)
-                    df = optimize_dataframe(df)
-                    write_chunk(df, parquet_path, chunk_index)
-                    rows.clear()
-                    chunk_index += 1
-
-            # Write remaining rows
-            if rows:
+            if len(rows) >= chunk_size:
                 df = pd.DataFrame(rows)
                 df = optimize_dataframe(df)
                 write_chunk(df, parquet_path, chunk_index)
+                rows.clear()
+                chunk_index += 1
+
+        # Write remaining rows
+        if rows:
+            df = pd.DataFrame(rows)
+            df = optimize_dataframe(df)
+            write_chunk(df, parquet_path, chunk_index)
 
         print(f"Finished processing {total} reads for chromosome {chrom}")
 
