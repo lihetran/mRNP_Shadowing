@@ -167,9 +167,9 @@ def main():
                 strand = record[2]
                 qual = record[3]
 
-                rc = reverseComplement(seq)
-                newSeq, positions = replaceCharacter(rc, 'A', 'G')
-                originalReadDict_AG[header.split()[0][1:]] = rc
+                # rc = reverseComplement(seq)
+                newSeq, positions = replaceCharacter(seq, 'A', 'G')
+                originalReadDict_AG[header.split()[0][1:]] = seq
                 f_out.write(header + '\n' + newSeq + '\n' + strand + '\n' + qual + '\n')
 
     elif args.reads_fasta:
@@ -198,7 +198,8 @@ def main():
     #### Align mutated reads to mutated reference (A-G) ########
     
     # cmd1 = 'minimap2 -ax map-ont -t 20 --junc-bed ' + args.junction_bed + ' --secondary=no --for-only --MD --sam-hit-only ' + mutated_genome_AG + ' ' + mut_AG + ' > tmp/alignments.AtoG.sam'
-    cmd1 = 'minimap2 -ax map-ont -t 20' + ' --secondary=no --for-only --cs="long" --sam-hit-only ' + mutated_genome_AG + ' ' + mut_AG + ' > tmp/alignments.AtoG.sam' 
+    # cmd1 = 'minimap2 -ax map-ont -t 20' + ' --secondary=no --for-only --cs="long" --sam-hit-only ' + mutated_genome_AG + ' ' + mut_AG + ' > tmp/alignments.AtoG.sam' 
+    cmd1 = 'minimap2 -ax map-ont -t 20' + ' --for-only --cs="long" ' + mutated_genome_AG + ' ' + mut_AG + ' > tmp/alignments.AtoG.sam' # remove --secondary=no to keep secondary alignments
     # cmd1 = 'minimap2 -ax map-ont -t 20' + ' --secondary=no --cs="long" --sam-hit-only ' + mutated_genome_AG + ' ' + mut_AG + ' > tmp/alignments.AtoG.sam' 
     print('Mapping A-G reads to A-G reference')
     subprocess.call(cmd1, shell=True)

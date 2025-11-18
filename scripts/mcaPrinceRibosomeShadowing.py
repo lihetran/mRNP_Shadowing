@@ -8,6 +8,8 @@ Input: pickle2 - a pickled file from Liam
     numReads - will pick this many reads from each bc. Rec: 50.
         Will select longer reads first.
     minEdit - minimum edit frequency, e.g., 0.7 for 70%
+    maxEdit - maximum edit frequency, e.g., 1.0 for 100%
+    outPrefix - prefix for output files
 
 Output: plot of first two components from PCA, colored by bc of the
     library they come from.
@@ -15,15 +17,15 @@ Output: plot of first two components from PCA, colored by bc of the
 run as python3 mcaPrinceRibosomeShadowing.py pickle2 numReads minEdit 
     outPrefix
 """
-from operator import pos
 from pathlib import Path
 import sys, common, pickle, collections, numpy
 import pandas as pd
 import matplotlib.pyplot as plt
 from logJosh import Tee
 import prince
+import seaborn as sns
 
-def parsePickleFile(pickleFile):
+def parsePickleFile(pickleFile, barcodeDict=None):
     """
     Given Liam's pickle file, will output a dict of the format:
     {bc:{readID:{position:edit}}} where position has to be an A in the ref
@@ -34,7 +36,11 @@ def parsePickleFile(pickleFile):
     bb=collections.defaultdict(lambda:collections.defaultdict(dict))      
     ##
     for readID,subDict in dataDict.items():
+
         barCode=subDict['barcode']
+        if barcodeDict is not None:
+            if barCode not in barcodeDict:
+                continue
         #print(barCode,readID)
         editString=subDict['edit_string']
         #print(editString,len(editString))
@@ -52,12 +58,31 @@ def parsePickleFile(pickleFile):
             if idx!=None and absIdx!=None:
                 seq=refSeq[ii]
                 edit=editString[ii]
-                if seq=='A' and edit!='2' and absIdx<=695:
-                    ##695 is where the RT primer binds--anything past this
+                if seq=='A' and edit!='2' and absIdx<=704:
+                    ##704 is where the RT primer binds--anything past this
                     ##is artifact.
                     bb[barCode][readID][absIdx]=int(edit)
     ##
     return bb
+
+def parseBarcodeFile(barcodeFile):
+    '''
+    Given a barcode txt file, will return a dict of
+    {barcode:library_name}
+    '''
+    bcDict={}
+    with open(barcodeFile,'r') as f:
+        for line in f:
+            line=line.rstrip()
+            print(line)
+            if line=='':
+                continue
+            parts=line.split(',')
+            bc=parts[0]
+            libName=parts[1]
+            bcDict[bc]=libName
+    ##
+    return bcDict
 
 def parseParquetFile(parquetDir, pattern="*.parquet", sort=True, num_files=None):
     """
@@ -95,19 +120,20 @@ def parseParquetFile(parquetDir, pattern="*.parquet", sort=True, num_files=None)
                 if idx!=None and absIdx!=None:
                     seq=ref_sequence[ii]
                     edit=editString[ii]
-                    if seq=='A' and edit!='2' and absIdx<=815:
-                        ##815 is where the RT primer binds--anything past this
+                    if seq=='A' and edit!='2' and absIdx<=704:
+                        ##704 is where the RT primer binds--anything past this
                         ##is artifact.
                         bb[barCode][readID][absIdx]=int(edit)
     ##
     return bb
 
 
-def formatForMCA(dataDict,numReads,minEditFreq):
+def formatForMCA(dataDict,numReads,minEditFreq,maxEditFreq):
     """
     dataDict={bc:{readID:{position:1/0}}}
     numReads is an integer.
     minEditFreq is a frequency (e.g., 0.7)
+    maxEditFreq is a frequency (e.g., 1.0)
     Will sort each bc's readIDs by longest -> shortest, and then select the
     numReads longest reads with at least minEditFreq of 1's
     Will then convert to a list-of-lists like:
@@ -123,7 +149,8 @@ def formatForMCA(dataDict,numReads,minEditFreq):
     for bc,readDict in dataDict.items():
         temp=[]
         for readID,positDict in readDict.items():
-            if sum(positDict.values())/len(positDict)>=minEditFreq:
+            if sum(positDict.values())/len(positDict)>=minEditFreq and \
+               sum(positDict.values())/len(positDict)<=maxEditFreq:
                 temp.append(len(positDict))
         ##
         temp.sort()
@@ -156,8 +183,12 @@ def formatForMCA(dataDict,numReads,minEditFreq):
         ##now convert the dict to a vector/list
         temp=[]
         for k in positions:
+            # cluster on lysine window [220, 380]
             if k in entry[1]:
-                v=entry[1][k]
+                if k >= 220 and k <= 380:
+                    v=entry[1][k]
+                else:
+                    v=numpy.nan##in case no value
             else:
                 v=numpy.nan##in case no value
             temp.append(v)
@@ -178,7 +209,7 @@ def doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
     ##initialize mca
     mca = prince.MCA(n_components=5, n_iter=5, \
         copy=True, check_input=True, engine='sklearn', \
-        random_state=42)
+        random_state=42, correction="greenacre")
     ##
     mca_fit = mca.fit(X)
     X_mca = mca_fit.transform(X)
@@ -204,16 +235,29 @@ def doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix):
         ##save output
         plt.savefig('%s.%s.%s.png'%(outPrefix,ii,ii+1))
         plt.close()
+    # plot heatmap of column contributions
+    contributions = mca.column_contributions_
+    print(contributions)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(contributions, cmap='viridis')
+    plt.title('Column Contributions to MCA Dimensions')
+    plt.xlabel('MCA Dimensions')
+    plt.ylabel('Positions')
+    plt.savefig(f"{outPrefix}_mca_column_contributions_heatmap.png", dpi=300)
+    plt.close()
 
 def main(args):
-    parquetDir,numReads,minEdit,numFiles,outPrefix=args[0:]
+    # parquetDir,numReads,minEdit,numFiles,outPrefix=args[0:]
+    pickleFile,numReads,minEdit,maxEdit,barcodeFile,outPrefix=args[0:]
     ##
-    # dataDict=parsePickleFile(pickleFile)
-    dataDict=parseParquetFile(parquetDir,num_files=int(numFiles))
+    barcodeDict=parseBarcodeFile(barcodeFile)
+    print(barcodeDict)
+    dataDict=parsePickleFile(pickleFile, barcodeDict)
+    # dataDict=parseParquetFile(parquetDir,num_files=int(numFiles))
     print(len(dataDict))
     ##
     matrixOfEdits,listOfBCs=formatForMCA(dataDict,int(numReads),\
-        float(minEdit))
+        float(minEdit), float(maxEdit))
     print(len(matrixOfEdits))
     ##
     doMCAandPlot(matrixOfEdits,listOfBCs,outPrefix)
