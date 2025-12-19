@@ -183,6 +183,11 @@ def main(args):
     totalMockSubs = 0
     print("Reading mock sham file...")
     for mockInfo, mockAnnot, mockGene, mockEdit, coords in mockSham.readSham():
+        print(mockInfo[0])
+        print(mockAnnot)
+        print(mockGene)
+        print(mockEdit)
+        print(coords)
         # read lengths
         mockReadLengths.append(len(mockInfo[9]))
         flag = mockInfo[1]
