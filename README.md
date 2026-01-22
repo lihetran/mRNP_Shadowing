@@ -1,0 +1,1 @@
+This is my working space for scripts related to the Polysome/mRNP shadowing project. Most of these scripts are meant for analyzing data from long-read nanopore sequencing of highly-edited RNAs that were incubated with base editors.
