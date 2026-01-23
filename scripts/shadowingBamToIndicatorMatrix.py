@@ -116,7 +116,6 @@ def read_generator(bam_path, ref_sequence, chrom):
                 'absolute_indices': absolute_indices
             }
 
-
 def optimize_dataframe(df):
     '''Downcast and convert dtypes to save memory'''
     for col in df.select_dtypes(include=['int64']).columns:
@@ -136,8 +135,8 @@ def write_chunk(df, base_path, chunk_index):
 def smooth_indicator_matrix_from_reads(
     edit_strings,
     absolute_indices_list,
-    window_start,
-    window_end,
+    window_start=220,
+    window_end=320,
     window=5
 ):
 
@@ -162,27 +161,27 @@ def smooth_indicator_matrix_from_reads(
     return X
 
 
-def edit_record_to_vector(
-    edit_string,
-    absolute_indices,
-    window_start,
-    window_end,
-    kernel
-):
-    L = window_end - window_start
-    vec = np.zeros(L, dtype=np.float32)
-
-    edits = np.frombuffer(
-        edit_string.encode(), dtype=np.uint8
-    ) - ord('0')
-
-    for e, pos in zip(edits, absolute_indices):
-        if pos is None:
-            continue
-        if window_start <= pos < window_end:
-            vec[pos - window_start] = e
-
-    return convolve(vec, kernel, mode="same")
+# def edit_record_to_vector(
+#     edit_string,
+#     absolute_indices,
+#     window_start=220,
+#     window_end=320,
+#     kernel
+# ):
+#     L = window_end - window_start
+#     vec = np.zeros(L, dtype=np.float32)
+#
+#     edits = np.frombuffer(
+#         edit_string.encode(), dtype=np.uint8
+#     ) - ord('0')
+#
+#     for e, pos in zip(edits, absolute_indices):
+#         if pos is None:
+#             continue
+#         if window_start <= pos < window_end:
+#             vec[pos - window_start] = e
+#
+#     return convolve(vec, kernel, mode="same")
 
 
 def main(args):
@@ -195,42 +194,73 @@ def main(args):
     # Load reference sequences
     ref_dict = SeqIO.to_dict(SeqIO.parse(ref_fasta, "fasta"))
 
-    chunk_size = 50000  # tune this based on your RAM and speed requirements
+    chunk_size = 50000
+
+    # ---- smoothing parameters ----
+    window_start = 220
+    window_end   = 320
+    smooth_window = 5
 
     for chrom, ref_seq in ref_dict.items():
         print(f"Processing chromosome {chrom}...")
-        parquet_path = output_dir / f"{bam_file.stem}_{chrom}.parquet"
-        # shelve_path = output_dir / f"{bam_file.stem}_{chrom}_largefields.shelve"
 
-        rows = []
+        parquet_path = output_dir / f"{bam_file.stem}_{chrom}.parquet"
+
+        edit_strings = []
+        absolute_indices = []
+
         chunk_index = 0
         total = 0
 
-        # with shelve.open(str(shelve_path)) as db:
         for record in read_generator(bam_file, ref_seq.seq, chrom):
-            # # Store large fields in shelve
-            # db[record['read_id']] = {
-            #     'aligned_pairs': record['aligned_pairs'],
-            #     'absolute_indices': record['absolute_indices']
-            # }
-            # # Remove bulky fields before putting into dataframe
-            # del record['aligned_pairs']
-            # del record['absolute_indices']
 
-            rows.append(record['edit_string'])
+            edit_strings.append(record["edit_string"])
+            absolute_indices.append(record["absolute_indices"])
             total += 1
 
-            if len(rows) >= chunk_size:
-                df = pd.DataFrame(rows)
-                df = optimize_dataframe(df)
+            if len(edit_strings) >= chunk_size:
+
+                X = smooth_indicator_matrix_from_reads(
+                    edit_strings,
+                    absolute_indices,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window=smooth_window
+                )
+
+                df = pd.DataFrame(
+                    X,
+                    columns=[
+                        f"pos_{i}"
+                        for i in range(window_start, window_end)
+                    ]
+                )
+
                 write_chunk(df, parquet_path, chunk_index)
-                rows.clear()
+
+                edit_strings.clear()
+                absolute_indices.clear()
                 chunk_index += 1
 
-        # Write remaining rows
-        if rows:
-            df = pd.DataFrame(rows)
-            df = optimize_dataframe(df)
+        # ---- write remaining reads ----
+        if edit_strings:
+
+            X = smooth_indicator_matrix_from_reads(
+                edit_strings,
+                absolute_indices,
+                window_start=window_start,
+                window_end=window_end,
+                window=smooth_window
+            )
+
+            df = pd.DataFrame(
+                X,
+                columns=[
+                    f"pos_{i}"
+                    for i in range(window_start, window_end)
+                ]
+            )
+
             write_chunk(df, parquet_path, chunk_index)
 
         print(f"Finished processing {total} reads for chromosome {chrom}")
@@ -238,8 +268,9 @@ def main(args):
     print("All done!")
 
 
+
 if __name__ == '__main__':
     if len(sys.argv) != 4:
-        print("Usage: python shadowingBamToPickle.py <bam_file> <reference_fasta> <output_dir>")
+        print("Usage: python shadowingBamToIndicatorMatrix.py <bam_file> <reference_fasta> <output_dir>")
         sys.exit(1)
     main(sys.argv[1:])
