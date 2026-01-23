@@ -197,8 +197,10 @@ def main(args):
     chunk_size = 50000
 
     # ---- smoothing parameters ----
-    window_start = 220
-    window_end   = 320
+    # window_start = 220
+    # window_end   = 320
+    window_start = 100
+    window_end = 600
     smooth_window = 5
 
     for chrom, ref_seq in ref_dict.items():
