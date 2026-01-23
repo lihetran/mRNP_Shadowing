@@ -161,29 +161,6 @@ def smooth_indicator_matrix_from_reads(
     return X
 
 
-# def edit_record_to_vector(
-#     edit_string,
-#     absolute_indices,
-#     window_start=220,
-#     window_end=320,
-#     kernel
-# ):
-#     L = window_end - window_start
-#     vec = np.zeros(L, dtype=np.float32)
-#
-#     edits = np.frombuffer(
-#         edit_string.encode(), dtype=np.uint8
-#     ) - ord('0')
-#
-#     for e, pos in zip(edits, absolute_indices):
-#         if pos is None:
-#             continue
-#         if window_start <= pos < window_end:
-#             vec[pos - window_start] = e
-#
-#     return convolve(vec, kernel, mode="same")
-
-
 def main(args):
     bam_file = Path(args[0])
     ref_fasta = Path(args[1])
