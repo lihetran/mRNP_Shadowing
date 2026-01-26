@@ -25,6 +25,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.signal import convolve
 
+
 def get_absolute_positions(read):
     '''need to calculate absolute position of the read in the reference sequence, will do this by getting the start of
     the alignment (4th field in the sam file) and the CIGAR string (5th field in the sam file) to get the absolute positions.'''
@@ -70,11 +71,11 @@ def get_absolute_positions(read):
     return aligned_positions
 
 
-def read_generator(bam_path, ref_sequence, chrom):
+def read_generator(bam_path, ref_sequence, chrom, window_start, window_end, min_edit_freq=0.0):
     '''Yield one read dict at a time'''
     ref_seq = ref_sequence.upper()
     with pysam.AlignmentFile(bam_path, "rb") as bam:
-        for read in bam.fetch(chrom):
+        for read in bam.fetch(chrom, window_start, window_end):
             if read.is_unmapped:
                 continue
             barcode = read.get_tag('cI') if read.has_tag('cI') else None
@@ -85,11 +86,17 @@ def read_generator(bam_path, ref_sequence, chrom):
             read_string = []
             ref_string = []
             absolute_indices = get_absolute_positions(read)
-
+            total_A = 0
+            total_edits = 0
+            # First pass to calculate edit frequency
             for read_pos, ref_pos in aligned_pairs:
                 if ref_pos is not None and read_pos is not None:
                     if ref_seq[ref_pos] == 'A' and read_seq[read_pos] == 'G':
                         edits.append(1)
+                        total_edits += 1
+                        total_A += 1
+                    elif ref_seq[ref_pos] == 'A':
+                        total_A += 1
                     else:
                         edits.append(0)
                     read_string.append(read_seq[read_pos])
@@ -107,17 +114,20 @@ def read_generator(bam_path, ref_sequence, chrom):
             read_string = ''.join(read_string)
             ref_string = ''.join(ref_string)
 
-            yield {
-                'read_id': read.query_name,
-                'edit_string': edit_string,
-                'barcode': barcode,
-                'bar_seq': bar_seq,
-                'read_sequence': read_seq,
-                'read_sequence_aligned': read_string,
-                'ref_sequence_aligned': ref_string,
-                'aligned_pairs': aligned_pairs,
-                'absolute_indices': absolute_indices
-            }
+            # Calculate edit frequency for A positions
+            edit_freq = (total_edits / total_A) if total_A > 0 else 0.0
+            if edit_freq > float(min_edit_freq):
+                yield {
+                    'read_id': read.query_name,
+                    'edit_string': edit_string,
+                    'barcode': barcode,
+                    'bar_seq': bar_seq,
+                    'read_sequence': read_seq,
+                    'read_sequence_aligned': read_string,
+                    'ref_sequence_aligned': ref_string,
+                    'aligned_pairs': aligned_pairs,
+                    'absolute_indices': absolute_indices
+                }
 
 def optimize_dataframe(df):
     '''Downcast and convert dtypes to save memory'''
@@ -138,9 +148,9 @@ def write_chunk(df, base_path, chunk_index):
 def smooth_indicator_matrix_from_reads(
     edit_strings,
     absolute_indices_list,
-    window_start=220,
-    window_end=320,
-    window=5
+    window_start,
+    window_end,
+    window
 ):
 
     L = window_end - window_start
@@ -167,7 +177,8 @@ def smooth_indicator_matrix_from_reads(
 def main(args):
     bam_file = Path(args[0])
     ref_fasta = Path(args[1])
-    output_dir = Path(args[2])
+    min_edit_freq = args[2]
+    output_dir = Path(args[3])
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,7 +192,7 @@ def main(args):
     # window_end   = 320
     window_start = 100
     window_end = 600
-    smooth_window = 5
+    smooth_window = 10
 
     for chrom, ref_seq in ref_dict.items():
         print(f"Processing chromosome {chrom}...")
@@ -194,7 +205,7 @@ def main(args):
         chunk_index = 0
         total = 0
 
-        for record in read_generator(bam_file, ref_seq.seq, chrom):
+        for record in read_generator(bam_file, ref_seq.seq, chrom, window_start, window_end, min_edit_freq):
 
             edit_strings.append(record["edit_string"])
             absolute_indices.append(record["absolute_indices"])
@@ -223,7 +234,7 @@ def main(args):
                 edit_strings.clear()
                 absolute_indices.clear()
                 chunk_index += 1
-
+        # print('len matrix:', len(X))
         # ---- write remaining reads ----
         if edit_strings:
 
@@ -252,7 +263,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         print("Usage: python shadowingBamToIndicatorMatrix.py <bam_file> <reference_fasta> <output_dir>")
         sys.exit(1)
     main(sys.argv[1:])
