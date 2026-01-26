@@ -10,6 +10,9 @@ input: bam file, this file will usually be a merged bam file that is the result 
     reference fasta file
     output_dir - directory to save the pickle file
 output: parquet files with the same name as the bam file, but with a .parquet extension
+
+January 26, 2026 LT
+Need to add ability to filter reads by edit frequency
 '''
 
 import pysam

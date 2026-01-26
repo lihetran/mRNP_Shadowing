@@ -117,6 +117,13 @@ def main(args):
         batch_size=50000,
         dtype=np.float32
     )
+    # load projected PCs for plotting
+    pc_files = sorted(Path(output_dir).glob("*_pcs.npy"))
+    for pc_file in pc_files:
+        pcs = np.load(pc_file)
+        plot_path = Path(output_dir) / f"{pc_file.stem}_PC1_vs_PC2.png"
+        plot_scatter(pcs, plot_path, pc_x=1, pc_y=2, alpha=0.5, s=1)
+        print(f"Plotted {plot_path.name}")
 
 if __name__ == '__main__':
     main(sys.argv[1:])
