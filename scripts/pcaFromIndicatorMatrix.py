@@ -106,6 +106,37 @@ def plot_scatter(pc_array, output_path, pc_x=1, pc_y=2, alpha=0.5, s=1):
     plt.savefig(output_path)
     plt.close()
 
+def plot_first_10_components(
+    pc_array,
+    output_prefix,
+    alpha=0.5,
+    s=1
+):
+    import matplotlib.pyplot as plt
+
+    for i in range(1, 11, 2):
+        pc_x = i
+        pc_y = i + 1
+
+        plt.figure(figsize=(8, 8))
+        plt.scatter(
+            pc_array[:, pc_x - 1],
+            pc_array[:, pc_y - 1],
+            alpha=alpha,
+            s=s
+        )
+
+        plt.xlabel(f"PC{pc_x}")
+        plt.ylabel(f"PC{pc_y}")
+        plt.title(f"PC{pc_x} vs PC{pc_y}")
+        plt.grid(True)
+        plt.axis("equal")
+
+        out = f"{output_prefix}_PC{pc_x}_PC{pc_y}.png"
+        plt.savefig(out)
+        plt.close()
+
+
 def main(args):
     parquet_dir = args[0]
     output_dir = args[1]
@@ -121,8 +152,10 @@ def main(args):
     pc_files = sorted(Path(output_dir).glob("*_pcs.npy"))
     for pc_file in pc_files:
         pcs = np.load(pc_file)
-        plot_path = Path(output_dir) / f"{pc_file.stem}_PC1_vs_PC2.png"
-        plot_scatter(pcs, plot_path, pc_x=1, pc_y=2, alpha=0.5, s=1)
+        # plot_path = Path(output_dir) / f"{pc_file.stem}_PC1_vs_PC2.png"
+        # plot_scatter(pcs, plot_path, pc_x=1, pc_y=2, alpha=0.5, s=1)
+        plot_path = Path(output_dir) / f"{pc_file.stem}"
+        plot_first_10_components(pcs, plot_path, alpha=0.5, s=1)
         print(f"Plotted {plot_path.name}")
 
 if __name__ == '__main__':
