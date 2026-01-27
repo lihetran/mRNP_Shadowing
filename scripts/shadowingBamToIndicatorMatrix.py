@@ -174,6 +174,62 @@ def smooth_indicator_matrix_from_reads(
 
     return X
 
+def smooth_indicator_matrix_from_reads2(
+    edit_strings,
+    absolute_indices_list,
+    ref_seq,
+    window_start,
+    window_end,
+    window
+):
+    """
+    Smooth A→G edits normalized by number of A positions.
+    """
+
+    L = window_end - window_start
+
+    kernel = np.ones(window, dtype=np.float32)
+
+    X_edit = np.zeros((len(edit_strings), L), dtype=np.float32)
+    X_A = np.zeros((len(edit_strings), L), dtype=np.float32)
+
+
+
+    for r, (edits, positions) in enumerate(
+        zip(edit_strings, absolute_indices_list)
+    ):
+        edit_vals = np.frombuffer(
+            edits.encode(), dtype=np.uint8
+        ) - ord("0")
+
+        for val, pos in zip(edit_vals, positions):
+            if pos is None:
+                continue
+            if window_start <= pos < window_end:
+                col = pos - window_start
+
+                # A position indicator
+                if ref_seq[pos] == "A":
+                    X_A[r, col] = 1.0
+
+                # Edit indicator
+                if val == 1:
+                    X_edit[r, col] = 1.0
+
+        # smooth both
+        edits_smoothed = convolve(X_edit[r], kernel, mode="same")
+        A_smoothed = convolve(X_A[r], kernel, mode="same")
+
+        # normalize safely
+        with np.errstate(divide="ignore", invalid="ignore"):
+            X_edit[r] = np.where(
+                A_smoothed > 0,
+                edits_smoothed / A_smoothed,
+                0.0
+            )
+
+    return X_edit
+
 
 def main(args):
     bam_file = Path(args[0])
@@ -193,7 +249,7 @@ def main(args):
     # window_end   = 320
     window_start = 100
     window_end = 600
-    smooth_window = 10
+    smooth_window = 15
 
     for chrom, ref_seq in ref_dict.items():
         print(f"Processing chromosome {chrom}...")
@@ -202,6 +258,7 @@ def main(args):
 
         edit_strings = []
         absolute_indices = []
+        ref_seqs = []
 
         chunk_index = 0
         total = 0
@@ -210,13 +267,22 @@ def main(args):
 
             edit_strings.append(record["edit_string"])
             absolute_indices.append(record["absolute_indices"])
+            ref_seqs.append(record["ref_sequence_aligned"])
             total += 1
 
             if len(edit_strings) >= chunk_size:
 
-                X = smooth_indicator_matrix_from_reads(
+                # X = smooth_indicator_matrix_from_reads(
+                #     edit_strings,
+                #     absolute_indices,
+                #     window_start=window_start,
+                #     window_end=window_end,
+                #     window=smooth_window
+                # )
+                X = smooth_indicator_matrix_from_reads2(
                     edit_strings,
                     absolute_indices,
+                    ref_seqs,
                     window_start=window_start,
                     window_end=window_end,
                     window=smooth_window
@@ -234,6 +300,7 @@ def main(args):
 
                 edit_strings.clear()
                 absolute_indices.clear()
+                ref_seqs.clear()
                 chunk_index += 1
         # print('len matrix:', len(X))
         # ---- write remaining reads ----
