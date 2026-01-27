@@ -13,6 +13,7 @@ output: parquet files with the same name as the bam file, but with a .parquet ex
 
 January 26, 2026 LT
 Need to add ability to filter reads by edit frequency
+-TO DO: make sure correct absolute positions correspond to the reference sequence and edits
 '''
 
 import pysam
