@@ -193,8 +193,6 @@ def smooth_indicator_matrix_from_reads2(
     X_edit = np.zeros((len(edit_strings), L), dtype=np.float32)
     X_A = np.zeros((len(edit_strings), L), dtype=np.float32)
 
-
-
     for r, (edits, positions) in enumerate(
         zip(edit_strings, absolute_indices_list)
     ):
@@ -229,6 +227,42 @@ def smooth_indicator_matrix_from_reads2(
             )
 
     return X_edit
+
+import numpy as np
+from numpy import convolve
+
+def smooth_indicator_matrix_from_reads_edit_count(
+    edit_string,
+    absolute_indices,
+    ref_seq,
+    window_start,
+    window_end,
+    rolling_window_size,
+):
+    """
+    Compute centered rolling count of edits only.
+    """
+
+    edit_vals = np.frombuffer(edit_string.encode(), dtype=np.uint8) - ord('0')
+
+    L = window_end - window_start
+    X_edit = np.zeros(L, dtype=np.float32)
+
+    # build edit indicator track
+    for val, pos in zip(edit_vals, absolute_indices):
+        if pos is None:
+            continue
+        if window_start <= pos < window_end:
+            if val == 1:
+                col = pos - window_start
+                X_edit[col] = 1.0
+
+    # rolling window sum
+    kernel = np.ones(rolling_window_size, dtype=np.float32)
+    edits_smoothed = convolve(X_edit, kernel, mode="same")
+
+    return edits_smoothed
+
 
 
 def main(args):
@@ -279,14 +313,22 @@ def main(args):
                 #     window_end=window_end,
                 #     window=smooth_window
                 # )
-                X = smooth_indicator_matrix_from_reads2(
-                    edit_strings,
-                    absolute_indices,
-                    ref_seqs,
+                # X = smooth_indicator_matrix_from_reads2(
+                #     edit_strings,
+                #     absolute_indices,
+                #     ref_seqs,
+                #     window_start=window_start,
+                #     window_end=window_end,
+                #     window=smooth_window
+                # )
+                X = smooth_indicator_matrix_from_reads_edit_count(
+                    edit_strings[0],
+                    absolute_indices[0],
+                    ref_seq,
                     window_start=window_start,
                     window_end=window_end,
-                    window=smooth_window
-                )
+                    rolling_window_size=smooth_window,
+                )[np.newaxis, :]
 
                 df = pd.DataFrame(
                     X,
