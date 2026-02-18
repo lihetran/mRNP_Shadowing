@@ -178,6 +178,6 @@ def main(args):
 
 if __name__ == '__main__':
     if len(sys.argv) != 4:
-        print("Usage: python shadowingBamToPickle.py <bam_file> <reference_fasta> <output_dir>")
+        print("Usage: python shadowingBamToParquet.py <bam_file> <reference_fasta> <output_dir>")
         sys.exit(1)
     main(sys.argv[1:])
