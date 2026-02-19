@@ -62,30 +62,24 @@ from sklearn.decomposition import IncrementalPCA
 # PASS 1 — parse raw parquets → edit-matrix parquets
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _parse_read_row(row, max_abs_idx=695, _debug_once=[True]):
+def _parse_read_row(row, min_abs_idx=0, max_abs_idx=695):
     """
     Replicate parsePickleFileForPCA logic for a single row of the raw parquet.
 
+    IMPORTANT: only stores positions where ref base == 'A', matching the
+    original code which used is_A to filter the edit vector and edit freq.
+
     Returns dict: {abs_position: (edit_int, is_A_int)} or None if unusable.
     """
-    edit_string   = row["edit_string"]
-    ref_aligned   = row["ref_sequence_aligned"]
-    abs_indices   = row["absolute_indices"]
+    edit_string = row["edit_string"]
+    ref_aligned = row["ref_sequence_aligned"]
+    abs_indices = row["absolute_indices"]
 
     # Normalise absolute_indices to a plain Python list of scalars.
-    # It may arrive as: a str repr, a numpy array, a list, or a pandas Series.
     if isinstance(abs_indices, str):
         abs_indices = ast.literal_eval(abs_indices)
-    elif hasattr(abs_indices, "tolist"):          # numpy array / pandas Series
+    elif hasattr(abs_indices, "tolist"):   # numpy array / pandas Series
         abs_indices = abs_indices.tolist()
-
-    # One-time diagnostic so you can see exactly what you're dealing with
-    if _debug_once[0]:
-        _debug_once[0] = False
-        sample = abs_indices[:5] if abs_indices else []
-        print(f"[debug] absolute_indices type after normalise: {type(abs_indices)}, "
-              f"first 5 values: {sample}, "
-              f"value types: {[type(v).__name__ for v in sample]}")
 
     positDict = {}
     for ii, abs_idx in enumerate(abs_indices):
@@ -97,9 +91,8 @@ def _parse_read_row(row, max_abs_idx=695, _debug_once=[True]):
                 continue
         except (TypeError, ValueError):
             continue
-        # Always store as plain int so dict keys are consistent
         abs_idx = int(abs_idx)
-        if abs_idx > max_abs_idx:
+        if abs_idx < min_abs_idx or abs_idx > max_abs_idx:
             continue
         if ii >= len(edit_string) or ii >= len(ref_aligned):
             continue
@@ -107,9 +100,15 @@ def _parse_read_row(row, max_abs_idx=695, _debug_once=[True]):
         if edit == "2":
             continue
         seq = ref_aligned[ii].upper()
-        if seq != "A":  # only keep A positions — the editing signal
+        is_A = 1 if seq == "A" else 0
+        # ── KEY FIX: only keep A positions in the edit vector ──────────────
+        # Original parsePickleFileForPCA stored both A and non-A positions,
+        # but formatForPCA2 built edit vectors using v[0] for ALL positions.
+        # However, the meaningful editing signal (A→G) only exists at A sites.
+        # Keeping non-A positions adds noise and dilutes explained variance.
+        if is_A == 0:
             continue
-        positDict[abs_idx] = (int(edit), 1)
+        positDict[abs_idx] = (int(edit), is_A)
 
     return positDict if positDict else None
 
@@ -129,6 +128,8 @@ def parse_to_edit_matrix(
     min_edit_freq=0.01,
     max_abs_idx=695,
     chunk_size=50000,
+    window_start=None,
+    window_end=None,
 ):
     """
     PASS 1: Stream raw parquets, apply parsePickleFileForPCA + formatForPCA2
@@ -139,6 +140,9 @@ def parse_to_edit_matrix(
       - a 'barcode' column
       - a 'read_id' column
     Values are float32 edit scores (0/1/NaN).
+
+    window_start / window_end : optional genomic position bounds to restrict
+    the feature matrix to a sub-region. If None, all positions are used.
 
     Returns
     -------
@@ -152,6 +156,12 @@ def parse_to_edit_matrix(
     files = sorted(raw_parquet_dir.glob("*.parquet"))
     if not files:
         raise ValueError(f"No parquet files found in {raw_parquet_dir}")
+
+    # Resolve window bounds — fall back to full range if not specified
+    effective_min = window_start if window_start is not None else 0
+    effective_max = window_end   if window_end   is not None else max_abs_idx
+    if window_start is not None or window_end is not None:
+        print(f"[parse] genomic window: {effective_min} – {effective_max}")
 
     print(f"[parse] {len(files)} raw parquet file(s)")
 
@@ -171,7 +181,9 @@ def parse_to_edit_matrix(
                 read_id = row.get("read_id", None)
                 if bc is None:
                     continue
-                positDict = _parse_read_row(row, max_abs_idx)
+                positDict = _parse_read_row(row,
+                                              min_abs_idx=effective_min,
+                                              max_abs_idx=effective_max)
                 if positDict is None:
                     continue
                 if _edit_freq(positDict) < min_edit_freq:
@@ -298,7 +310,7 @@ def _smooth_and_impute_chunk(arr: np.ndarray, col_means: np.ndarray,
     """
     Apply rolling smooth (window=5) + NaN imputation to a chunk.
 
-    To avoid boundary artefacts at chunk seams we prepend the last SEAM_PAD
+    To avoid boundary artifacts at chunk seams we prepend the last SEAM_PAD
     rows of the previous chunk before smoothing, then strip them off again.
 
     Parameters
@@ -495,6 +507,8 @@ def run_pipeline(
     n_components  = 5,
     chunk_size    = 50000,
     plot          = True,
+    window_start  = None,
+    window_end    = None,
 ):
     """
     Run the full 4-pass incremental PCA pipeline.
@@ -510,12 +524,15 @@ def run_pipeline(
     n_components    : number of PCs
     chunk_size      : rows per edit-matrix parquet chunk
     plot            : whether to generate scatter plots
+    window_start    : optional start of genomic position window (inclusive)
+    window_end      : optional end of genomic position window (inclusive)
     """
     # Pass 1
     positions, edit_matrix_dir = parse_to_edit_matrix(
         raw_parquet_dir, edit_matrix_dir,
         num_reads=num_reads, min_edit_freq=min_edit_freq,
         max_abs_idx=max_abs_idx, chunk_size=chunk_size,
+        window_start=window_start, window_end=window_end,
     )
 
     # Pass 2
