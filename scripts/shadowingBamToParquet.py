@@ -75,7 +75,9 @@ def read_generator(bam_path, ref_sequence, chrom):
             edits = []
             read_string = []
             ref_string = []
-            absolute_indices = get_absolute_positions(read)
+            # absolute_indices = get_absolute_positions(read)
+            # Use pysam's own aligned_pairs for ref positions — avoids custom CIGAR parsing errors
+            absolute_indices = [p[1] for p in read.get_aligned_pairs()]
 
             for read_pos, ref_pos in aligned_pairs:
                 if ref_pos is not None and read_pos is not None:
