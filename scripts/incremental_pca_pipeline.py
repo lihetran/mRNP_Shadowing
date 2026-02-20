@@ -564,7 +564,7 @@ def run_pipeline(
         )
 
     return ipca, pc_files, barcodes
-    return ipca, pc_files, barcodes
+    # return ipca, pc_files, barcodes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
