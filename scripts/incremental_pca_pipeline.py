@@ -62,7 +62,7 @@ from sklearn.decomposition import IncrementalPCA
 # PASS 1 — parse raw parquets → edit-matrix parquets
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _parse_read_row(row, min_abs_idx=0, max_abs_idx=695):
+def _parse_read_row(row, max_abs_idx=695):
     """
     Replicate parsePickleFileForPCA logic for a single row of the raw parquet.
 
@@ -92,7 +92,7 @@ def _parse_read_row(row, min_abs_idx=0, max_abs_idx=695):
         except (TypeError, ValueError):
             continue
         abs_idx = int(abs_idx)
-        if abs_idx < min_abs_idx or abs_idx > max_abs_idx:
+        if abs_idx > max_abs_idx:
             continue
         if ii >= len(edit_string) or ii >= len(ref_aligned):
             continue
@@ -181,9 +181,7 @@ def parse_to_edit_matrix(
                 read_id = row.get("read_id", None)
                 if bc is None:
                     continue
-                positDict = _parse_read_row(row,
-                                              min_abs_idx=effective_min,
-                                              max_abs_idx=effective_max)
+                positDict = _parse_read_row(row, max_abs_idx=max_abs_idx)
                 if positDict is None:
                     continue
                 if _edit_freq(positDict) < min_edit_freq:
@@ -219,7 +217,12 @@ def parse_to_edit_matrix(
             except (TypeError, ValueError):
                 print(f"[warn] dropping unconvertible key: {pos!r}")
                 continue
-            raw_positions.add(int(pos))
+            ipos = int(pos)
+            # Apply window AFTER edit freq filtering — reads selected globally,
+            # features restricted to window
+            if ipos < effective_min or ipos > effective_max:
+                continue
+            raw_positions.add(ipos)
     positions = sorted(raw_positions)
     print(f"[parse] {len(positions)} unique genomic positions")
 
@@ -310,7 +313,7 @@ def _smooth_and_impute_chunk(arr: np.ndarray, col_means: np.ndarray,
     """
     Apply rolling smooth (window=5) + NaN imputation to a chunk.
 
-    To avoid boundary artifacts at chunk seams we prepend the last SEAM_PAD
+    To avoid boundary artefacts at chunk seams we prepend the last SEAM_PAD
     rows of the previous chunk before smoothing, then strip them off again.
 
     Parameters
@@ -550,12 +553,17 @@ def run_pipeline(
 
     # Plot (barcodes as labels)
     if plot:
+        if window_start is not None or window_end is not None:
+            win_str = f"window_{window_start or 0}_{window_end or max_abs_idx}"
+        else:
+            win_str = "all_positions"
         plot_pca(
             pc_files,
-            out_prefix=str(Path(output_dir) / "result"),
+            out_prefix=str(Path(output_dir) / f"result_{win_str}"),
             labels=barcodes,
         )
 
+    return ipca, pc_files, barcodes
     return ipca, pc_files, barcodes
 
 
