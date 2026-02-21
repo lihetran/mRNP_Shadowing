@@ -132,32 +132,48 @@ def parse_to_edit_matrix(
     window_end=None,
 ):
     """
-    PASS 1: Stream raw parquets, apply parsePickleFileForPCA + formatForPCA2
-    logic, write edit-matrix parquets.
+    PASS 1: Three-sub-pass approach to build edit-matrix parquets
+    without loading all reads into memory.
 
-    Each output parquet has:
-      - one column per genomic position (named by abs_idx, e.g. "123")
-      - a 'barcode' column
-      - a 'read_id' column
-    Values are float32 edit scores (0/1/NaN).
+    Sub-pass 1a — vectorised filter using precomputed global_edit_freq column:
+        Stream raw parquets, filter on global_edit_freq, write a lightweight
+        summary parquet per barcode: (read_id, barcode, n_a_positions).
+        Memory: O(chunk_size) at any time.
+
+    Sub-pass 1b — top-N selection:
+        Read summary parquets, select top-N read_ids per barcode by
+        n_a_positions (mirrors original formatForPCA2 length-based selection).
+        Memory: O(total_passing_reads) for summaries only — tiny since no
+        positDicts are held.
+
+    Sub-pass 1c — edit matrix construction:
+        Stream raw parquets again, parse positDicts only for selected read_ids,
+        write edit matrix rows on the fly. Memory: O(chunk_size * n_positions).
 
     window_start / window_end : optional genomic position bounds to restrict
-    the feature matrix to a sub-region. If None, all positions are used.
+    the feature matrix to a sub-region. Applied after global edit freq filter
+    so read selection is always based on global editing behaviour.
+
+    NOTE: requires 'global_edit_freq' and 'n_a_positions' columns in the raw
+    parquets — produced by the updated shadowingBamToParquet.py.
 
     Returns
     -------
     positions : sorted list of int genomic positions (defines column order)
     edit_matrix_dir : Path
     """
-    raw_parquet_dir  = Path(raw_parquet_dir)
-    edit_matrix_dir  = Path(edit_matrix_dir)
+    import heapq
+    from collections import defaultdict
+
+    raw_parquet_dir = Path(raw_parquet_dir)
+    edit_matrix_dir = Path(edit_matrix_dir)
     edit_matrix_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(raw_parquet_dir.glob("*.parquet"))
     if not files:
         raise ValueError(f"No parquet files found in {raw_parquet_dir}")
 
-    # Resolve window bounds — fall back to full range if not specified
+    # Resolve window bounds
     effective_min = window_start if window_start is not None else 0
     effective_max = window_end   if window_end   is not None else max_abs_idx
     if window_start is not None or window_end is not None:
@@ -165,101 +181,104 @@ def parse_to_edit_matrix(
 
     print(f"[parse] {len(files)} raw parquet file(s)")
 
-    # ── Steps 1+2: streaming read collection with bounded per-BC heap ──────────
-    # Problem: accumulating all passing reads before selecting top-N can use
-    # gigabytes of RAM with 1-10M reads. Fix: use a min-heap per barcode capped
-    # at (num_reads * HEAP_FACTOR) candidates, so memory is O(barcodes * num_reads)
-    # regardless of total read count.
-    #
-    # We replicate the original formatForPCA2 value-membership selection:
-    # reads tied with the Nth longest are all included, so we keep a small
-    # buffer above num_reads to catch ties at the boundary.
-    import heapq
-    from collections import defaultdict
-
-    HEAP_FACTOR = 3  # keep up to num_reads * 3 candidates per BC to catch ties
-    heap_size   = num_reads * HEAP_FACTOR
-
-    # Per-BC min-heap: (length, read_id, positDict)
-    # Min-heap on length means we evict the shortest read when over capacity.
-    bc_heaps = defaultdict(list)
+    # ── Sub-pass 1a: vectorised filter ──────────────────────────────────────
+    # Uses precomputed global_edit_freq column — no per-row positDict parsing.
+    # Writes lightweight summary: (read_id, barcode, n_a_positions).
+    print("[parse 1a] filtering reads by global edit frequency...")
+    summary_path = edit_matrix_dir / "read_summary.parquet"
+    summary_chunks = []
+    total_seen = 0
+    total_passed = 0
 
     for i, fpath in enumerate(files, 1):
         pf = pq.ParquetFile(fpath)
-        print(f"  [{i}/{len(files)}] parsing {fpath.name}")
+        print(f"  [{i}/{len(files)}] {fpath.name}")
+        for rg in range(pf.metadata.num_row_groups):
+            df = pf.read_row_group(
+                rg, columns=["read_id", "barcode", "global_edit_freq", "n_a_positions"]
+            ).to_pandas()
+            total_seen += len(df)
+            passing = df[
+                df["barcode"].notna() &
+                (df["global_edit_freq"] >= min_edit_freq)
+            ][["read_id", "barcode", "n_a_positions"]]
+            total_passed += len(passing)
+            if len(passing) > 0:
+                summary_chunks.append(passing)
+
+    summary_df = pd.concat(summary_chunks, ignore_index=True)
+    summary_df.to_parquet(summary_path, compression="zstd", index=False)
+    print(f"[parse 1a] {total_passed:,} / {total_seen:,} reads passed filter")
+
+
+    # ── Sub-pass 1b: top-N selection per barcode ─────────────────────────────
+    # Value-membership selection matching original formatForPCA2 logic.
+    # Memory: O(total_passing) for the summary only — no positDicts.
+    print("[parse 1b] selecting top-N reads per barcode...")
+    selected_ids = set()   # read_ids to parse in sub-pass 1c
+    selected_bc  = {}      # read_id → barcode
+
+    for bc, grp in summary_df.groupby("barcode"):
+        lengths          = sorted(grp["n_a_positions"].tolist(), reverse=True)
+        length_threshold = set(lengths[:num_reads])   # value membership
+        mask             = grp["n_a_positions"].isin(length_threshold)
+        chosen           = grp[mask]
+        for _, row in chosen.iterrows():
+            selected_ids.add(row["read_id"])
+            selected_bc[row["read_id"]] = bc
+
+    print(f"[parse 1b] {len(selected_ids):,} reads selected across {summary_df['barcode'].nunique()} barcodes")
+
+
+
+    # ── Sub-pass 1c: build edit matrix for selected reads ───────────────────
+    # Stream raw parquets again, parse positDicts only for selected read_ids.
+    # Collect positions first (need global set before writing columns).
+    print("[parse 1c] collecting positions from selected reads...")
+    raw_positions   = set()
+    selected_parsed = {}   # read_id → positDict  (only selected reads)
+
+    for fpath in files:
+        pf = pq.ParquetFile(fpath)
         for rg in range(pf.metadata.num_row_groups):
             df = pf.read_row_group(rg).to_pandas()
-            for _, row in df.iterrows():
-                bc      = row.get("barcode", None)
-                read_id = row.get("read_id", None)
-                if bc is None:
-                    continue
+            # Fast pre-filter before expensive positDict parsing
+            df_sel = df[df["read_id"].isin(selected_ids)]
+            for _, row in df_sel.iterrows():
+                read_id = row["read_id"]
+                if read_id in selected_parsed:
+                    continue   # already parsed (read spans multiple row groups)
                 positDict = _parse_read_row(row, max_abs_idx=max_abs_idx)
                 if positDict is None:
                     continue
-                if _edit_freq(positDict) < min_edit_freq:
-                    continue
-                length = len(positDict)
-                heap   = bc_heaps[bc]
-                if len(heap) < heap_size:
-                    heapq.heappush(heap, (length, read_id, positDict))
-                elif length > heap[0][0]:
-                    # New read is longer than the shortest in heap — replace it
-                    heapq.heapreplace(heap, (length, read_id, positDict))
+                selected_parsed[read_id] = positDict
+                for pos in positDict:
+                    ipos = int(pos)
+                    if effective_min <= ipos <= effective_max:
+                        raw_positions.add(ipos)
 
-    print(f"[parse] {len(bc_heaps)} barcodes found")
-
-    # Apply original formatForPCA2 value-membership selection from heap contents
-    selected = []
-    for bc, heap in bc_heaps.items():
-        read_list = [(read_id, pd_) for _, read_id, pd_ in heap]
-        lengths   = sorted([len(r[1]) for r in read_list], reverse=True)
-        length_threshold = lengths[:num_reads]
-        for read_id, positDict in read_list:
-            if len(positDict) in length_threshold:
-                selected.append((read_id, bc, positDict))
-
-    print(f"[parse] {len(selected)} reads selected after filtering")
-
-    # ── Step 3: determine global position set ────────────────────────────────
-    raw_positions = set()
-    for _, _, pd_ in selected:
-        for pos in pd_:
-            try:
-                if pos is None or np.isnan(float(pos)):
-                    print(f"[warn] dropping NaN/None key: {pos!r}")
-                    continue
-            except (TypeError, ValueError):
-                print(f"[warn] dropping unconvertible key: {pos!r}")
-                continue
-            ipos = int(pos)
-            # Apply window AFTER edit freq filtering — reads selected globally,
-            # features restricted to window
-            if ipos < effective_min or ipos > effective_max:
-                continue
-            raw_positions.add(ipos)
     positions = sorted(raw_positions)
-    print(f"[parse] {len(positions)} unique genomic positions")
+    print(f"[parse 1c] {len(positions)} unique genomic positions")
 
-    # Paranoia check — duplicate column names will crash parquet write
+    # Paranoia check
     pos_str_check = ["read_id", "barcode"] + [str(p) for p in positions]
     if len(pos_str_check) != len(set(pos_str_check)):
         from collections import Counter
         dupes = [k for k, v in Counter(pos_str_check).items() if v > 1]
         raise RuntimeError(f"Duplicate column names after cleaning: {dupes}")
 
-    # Save position index for later passes
     np.save(edit_matrix_dir / "positions.npy", np.array(positions))
 
-    # ── Step 4: write edit-matrix parquets ───────────────────────────────────
-    pos_str = [str(p) for p in positions]  # column names must be strings
-    out_files = []
+    # Write edit matrix parquets in chunks
+    pos_str  = [str(p) for p in positions]
+    entries  = list(selected_parsed.items())   # [(read_id, positDict), ...]
     chunk_idx = 0
 
-    for start in range(0, len(selected), chunk_size):
-        batch = selected[start : start + chunk_size]
+    for start in range(0, len(entries), chunk_size):
+        batch = entries[start : start + chunk_size]
         rows  = []
-        for read_id, bc, positDict in batch:
+        for read_id, positDict in batch:
+            bc  = selected_bc.get(read_id, None)
             vec = [float(positDict[p][0]) if p in positDict else np.nan
                    for p in positions]
             rows.append([read_id, bc] + vec)
@@ -268,7 +287,6 @@ def parse_to_edit_matrix(
         df   = pd.DataFrame(rows, columns=cols)
         out  = edit_matrix_dir / f"edit_matrix_chunk{chunk_idx}.parquet"
         df.to_parquet(out, compression="zstd", index=False)
-        out_files.append(out)
         print(f"  wrote {out.name}  ({len(df)} rows)")
         chunk_idx += 1
 
