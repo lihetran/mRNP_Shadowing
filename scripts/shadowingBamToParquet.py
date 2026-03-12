@@ -62,12 +62,16 @@ def read_generator(bam_path, ref_sequence, chrom):
             ref_string  = ''.join(ref_string)
 
             # ── Compute global edit frequency over A positions ───────────────
-            # Done here so downstream PCA filtering can use a fast vectorised
-            # column lookup instead of per-row positDict parsing.
-            # edit_freq = (A→G edits) / (total A positions in aligned ref)
-            a_indices  = [i for i, c in enumerate(ref_string) if c == 'A']
-            a_edits    = sum(1 for i in a_indices
-                             if i < len(edit_string) and edit_string[i] == '1')
+            # Must match _edit_freq() in incremental_pca_pipeline.py exactly:
+            # - only count positions where ref base == 'A'
+            # - skip indel positions (edit_string[i] == '2')
+            # Indels are marked '2' in edit_string and must be excluded from
+            # both numerator and denominator, otherwise global_edit_freq and
+            # _edit_freq diverge and reads near the threshold are selected
+            # differently, hurting cluster separation.
+            a_indices  = [i for i, c in enumerate(ref_string)
+                          if c == 'A' and i < len(edit_string) and edit_string[i] != '2']
+            a_edits    = sum(1 for i in a_indices if edit_string[i] == '1')
             n_a        = len(a_indices)
             global_edit_freq = a_edits / n_a if n_a > 0 else 0.0
 
@@ -81,8 +85,8 @@ def read_generator(bam_path, ref_sequence, chrom):
                 'ref_sequence_aligned':   ref_string,
                 'aligned_pairs':          aligned_pairs,
                 'absolute_indices':       absolute_indices,
-                'global_edit_freq':       global_edit_freq,   # ← new
-                'n_a_positions':          n_a,                # ← new
+                'global_edit_freq':       global_edit_freq,   # ← non-indel A edit freq, matches _edit_freq()
+                'n_a_positions':          n_a,                # ← non-indel A positions, matches _edit_freq() denom
             }
 
 

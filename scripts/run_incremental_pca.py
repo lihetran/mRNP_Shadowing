@@ -46,7 +46,8 @@ inputs:
 '''
 
 import argparse
-from incremental_pca_pipeline import run_pipeline
+# from incremental_pca_pipeline import run_pipeline
+from threePass_incremental_pca_pipeline import run_pipeline
 
 def main():
     parser = argparse.ArgumentParser(
@@ -74,6 +75,8 @@ def main():
                         help="Start of genomic position window, inclusive (default: None = use all positions)")
     parser.add_argument("--window_end",      type=int, default=None,
                         help="End of genomic position window, inclusive (default: None = use all positions)")
+    parser.add_argument("--barcodes",       type=str, nargs='*', default=None,
+                        help="Optional list of barcodes to include (default: None = use all barcodes)")
 
     args = parser.parse_args()
 
@@ -89,9 +92,23 @@ def main():
         plot            = not args.no_plot,
         window_start    = args.window_start,
         window_end      = args.window_end,
+        barcodes        = args.barcodes,
     )
+    # ipca, pc_files = run_pipeline(
+    #     raw_parquet_dir = args.raw_parquet_dir,
+    #     edit_matrix_dir = args.edit_matrix_dir,
+    #     output_dir      = args.output_dir,
+    #     num_reads       = args.num_reads,
+    #     min_edit_freq   = args.min_edit_freq,
+    #     n_components    = args.n_components,
+    #     max_abs_idx     = args.max_abs_idx,
+    #     chunk_size      = args.chunk_size,
+    #     plot            = not args.no_plot,
+    #     window_start    = args.window_start,
+    #     window_end      = args.window_end
+    # )
 
-    print(f"\nDone. {len(pc_files)} PC file(s), {len(barcodes)} total reads.")
+    # print(f"\nDone. {len(pc_files)} PC file(s), {len(barcodes)} total reads.")
     print(f"Explained variance: {ipca.explained_variance_ratio_}")
     print(f"Total variance explained: {ipca.explained_variance_ratio_.sum()*100:.2f}%")
 

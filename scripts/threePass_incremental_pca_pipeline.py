@@ -130,6 +130,7 @@ def parse_to_edit_matrix(
     chunk_size=50000,
     window_start=None,
     window_end=None,
+    barcodes=None,
 ):
     """
     PASS 1: Three-sub-pass approach to build edit-matrix parquets
@@ -153,6 +154,8 @@ def parse_to_edit_matrix(
     window_start / window_end : optional genomic position bounds to restrict
     the feature matrix to a sub-region. Applied after global edit freq filter
     so read selection is always based on global editing behaviour.
+    barcodes : optional list of barcode strings to include. If None, all
+    barcodes present in the data are used.
 
     NOTE: requires 'global_edit_freq' and 'n_a_positions' columns in the raw
     parquets — produced by the updated shadowingBamToParquet.py.
@@ -178,76 +181,128 @@ def parse_to_edit_matrix(
     effective_max = window_end   if window_end   is not None else max_abs_idx
     if window_start is not None or window_end is not None:
         print(f"[parse] genomic window: {effective_min} – {effective_max}")
+    if barcodes is not None:
+        print(f"[parse] barcode filter: {barcodes}")
 
     print(f"[parse] {len(files)} raw parquet file(s)")
 
-    # ── Sub-pass 1a: vectorised filter ──────────────────────────────────────
-    # Uses precomputed global_edit_freq column — no per-row positDict parsing.
-    # Writes lightweight summary: (read_id, barcode, n_a_positions).
-    print("[parse 1a] filtering reads by global edit frequency...")
-    summary_path = edit_matrix_dir / "read_summary.parquet"
-    summary_chunks = []
+    # ── Sub-pass 1a: barcode filter + edit freq via positDict parsing ──────────
+    # global_edit_freq in the parquet is computed without the max_abs_idx cap,
+    # so it systematically underestimates edit freq vs _edit_freq(positDict).
+    # For correctness we compute edit freq from positDicts here, matching the
+    # working version exactly. The vectorised barcode filter still provides a
+    # meaningful speedup by skipping excluded barcodes before parsing.
+    print("[parse 1a] filtering reads by barcode and edit frequency...")
     total_seen = 0
     total_passed = 0
+    selected_bc  = {}   # read_id → barcode (passing reads only)
+
+    using_window = window_start is not None or window_end is not None
 
     for i, fpath in enumerate(files, 1):
         pf = pq.ParquetFile(fpath)
         print(f"  [{i}/{len(files)}] {fpath.name}")
         for rg in range(pf.metadata.num_row_groups):
-            df = pf.read_row_group(
-                rg, columns=["read_id", "barcode", "global_edit_freq", "n_a_positions"]
-            ).to_pandas()
+            df = pf.read_row_group(rg).to_pandas()
             total_seen += len(df)
-            passing = df[
-                df["barcode"].notna() &
-                (df["global_edit_freq"] >= min_edit_freq)
-            ][["read_id", "barcode", "n_a_positions"]]
-            total_passed += len(passing)
-            if len(passing) > 0:
-                summary_chunks.append(passing)
+            # Fast barcode pre-filter before expensive positDict parsing
+            bc_mask = df["barcode"].notna()
+            if barcodes is not None:
+                bc_mask = bc_mask & df["barcode"].isin(barcodes)
+            df_bc = df[bc_mask]
+            for _, row in df_bc.iterrows():
+                read_id = row["read_id"]
+                bc      = row["barcode"]
+                positDict = _parse_read_row(row, max_abs_idx=max_abs_idx)
+                if positDict is None:
+                    continue
+                if _edit_freq(positDict) < min_edit_freq:
+                    continue
+                selected_bc[read_id] = bc
+                total_passed += 1
 
-    summary_df = pd.concat(summary_chunks, ignore_index=True)
-    summary_df.to_parquet(summary_path, compression="zstd", index=False)
     print(f"[parse 1a] {total_passed:,} / {total_seen:,} reads passed filter")
 
+    selected_ids = set(selected_bc.keys())
+    print(f"[parse 1b] {len(selected_ids):,} candidate reads across "
+          f"{len(set(selected_bc.values()))} barcodes — selection deferred to 1c")
 
-    # ── Sub-pass 1b: top-N selection per barcode ─────────────────────────────
-    # Value-membership selection matching original formatForPCA2 logic.
-    # Memory: O(total_passing) for the summary only — no positDicts.
-    print("[parse 1b] selecting top-N reads per barcode...")
-    selected_ids = set()   # read_ids to parse in sub-pass 1c
-    selected_bc  = {}      # read_id → barcode
+    # ── Sub-pass 1c: two streams for all cases ───────────────────────────────
+    #
+    # Stream 1 — parse positDicts for all candidates, record ranking length
+    #            (len(positDict), capped by max_abs_idx), free positDict.
+    #            When window active, also count A positions within window.
+    #            Do top-N selection from these lengths.
+    #            Memory: O(n_candidates) for length dict — just one int per read.
+    #
+    # Stream 2 — parse positDicts only for final selected reads, collect
+    #            positions, write edit matrix.
+    #            Memory: O(num_reads * barcodes * positions)
 
-    for bc, grp in summary_df.groupby("barcode"):
-        lengths          = sorted(grp["n_a_positions"].tolist(), reverse=True)
-        length_threshold = set(lengths[:num_reads])   # value membership
-        mask             = grp["n_a_positions"].isin(length_threshold)
-        chosen           = grp[mask]
-        for _, row in chosen.iterrows():
-            selected_ids.add(row["read_id"])
-            selected_bc[row["read_id"]] = bc
-
-    print(f"[parse 1b] {len(selected_ids):,} reads selected across {summary_df['barcode'].nunique()} barcodes")
-
-
-
-    # ── Sub-pass 1c: build edit matrix for selected reads ───────────────────
-    # Stream raw parquets again, parse positDicts only for selected read_ids.
-    # Collect positions first (need global set before writing columns).
-    print("[parse 1c] collecting positions from selected reads...")
-    raw_positions   = set()
-    selected_parsed = {}   # read_id → positDict  (only selected reads)
+    # ── 1c stream 1: compute ranking lengths, select top-N ───────────────────
+    print("[parse 1c-1] computing ranking lengths per read...")
+    rank_count  = {}   # read_id → ranking length (len(positDict) or window A count)
 
     for fpath in files:
         pf = pq.ParquetFile(fpath)
         for rg in range(pf.metadata.num_row_groups):
             df = pf.read_row_group(rg).to_pandas()
-            # Fast pre-filter before expensive positDict parsing
+            df_sel = df[df["read_id"].isin(selected_ids)]
+            for _, row in df_sel.iterrows():
+                read_id = row["read_id"]
+                if read_id in rank_count:
+                    continue
+                positDict = _parse_read_row(row, max_abs_idx=max_abs_idx)
+                if positDict is None:
+                    rank_count[read_id] = 0
+                    continue
+                if using_window:
+                    # Rank by A positions within window
+                    rank_count[read_id] = sum(
+                        1 for pos in positDict
+                        if effective_min <= int(pos) <= effective_max
+                    )
+                else:
+                    # Rank by total capped A positions — matches len(positDict)
+                    # in the working version exactly
+                    rank_count[read_id] = len(positDict)
+                # positDict intentionally NOT stored — freed here
+
+    # Top-N selection using value-membership, matching original formatForPCA2
+    print("[parse 1c-1] selecting top-N reads per barcode...")
+    final_ids     = set()
+    bc_candidates = {}
+    for read_id, bc in selected_bc.items():
+        if read_id not in rank_count:
+            continue
+        bc_candidates.setdefault(bc, []).append((rank_count[read_id], read_id))
+
+    for bc, candidates in bc_candidates.items():
+        lengths          = sorted([c[0] for c in candidates], reverse=True)
+        length_threshold = lengths[:num_reads]   # list, not set — matches original
+        for count, read_id in candidates:
+            if count in length_threshold:
+                final_ids.add(read_id)
+
+    del rank_count, bc_candidates
+    selected_ids = final_ids
+    print(f"[parse 1c-1] {len(selected_ids):,} reads selected across "
+          f"{len(set(selected_bc.values()))} barcodes")
+
+    # ── 1c stream 2: parse positDicts for selected reads only ────────────────
+    print("[parse 1c-2] parsing positDicts for selected reads...")
+    raw_positions   = set()
+    selected_parsed = {}   # read_id → positDict
+
+    for fpath in files:
+        pf = pq.ParquetFile(fpath)
+        for rg in range(pf.metadata.num_row_groups):
+            df = pf.read_row_group(rg).to_pandas()
             df_sel = df[df["read_id"].isin(selected_ids)]
             for _, row in df_sel.iterrows():
                 read_id = row["read_id"]
                 if read_id in selected_parsed:
-                    continue   # already parsed (read spans multiple row groups)
+                    continue
                 positDict = _parse_read_row(row, max_abs_idx=max_abs_idx)
                 if positDict is None:
                     continue
@@ -529,6 +584,67 @@ def plot_pca(pc_files, out_prefix, labels=None, n_pairs=4):
         print(f"  saved → {out_path}")
 
 
+
+
+def plot_edit_freq_cdf(raw_parquet_dir, out_prefix, barcodes=None):
+    """
+    Plot the CDF of global edit frequencies, one line per barcode.
+    Streams raw parquets using the precomputed global_edit_freq column —
+    no positDict parsing needed.
+
+    Parameters
+    ----------
+    raw_parquet_dir : path to directory of raw parquets from shadowingBamToParquet.py
+    out_prefix      : output file prefix; saved as <out_prefix>.edit_freq_cdf.png
+    barcodes        : optional list of barcode strings to include (default: all)
+    """
+    raw_parquet_dir = Path(raw_parquet_dir)
+    files = sorted(raw_parquet_dir.glob("*.parquet"))
+    if not files:
+        raise ValueError(f"No parquet files found in {raw_parquet_dir}")
+
+    print("[cdf] collecting edit frequencies...")
+    bc_freqs = {}   # bc -> list of global_edit_freq values
+
+    for fpath in files:
+        pf = pq.ParquetFile(fpath)
+        for rg in range(pf.metadata.num_row_groups):
+            df = pf.read_row_group(
+                rg, columns=["barcode", "global_edit_freq"]
+            ).to_pandas()
+            if barcodes is not None:
+                df = df[df["barcode"].isin(barcodes)]
+            df = df[df["barcode"].notna()]
+            for bc, grp in df.groupby("barcode"):
+                if bc not in bc_freqs:
+                    bc_freqs[bc] = []
+                bc_freqs[bc].extend(grp["global_edit_freq"].tolist())
+
+    print(f"[cdf] {len(bc_freqs)} barcode(s) found")
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    for bc, freqs in sorted(bc_freqs.items()):
+        freqs_sorted = np.sort(freqs)
+        cdf = np.arange(1, len(freqs_sorted) + 1) / len(freqs_sorted)
+        ax.plot(freqs_sorted, cdf, label=f"{bc} (n={len(freqs):,})", linewidth=1.5)
+        print(f"  {bc}: {len(freqs):,} reads, "
+              f"median={np.median(freqs):.3f}, "
+              f"mean={np.mean(freqs):.3f}")
+
+    ax.set_xlabel("Global Edit Frequency (A->G edits / A positions)")
+    ax.set_ylabel("Cumulative Fraction of Reads")
+    ax.set_title("CDF of Global Edit Frequencies by Barcode")
+    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", borderaxespad=0, fontsize=8)
+    ax.axvline(x=0.8, color="grey", linestyle="--", linewidth=0.8,
+               label="default threshold (0.8)")
+
+    out_path = f"{out_prefix}.edit_freq_cdf.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[cdf] saved -> {out_path}")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # top-level convenience wrapper
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -545,6 +661,7 @@ def run_pipeline(
     plot          = True,
     window_start  = None,
     window_end    = None,
+    barcodes      = None,
 ):
     """
     Run the full 4-pass incremental PCA pipeline.
@@ -562,6 +679,7 @@ def run_pipeline(
     plot            : whether to generate scatter plots
     window_start    : optional start of genomic position window (inclusive)
     window_end      : optional end of genomic position window (inclusive)
+    barcodes        : optional list of barcode strings to include (default: all)
     """
     # Pass 1
     positions, edit_matrix_dir = parse_to_edit_matrix(
@@ -569,6 +687,7 @@ def run_pipeline(
         num_reads=num_reads, min_edit_freq=min_edit_freq,
         max_abs_idx=max_abs_idx, chunk_size=chunk_size,
         window_start=window_start, window_end=window_end,
+        barcodes=barcodes,
     )
 
     # Pass 2
