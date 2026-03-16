@@ -21,7 +21,7 @@ Usage:
 
 import argparse
 from pathlib import Path
-from rare_read_pca_pipeline import run_pipeline, plot_edit_freq_cdf
+from rare_read_PCA_pipeline import run_pipeline, plot_edit_freq_cdf
 
 
 def main():
