@@ -57,10 +57,272 @@ def parse_gtf_cds(gtf_path: str) -> dict:
             strand = fields[6]
             m = re.search(r'transcript_id "([^"]+)"', fields[8])
             tid = m.group(1) if m else "."
-            cds_by_chrom[chrom].append((start, end, strand, tid))
+            m2 = re.search(r'gene_name "([^"]+)"', fields[8])
+            gname = m2.group(1) if m2 else "."
+            cds_by_chrom[chrom].append((start, end, strand, tid, gname))
     for chrom in cds_by_chrom:
         cds_by_chrom[chrom].sort()
     return dict(cds_by_chrom)
+
+
+def parse_gtf_biotypes(gtf_path: str) -> dict:
+    """
+    Parse all features from the GTF that have a transcript_biotype attribute.
+    Returns a dict: chrom → sorted list of (start0, end0, biotype)
+    covering every feature interval (gene, transcript, exon, CDS, etc.).
+    Using all feature types ensures reads in UTRs/introns are still assigned.
+    """
+    idx = collections.defaultdict(list)
+    with open(gtf_path) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            # Use transcript-level features to avoid redundant sub-feature hits
+            if fields[2] not in ("transcript", "gene"):
+                continue
+            m = re.search(r'transcript_biotype "([^"]+)"', fields[8])
+            if not m:
+                # fall back to gene_biotype if transcript_biotype absent
+                m = re.search(r'gene_biotype "([^"]+)"', fields[8])
+            if not m:
+                continue
+            chrom   = fields[0]
+            start   = int(fields[3]) - 1
+            end     = int(fields[4])
+            biotype = m.group(1)
+            idx[chrom].append((start, end, biotype))
+    for chrom in idx:
+        idx[chrom].sort()
+    return dict(idx)
+
+
+def overlapping_biotypes(chrom: str,
+                          read_start: int,
+                          read_end: int,
+                          biotype_idx: dict) -> set:
+    """
+    Return the set of all biotypes whose intervals overlap [read_start, read_end)
+    on chrom. Uses a linear scan over the sorted interval list — fast enough
+    for typical GTF sizes; replace with an interval tree if needed.
+    """
+    intervals = biotype_idx.get(chrom, [])
+    result = set()
+    for (start, end, biotype) in intervals:
+        if start >= read_end:
+            break   # sorted by start — no more overlaps possible
+        if end > read_start:
+            result.add(biotype)
+    return result
+
+
+def assign_read_biotypes(bam_path: str,
+                          biotype_idx: dict,
+                          min_mapq: int = 0) -> dict:
+    """
+    Iterate every read in the BAM and assign it to all biotypes whose
+    intervals overlap its alignment. Reads with no overlap get biotype
+    'intergenic'.
+
+    Returns dict: read_name → frozenset of biotypes.
+    """
+    read_biotypes = {}
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    for read in bam:
+        if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+        if read.mapping_quality < min_mapq:
+            continue
+        biotypes = overlapping_biotypes(
+            read.reference_name,
+            read.reference_start,
+            read.reference_end,
+            biotype_idx,
+        )
+        read_biotypes[read.query_name] = frozenset(biotypes) if biotypes \
+                                         else frozenset(["intergenic"])
+    bam.close()
+    return read_biotypes
+
+
+def plot_biotype_counts(biotype_maps: dict,
+                         labels: dict,
+                         output_prefix: str):
+    """
+    For each library, plot a stacked bar of read counts by biotype.
+    Reads assigned to multiple biotypes are counted once per biotype.
+
+    biotype_maps: dict key → read_name → frozenset of biotypes
+    labels:       dict key → display label
+    """
+    sns.set_theme(style="whitegrid", font_scale=1.1)
+
+    # Collect all biotypes and counts per library
+    lib_counts = {}
+    all_biotypes = set()
+    for key, bmap in biotype_maps.items():
+        counts = collections.Counter()
+        for biotypes in bmap.values():
+            for bt in biotypes:
+                counts[bt] += 1
+        lib_counts[key] = counts
+        all_biotypes.update(counts.keys())
+
+    # Sort biotypes by total count descending
+    total = collections.Counter()
+    for counts in lib_counts.values():
+        total.update(counts)
+    biotype_order = [bt for bt, _ in total.most_common()]
+
+    # Build DataFrame for plotting
+    rows = []
+    for key, counts in lib_counts.items():
+        for bt in biotype_order:
+            rows.append({
+                "library": labels[key],
+                "biotype": bt,
+                "count":   counts.get(bt, 0),
+            })
+    df = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle("Read counts by transcript biotype", fontsize=13, fontweight="bold")
+
+    palette = sns.color_palette("tab20", n_colors=len(biotype_order))
+    color_map = dict(zip(biotype_order, palette))
+
+    for ax, (key, label) in zip(axes, labels.items()):
+        sub = df[df["library"] == label].set_index("biotype").loc[biotype_order]
+        bars = ax.barh(biotype_order[::-1],
+                       sub.loc[biotype_order[::-1], "count"],
+                       color=[color_map[bt] for bt in biotype_order[::-1]],
+                       edgecolor="white")
+        # Annotate counts
+        for bar, bt in zip(bars, biotype_order[::-1]):
+            n = sub.loc[bt, "count"]
+            ax.text(bar.get_width() + sub["count"].max() * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{n:,}", va="center", fontsize=8)
+        ax.set_xlabel("Number of reads\n(reads overlapping multiple biotypes counted per biotype)")
+        ax.set_title(label)
+        ax.xaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda x, _: f"{int(x):,}")
+        )
+
+    plt.tight_layout()
+    plot_path = f"{output_prefix}_biotype_counts.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved biotype count plots → {plot_path}", file=sys.stderr)
+
+    # Save counts table
+    df.to_csv(f"{output_prefix}_biotype_counts.csv", index=False)
+
+
+
+def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
+                                        biotype_maps: dict,
+                                        labels: dict,
+                                        output_prefix: str,
+                                        min_reads: int = 50):
+    """
+    For each biotype, plot the CDF of per-read editing efficiency,
+    overlaying both libraries. One panel per biotype with >= min_reads
+    in at least one library.
+
+    Uses the read-level summary rows from strat_raw (rel_pos is NaN)
+    joined to biotype_maps on read_name.
+    """
+    sns.set_theme(style="whitegrid", font_scale=1.0)
+    c1, c2 = COLORS["bam1"], COLORS["bam2"]
+
+    # Build per-library DataFrame of (read_name, read_edit_eff, biotype)
+    # expanding multi-biotype reads into one row per biotype
+    lib_dfs = {}
+    for key in ("bam1", "bam2"):
+        raw = strat_raw_dfs[key]
+        read_rows = (
+            raw[raw["rel_pos"].isna()]
+               .drop_duplicates(subset=["read_name"])
+               [["read_name", "read_edit_eff"]]
+               .dropna(subset=["read_edit_eff"])
+        )
+        bmap = biotype_maps[key]
+        rows = []
+        for _, row in read_rows.iterrows():
+            for bt in bmap.get(row["read_name"], {"unassigned"}):
+                rows.append({
+                    "read_name":     row["read_name"],
+                    "read_edit_eff": row["read_edit_eff"],
+                    "biotype":       bt,
+                })
+        lib_dfs[key] = pd.DataFrame(rows)
+
+    # Find biotypes present with enough reads in at least one library
+    all_biotypes = set()
+    for key, df in lib_dfs.items():
+        counts = df.groupby("biotype")["read_name"].nunique()
+        all_biotypes.update(counts[counts >= min_reads].index)
+
+    if not all_biotypes:
+        print("  No biotypes with sufficient reads for efficiency plot.",
+              file=sys.stderr)
+        return
+
+    # Sort by total read count descending
+    total_counts = collections.Counter()
+    for key, df in lib_dfs.items():
+        for bt, n in df.groupby("biotype")["read_name"].nunique().items():
+            total_counts[bt] += n
+    biotype_order = [bt for bt, _ in total_counts.most_common()
+                     if bt in all_biotypes]
+
+    n_bt  = len(biotype_order)
+    ncols = min(3, n_bt)
+    nrows = (n_bt + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(6 * ncols, 4 * nrows),
+                              squeeze=False)
+    fig.suptitle(
+        "Per-read A→G editing efficiency by biotype",
+        fontsize=13, fontweight="bold"
+    )
+
+    for idx, bt in enumerate(biotype_order):
+        ax = axes[idx // ncols][idx % ncols]
+        for key, label, color in [("bam1", labels["bam1"], c1),
+                                   ("bam2", labels["bam2"], c2)]:
+            sub = lib_dfs[key][lib_dfs[key]["biotype"] == bt]["read_edit_eff"]
+            if len(sub) == 0:
+                continue
+            s      = np.sort(sub.values)
+            cdf    = np.arange(1, len(s) + 1) / len(s)
+            median = float(np.median(s))
+            ax.plot(s, cdf, color=color, lw=2,
+                    label=f"{label} (n={len(s):,}, med={median:.3f})")
+            ax.axvline(median, color=color, lw=1, ls="--", alpha=0.6)
+        ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("A→G editing efficiency")
+        ax.set_ylabel("Cumulative fraction")
+        ax.set_title(bt)
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax.legend(fontsize=7)
+
+    # Hide unused axes
+    for idx in range(n_bt, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    plt.tight_layout()
+    plot_path = f"{output_prefix}_efficiency_by_biotype.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved efficiency by biotype → {plot_path}", file=sys.stderr)
+
 
 
 def find_his_positions(ref_fasta: pysam.FastaFile,
@@ -73,7 +335,7 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
             chrom_len = ref_fasta.get_reference_length(chrom)
         except KeyError:
             continue
-        for (cds_start, cds_end, strand, tid) in intervals:
+        for (cds_start, cds_end, strand, tid, gname) in intervals:
             cds_seq = ref_fasta.fetch(chrom, cds_start, cds_end).upper()
             cds_len = cds_end - cds_start
             for i in range(0, cds_len - 2, 3):
@@ -95,6 +357,7 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
                         "strand":      strand,
                         "codon":       codon,
                         "transcript":  tid,
+                        "gene_name":   gname,
                         "win_start":   win_start,
                         "win_end":     win_end,
                     })
@@ -106,7 +369,21 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
         tid_counter[site["transcript"]] += 1
         site["his_rank"] = tid_counter[site["transcript"]]
 
-    return sites
+    # Deduplicate by edit_pos — overlapping isoforms/genes can produce
+    # multiple entries for the same genomic A, which would cause the same
+    # reads to be counted multiple times. Keep the first occurrence
+    # (lowest his_rank, first transcript encountered).
+    seen_positions = set()
+    deduped = []
+    for site in sites:
+        key = (site["chrom"], site["edit_pos"])
+        if key not in seen_positions:
+            seen_positions.add(key)
+            deduped.append(site)
+
+    print(f"  Deduplicated {len(sites):,} → {len(deduped):,} unique His A positions.",
+          file=sys.stderr)
+    return deduped
 
 
 def reverse_complement(seq: str) -> str:
@@ -148,11 +425,19 @@ def count_mismatches_at_site(bam: pysam.AlignmentFile,
             if pread.is_del or pread.is_refskip:
                 continue
             qbase = pread.alignment.query_sequence[pread.query_position].upper()
-            if strand == "-":
+            # For unstranded nanopore data: complement both ref and query for
+            # reverse-strand reads so everything is in transcript coordinates.
+            # A→G edits appear as ref=A,read=G on forward reads and
+            # ref=T,read=C on reverse reads in the raw alignment.
+            if pread.alignment.is_reverse:
                 qbase = complement_base(qbase)
             counts[qbase] += 1
 
         total = sum(counts.values())
+        # ref_base in transcript coordinates: complement if position is on minus
+        # strand of reference (i.e. the majority of reads covering it are reverse)
+        # We use read-level complementing above, so ref_base stays as plus-strand
+        # for the position filter but we record it complemented for minus-strand sites
         pos_data[rel_pos] = {
             "ref_pos":  ref_pos,
             "ref_base": ref_base if strand == "+" else complement_base(ref_base),
@@ -210,40 +495,38 @@ def aggregate_sites(sites: list,
 
 
 def transcript_normalised_agg(df: pd.DataFrame,
-                              group_cols: list = None) -> pd.DataFrame:
+                              group_cols: list = None,
+                              pseudo: float = 1e-3) -> pd.DataFrame:
     """
     Two-stage aggregation restricted to ref=A positions only, using
-    ag_edit_frac = G/(A+G) as the editing metric:
-      1. Average ag_edit_frac across all His sites within a transcript at each rel_pos
+    ag_edit_frac = G/(A+G) + pseudocount as the editing metric:
+      1. Average (ag_edit_frac + pseudo) across all His sites within a
+         transcript at each rel_pos
       2. Average those transcript means across transcripts at each rel_pos
 
-    Non-A ref positions are excluded entirely — they are not informative
-    for A→G editing and would mix in sequencing error rates.
+    A pseudocount is added so that sites with zero editing still contribute
+    rather than being dropped, keeping the meta-plot anchored to all sites.
 
+    Non-A ref positions and codon flanks are excluded (see in_his_codon filter).
     group_cols: additional columns to group by before rel_pos (e.g. ["his_rank"])
     Returns DataFrame with rel_pos (+ group_cols), mean_edit_frac, sem_edit_frac, n_transcripts.
     """
     if group_cols is None:
         group_cols = []
 
-    # Keep ref=A positions that are either:
-    #   - the His A itself (rel_pos=0, in_his_codon=True), OR
-    #   - outside the His codon entirely (in_his_codon=False)
-    # This excludes rel_pos=-1 (C) and +1 (T/C) of THIS site's codon,
-    # but also prevents incidental ref=A hits at those positions from
-    # OTHER sites' windows contaminating the codon-flanking positions.
     ref_a = df[
         df["ag_edit_frac"].notna() &
         (df["ref_base"] == "A") &
         (~df["in_his_codon"] | df["is_his_A"])
     ].copy()
+    ref_a["ag_edit_frac_ps"] = ref_a["ag_edit_frac"] + pseudo
 
-    # Stage 1: per-transcript mean ag_edit_frac at each rel_pos
+    # Stage 1: per-transcript mean at each rel_pos
     tx_mean = (
-        ref_a.groupby(group_cols + ["transcript", "rel_pos"])["ag_edit_frac"]
+        ref_a.groupby(group_cols + ["transcript", "rel_pos"])["ag_edit_frac_ps"]
              .mean()
              .reset_index()
-             .rename(columns={"ag_edit_frac": "tx_mean_edit_frac"})
+             .rename(columns={"ag_edit_frac_ps": "tx_mean_edit_frac"})
     )
 
     # Stage 2: grand mean across transcripts
@@ -286,15 +569,18 @@ def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
     }
 
 
-def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple:
+def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame,
+                       pseudo: float = 1e-3) -> tuple:
     """
     Transcript-normalised log2FC of A→G editing fraction at ref=A positions only.
+    A pseudocount is added so transcripts with zero editing in one condition
+    still contribute rather than being excluded.
 
     Steps:
-      1. Restrict each BAM's data to ref=A positions with valid ag_edit_frac
-      2. Per-transcript mean ag_edit_frac at each rel_pos
+      1. Restrict each BAM's data to ref=A positions (excl. codon flanks)
+      2. Per-transcript mean (ag_edit_frac + pseudo) at each rel_pos
       3. Merge on (transcript, his_rank, rel_pos)
-      4. Compute log2FC where both conditions have ag_edit_frac > 0
+      4. log2FC = log2(mean_2 / mean_1) per transcript per rel_pos
       5. Average log2FC across transcripts at each rel_pos
 
     Returns:
@@ -307,8 +593,9 @@ def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple:
             (df["ref_base"] == "A") &
             (~df["in_his_codon"] | df["is_his_A"])
         ].copy()
+        ref_a["ag_edit_frac_ps"] = ref_a["ag_edit_frac"] + pseudo
         return (
-            ref_a.groupby(["transcript", "his_rank", "rel_pos"])["ag_edit_frac"]
+            ref_a.groupby(["transcript", "his_rank", "rel_pos"])["ag_edit_frac_ps"]
                  .mean()
                  .reset_index()
         )
@@ -320,12 +607,9 @@ def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple:
                        on=["transcript", "his_rank", "rel_pos"],
                        suffixes=("_1", "_2"))
 
-    # Only compute log2FC where both conditions have observed editing —
-    # no pseudocount, so transcripts with ag_edit_frac == 0 in either BAM are excluded
-    merged = merged[
-        (merged["ag_edit_frac_1"] > 0) & (merged["ag_edit_frac_2"] > 0)
-    ].copy()
-    merged["log2fc"] = np.log2(merged["ag_edit_frac_2"] / merged["ag_edit_frac_1"])
+    merged["log2fc"] = np.log2(
+        merged["ag_edit_frac_ps_2"] / merged["ag_edit_frac_ps_1"]
+    )
 
     def _agg(sub):
         if sub.empty:
@@ -363,7 +647,7 @@ def plot_comparison(s1: dict, s2: dict,
                     strat_raw_dfs: dict = None):
 
     sns.set_theme(style="whitegrid", font_scale=1.1)
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
         f"Histidine A→G Editing Comparison: {label1} vs {label2}",
         fontsize=14, fontweight="bold"
@@ -378,7 +662,7 @@ def plot_comparison(s1: dict, s2: dict,
     _meta_panel(axes[0, 1], s2["rel_position_agg"], label2, c2, window)
 
     # ── Panel 3: log2FC meta-plot ─────────────────────────────────────────────
-    ax = axes[0, 2]
+    ax = axes[1, 0]
     log2fc_agg = s1["log2fc_agg"].set_index("rel_pos")
     log2fc  = log2fc_agg["mean_log2fc"]
     sem_fc  = log2fc_agg["sem_log2fc"]
@@ -399,11 +683,12 @@ def plot_comparison(s1: dict, s2: dict,
     ax.set_xlim(-window, window)
     ax.set_xlabel("Position relative to His codon A")
     ax.set_ylabel(f"log2FC ({label2} / {label1})")
-    ax.set_title("log2 Fold-Change in G mismatch rate\n(mean ± SEM across sites)")
+    ax.set_title("log2 Fold-Change in editing\n(mean ± SEM across transcripts)")
     ax.legend(fontsize=8)
 
-    # ── Panel 4: Overlaid CDFs ────────────────────────────────────────────────
-    ax = axes[1, 0]
+    # ── Panel 4: CDFs — His A editing fraction + overall read efficiency ──────
+    ax = axes[1, 1]
+    # His A editing fraction CDF
     for fracs, label, color in [
         (s1["edit_frac_dist"], label1, c1),
         (s2["edit_frac_dist"], label2, c2),
@@ -413,19 +698,9 @@ def plot_comparison(s1: dict, s2: dict,
             cdf = np.arange(1, len(sf) + 1) / len(sf)
             median = float(np.median(sf))
             ax.plot(sf, cdf, color=color, lw=2,
-                    label=f"{label} (n={len(sf):,}, med={median:.3f})")
+                    label=f"{label} His A (med={median:.3f})")
             ax.axvline(median, color=color, lw=1, ls="--", alpha=0.7)
-    ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
-    ax.set_xlabel("A→G edit fraction at His A")
-    ax.set_ylabel("Cumulative fraction of sites")
-    ax.set_title("CDF of editing at His A")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-    ax.legend(fontsize=9)
-
-    # ── Panel 5: Overall per-read editing efficiency CDF ─────────────────────
-    ax = axes[1, 1]
+    # Overall read efficiency CDF (dashed)
     if strat_raw_dfs is not None:
         for key, label, color in [("bam1", label1, c1), ("bam2", label2, c2)]:
             raw = strat_raw_dfs[key]
@@ -440,42 +715,16 @@ def plot_comparison(s1: dict, s2: dict,
             eff    = np.sort(read_rows["read_edit_eff"].values)
             cdf    = np.arange(1, len(eff) + 1) / len(eff)
             median = float(np.median(eff))
-            ax.plot(eff, cdf, color=color, lw=2,
-                    label=f"{label} (n={len(eff):,}, med={median:.3f})")
-            ax.axvline(median, color=color, lw=1, ls="--", alpha=0.7)
-        ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
-        ax.set_xlabel("Per-read A→G editing efficiency")
-        ax.set_ylabel("Cumulative fraction of reads")
-        ax.set_title("Overall editing efficiency CDF\n(QC: should overlap if libraries matched)")
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-        ax.legend(fontsize=9)
-    else:
-        ax.text(0.5, 0.5, "No read-level data\n(run with strat_raw_dfs)",
-                ha="center", va="center", transform=ax.transAxes)
-
-    # ── Panel 6: log2FC distribution at His A sites only ─────────────────────
-    ax = axes[1, 2]
-    ha1 = s1["his_a_sites"][["site_id", "ag_edit_frac"]].dropna()
-    ha2 = s2["his_a_sites"][["site_id", "ag_edit_frac"]].dropna()
-    merged = ha1.merge(ha2, on="site_id", suffixes=("_1", "_2"))
-    valid  = merged[
-        (merged["ag_edit_frac_1"] > 0) & (merged["ag_edit_frac_2"] > 0)
-    ]
-    if len(valid) > 0:
-        fc = np.log2(valid["ag_edit_frac_2"] / valid["ag_edit_frac_1"])
-        ax.hist(fc, bins=60, color="mediumpurple", edgecolor="white")
-        ax.axvline(0, color="black", lw=1, ls="--")
-        ax.axvline(fc.median(), color="crimson", lw=1.5, ls="--",
-                   label=f"Median log2FC = {fc.median():.2f}")
-        ax.set_xlabel(f"log2FC ({label2} / {label1}) at His A")
-        ax.set_ylabel("Number of sites")
-        ax.set_title(f"Per-site log2FC at His A\n(n={len(valid):,} sites with G>0 in both)")
-        ax.legend(fontsize=9)
-    else:
-        ax.text(0.5, 0.5, "No sites with G>0 in both conditions",
-                ha="center", va="center", transform=ax.transAxes)
+            ax.plot(eff, cdf, color=color, lw=2, ls="--",
+                    label=f"{label} read eff. (med={median:.3f})")
+    ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
+    ax.set_xlabel("A→G fraction")
+    ax.set_ylabel("Cumulative fraction")
+    ax.set_title("CDF: His A editing (solid) vs\noverall read efficiency (dashed)")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+    ax.legend(fontsize=8)
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_comparison_plots.png"
@@ -649,7 +898,6 @@ def build_co_occurrence_matrix(sites: list,
     """
     n     = 2 * window + 1
     mat   = np.zeros((n, n), dtype=np.float64)
-    # rel_pos → matrix index: rel_pos 0 maps to index `window`
     offset = window
 
     for site in sites:
@@ -657,8 +905,8 @@ def build_co_occurrence_matrix(sites: list,
         edit_pos = site["edit_pos"]
         win_start = site["win_start"]
         win_end   = site["win_end"]
+        strand    = site["strand"]
 
-        # Fetch reference sequence for the window once
         ref_seq = ref_fasta.fetch(chrom, win_start, win_end).upper()
 
         for read in bam.fetch(chrom, win_start, win_end):
@@ -669,27 +917,29 @@ def build_co_occurrence_matrix(sites: list,
             if read.query_sequence is None:
                 continue
 
-            # Build ref_pos → query_base map using the alignment pairs,
-            # restricted to the window and to positions where ref=A
+            is_rev = read.is_reverse
             ag_rel_positions = []
             for qpos, rpos in read.get_aligned_pairs(matches_only=True):
                 if rpos < win_start or rpos >= win_end:
                     continue
-                ref_idx  = rpos - win_start
-                ref_base = ref_seq[ref_idx] if ref_idx < len(ref_seq) else "N"
-                if ref_base != "A":
+                ref_idx          = rpos - win_start
+                ref_base_genomic = ref_seq[ref_idx] if ref_idx < len(ref_seq) else "N"
+                ref_base_read    = complement_base(ref_base_genomic) if is_rev \
+                                   else ref_base_genomic
+                if ref_base_read != "A":
                     continue
-                # Check base quality
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
-                qbase = read.query_sequence[qpos].upper()
+                qbase_raw = read.query_sequence[qpos].upper()
+                qbase     = complement_base(qbase_raw) if is_rev else qbase_raw
                 if qbase == "G":
                     rel = rpos - edit_pos
+                    if strand == "-":
+                        rel = -rel
                     if -window <= rel <= window:
                         ag_rel_positions.append(rel)
 
-            # Accumulate co-occurrences for all pairs on this read
             if len(ag_rel_positions) == 0:
                 continue
             idxs = [r + offset for r in ag_rel_positions]
@@ -865,14 +1115,30 @@ def collect_his_a_stratified(sites: list,
         site_id, transcript, his_rank, rel_pos, his_a_edited, ag_edit
     where ag_edit is 1 if the read shows G at that ref=A position, 0 if A.
     """
-    records = []
+    records   = []
+    chrom_seq_cache: dict = {}   # chrom → full sequence, loaded once
     for site in sites:
         chrom     = site["chrom"]
         edit_pos  = site["edit_pos"]
         win_start = site["win_start"]
         win_end   = site["win_end"]
+        strand    = site["strand"]
 
-        ref_seq = ref_fasta.fetch(chrom, win_start, win_end).upper()
+        if chrom not in chrom_seq_cache:
+            chrom_seq_cache[chrom] = ref_fasta.fetch(chrom).upper()
+
+        ref_seq      = chrom_seq_cache[chrom][win_start:win_end]
+        full_ref_seq = chrom_seq_cache[chrom]
+
+        # In transcript coordinates, an A→G edit is always ref=A, read=G.
+        # For unstranded nanopore reads this appears as:
+        #   forward read: ref=A, read=G  (plus-strand gene or reverse-strand gene)
+        #   reverse read: ref=T, read=C  (complement in raw alignment)
+        # So we complement both ref and query for reverse reads, then look for A→G.
+        # The genomic ref base at the His A is determined by gene strand:
+        #   plus-strand gene:  ref=A on plus strand
+        #   minus-strand gene: ref=T on plus strand (A on transcript)
+        ref_transcript_a = "A" if strand == "+" else "T"
 
         for read in bam.fetch(chrom, win_start, win_end):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
@@ -882,39 +1148,55 @@ def collect_his_a_stratified(sites: list,
             if read.query_sequence is None:
                 continue
 
-            # Build rpos → qbase map for this read, ref=A positions only
-            ref_a_calls = {}   # rel_pos → query base (A or G)
+            # Determine this read's view: reverse reads see complement of ref
+            is_rev = read.is_reverse
+
+            ref_a_calls = {}
             for qpos, rpos in read.get_aligned_pairs(matches_only=True):
                 if rpos < win_start or rpos >= win_end:
                     continue
-                ref_base = ref_seq[rpos - win_start]
-                if ref_base != "A":
+                ref_base_genomic = ref_seq[rpos - win_start]
+                # In read-strand transcript space
+                ref_base_read = complement_base(ref_base_genomic) if is_rev \
+                                else ref_base_genomic
+                if ref_base_read != "A":
                     continue
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
-                qbase = read.query_sequence[qpos].upper()
+                qbase_raw = read.query_sequence[qpos].upper()
+                qbase = complement_base(qbase_raw) if is_rev else qbase_raw
                 if qbase in ("A", "G"):
                     rel = rpos - edit_pos
+                    # For minus-strand genes, mirror the relative position
+                    if strand == "-":
+                        rel = -rel
                     if -window <= rel <= window:
                         ref_a_calls[rel] = qbase
 
-            # Need to have a call at the His A to classify this read
             if 0 not in ref_a_calls:
                 continue
 
             his_a_edited = ref_a_calls[0] == "G"
 
-            # Per-read overall editing efficiency: fraction of all ref=A
-            # positions on this read (excluding His A and codon flanks)
-            # that show G
-            window_calls = {
-                rp: qb for rp, qb in ref_a_calls.items()
-                if rp not in (0, -1, 1)
-            }
-            n_ref_a    = len(window_calls)
-            n_ag       = sum(1 for qb in window_calls.values() if qb == "G")
-            read_edit_eff = n_ag / n_ref_a if n_ref_a > 0 else np.nan
+            # Per-read overall editing efficiency: genome-wide, read-strand-aware
+            edits  = 0
+            num_as = 0
+            for qpos, rpos in read.get_aligned_pairs():
+                if rpos is None or qpos is None:
+                    continue
+                if rpos >= len(full_ref_seq):
+                    continue
+                ref_base_genomic = full_ref_seq[rpos]
+                ref_base_read = complement_base(ref_base_genomic) if is_rev \
+                                else ref_base_genomic
+                if ref_base_read == "A":
+                    num_as += 1
+                    qbase_raw = read.query_sequence[qpos].upper()
+                    qbase = complement_base(qbase_raw) if is_rev else qbase_raw
+                    if qbase == "G":
+                        edits += 1
+            read_edit_eff = edits / num_as if num_as > 0 else np.nan
 
             # Emit one summary row per read for the efficiency CDF
             records.append({
@@ -1172,169 +1454,145 @@ def plot_his_a_stratified(strat_dfs: dict,
     print(f"  Saved His-A stratified plots → {plot_path}", file=sys.stderr)
 
 
-def compute_quiet_zone(strat_raw: pd.DataFrame,
-                        half_width: int = 10) -> pd.DataFrame:
+
+def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
+                                        biotype_maps: dict,
+                                        labels: dict,
+                                        output_prefix: str):
     """
-    For each read, determine whether it has a 'quiet zone' — zero A→G
-    mismatches at any ref=A position within [-half_width, +half_width]
-    including the His A at rel_pos=0 (but still excluding codon flanks ±1
-    which are never ref=A for CAT/CAC).
+    For each library, show the distribution of per-read editing efficiency
+    broken down by transcript biotype.
 
-    The His A is included because a blocking protein would prevent editing
-    there too, so a truly blocked read shows no editing across the full zone.
-
-    Works from both per-position rows and the His A call stored in
-    his_a_edited on the read-level summary rows.
-    Returns a DataFrame with one row per unique (read_name, site_id):
-        read_name, site_id, his_a_edited, has_quiet_zone, read_edit_eff
+    Two panels per library:
+      - CDF of editing efficiency per biotype (overlaid)
+      - Boxplot of editing efficiency per biotype
     """
-    pos_rows = strat_raw[strat_raw["rel_pos"].notna()].copy()
+    sns.set_theme(style="whitegrid", font_scale=1.0)
 
-    # Restrict to positions within the quiet zone window (excludes ±1 already
-    # since those were never appended for CAT/CAC codons)
-    pos_rows = pos_rows[pos_rows["rel_pos"].abs() <= half_width]
+    # Extract read-level rows and attach all biotypes, exploding multi-biotype reads
+    lib_dfs = {}
+    all_biotypes = set()
+    for key in ("bam1", "bam2"):
+        raw = strat_raw_dfs[key]
+        read_rows = (
+            raw[raw["rel_pos"].isna()]
+               .drop_duplicates(subset=["read_name"])
+               [["read_name", "read_edit_eff"]]
+               .dropna(subset=["read_edit_eff"])
+        )
+        # Map each read to its biotype(s) and explode
+        bmap = biotype_maps[key]
+        read_rows = read_rows.copy()
+        read_rows["biotype_set"] = read_rows["read_name"].map(
+            lambda rn: list(bmap.get(rn, {"unassigned"}))
+        )
+        exploded = read_rows.explode("biotype_set").rename(
+            columns={"biotype_set": "biotype"}
+        )
+        lib_dfs[key] = exploded
+        all_biotypes.update(exploded["biotype"].unique())
 
-    # For each (read_name, site_id): any G mismatch in the flanking positions?
-    any_flank_edit = (
-        pos_rows.groupby(["read_name", "site_id"])["ag_edit"]
-                .max()
-                .reset_index()
-                .rename(columns={"ag_edit": "any_flank_edit"})
-    )
+    # Order biotypes by median editing efficiency across both libraries
+    med_eff = {}
+    for bt in all_biotypes:
+        vals = []
+        for df in lib_dfs.values():
+            sub = df[df["biotype"] == bt]["read_edit_eff"]
+            if len(sub) > 0:
+                vals.extend(sub.tolist())
+        med_eff[bt] = float(np.median(vals)) if vals else 0
+    biotype_order = sorted(all_biotypes, key=lambda bt: med_eff[bt], reverse=True)
 
-    # Join back his_a_edited and read_edit_eff from the read-level summary rows
-    read_rows = (
-        strat_raw[strat_raw["rel_pos"].isna()]
-                 .drop_duplicates(subset=["read_name", "site_id"])
-                 [["read_name", "site_id", "his_a_edited", "read_edit_eff"]]
-    )
-    result = any_flank_edit.merge(read_rows, on=["read_name", "site_id"], how="left")
-
-    # Quiet zone = no editing in flanks AND His A itself is not edited
-    result["has_quiet_zone"] = (
-        (result["any_flank_edit"] == 0) & (~result["his_a_edited"])
-    )
-    return result
-
-
-def plot_quiet_zone(quiet_dfs: dict,
-                    labels: dict,
-                    output_prefix: str,
-                    half_width: int = 10):
-    """
-    For each library, show:
-      - Fraction of reads with a quiet zone, split by His-A editing status
-      - CDF of overall editing efficiency for quiet-zone vs non-quiet-zone reads
-    """
-    sns.set_theme(style="whitegrid", font_scale=1.1)
+    palette = sns.color_palette("tab20", n_colors=len(biotype_order))
+    color_map = dict(zip(biotype_order, palette))
     c1, c2 = COLORS["bam1"], COLORS["bam2"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle(
-        f"Quiet zone analysis: ±{half_width} nt around His A (21 nt window, His A included)\n"
-        "Reads with zero A→G editing across entire zone (consistent with RBP blocking)",
-        fontsize=12, fontweight="bold"
-    )
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig.suptitle("Per-read A→G editing efficiency by transcript biotype",
+                 fontsize=13, fontweight="bold")
 
-    # ── Panel 0: fraction with quiet zone per library, by His-A status ────────
-    ax = axes[0]
-    bar_width = 0.35
-    x = np.arange(2)   # his_a_edited=False, True
-    x_labels = ["His-A unedited", "His-A edited"]
-
-    for i, (key, label, color) in enumerate([
+    for col, (key, label, lib_color) in enumerate([
         ("bam1", labels["bam1"], c1),
         ("bam2", labels["bam2"], c2),
     ]):
-        df = quiet_dfs[key]
-        fracs = []
-        ns    = []
-        for his_edited in [False, True]:
-            sub = df[df["his_a_edited"] == his_edited]
-            frac = sub["has_quiet_zone"].mean() if len(sub) > 0 else 0
-            fracs.append(frac)
-            ns.append(len(sub))
-        bars = ax.bar(x + i * bar_width, fracs, bar_width,
-                      label=label, color=color, alpha=0.8, edgecolor="white")
-        for bar, n in zip(bars, ns):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.005,
-                    f"n={n:,}", ha="center", va="bottom", fontsize=7)
+        df = lib_dfs[key]
 
-    ax.set_xticks(x + bar_width / 2)
-    ax.set_xticklabels(x_labels)
-    ax.set_ylabel("Fraction of reads with quiet zone")
-    ax.set_title("Fraction with quiet zone\nby His-A editing status")
-    ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-    ax.legend(fontsize=9)
-
-    # ── Panel 1: CDF of editing efficiency, quiet vs non-quiet ───────────────
-    ax = axes[1]
-    for key, label, color in [("bam1", labels["bam1"], c1),
-                               ("bam2", labels["bam2"], c2)]:
-        df = quiet_dfs[key].dropna(subset=["read_edit_eff"])
-        for has_qz, ls, suffix in [(True, "-", " quiet"), (False, "--", " non-quiet")]:
-            sub = df[df["has_quiet_zone"] == has_qz]["read_edit_eff"]
+        # ── Top: CDF per biotype ──────────────────────────────────────────────
+        ax = axes[0, col]
+        for bt in biotype_order:
+            sub = np.sort(df[df["biotype"] == bt]["read_edit_eff"].values)
             if len(sub) == 0:
                 continue
-            s = np.sort(sub.values)
-            c = np.arange(1, len(s) + 1) / len(s)
-            ax.plot(s, c, color=color, lw=2, ls=ls,
-                    label=f"{label}{suffix} (n={len(s):,})")
-    ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
-    ax.set_xlabel("Per-read A→G editing efficiency")
-    ax.set_ylabel("Cumulative fraction of reads")
-    ax.set_title("Editing efficiency CDF\nquiet zone vs non-quiet zone")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-    ax.legend(fontsize=7)
+            cdf    = np.arange(1, len(sub) + 1) / len(sub)
+            median = float(np.median(sub))
+            ax.plot(sub, cdf, color=color_map[bt], lw=1.5,
+                    label=f"{bt} (n={len(sub):,}, med={median:.3f})")
+        ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
+        ax.set_xlabel("Per-read A→G editing efficiency")
+        ax.set_ylabel("Cumulative fraction of reads")
+        ax.set_title(f"{label} — editing efficiency CDF by biotype")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax.legend(fontsize=7, loc="lower right")
 
-    # ── Panel 2: His-A editing rate in quiet vs non-quiet reads ──────────────
-    ax = axes[2]
-    bar_width = 0.35
-    x = np.arange(2)
-    x_labels = ["Quiet zone", "Non-quiet zone"]
+        # ── Bottom: boxplot per biotype ───────────────────────────────────────
+        ax = axes[1, col]
+        box_data   = []
+        box_colors = []
+        box_labels = []
+        box_ns     = []
+        for bt in biotype_order:
+            sub = df[df["biotype"] == bt]["read_edit_eff"].values
+            if len(sub) == 0:
+                continue
+            box_data.append(sub)
+            box_colors.append(color_map[bt])
+            box_labels.append(bt)
+            box_ns.append(len(sub))
 
-    for i, (key, label, color) in enumerate([
-        ("bam1", labels["bam1"], c1),
-        ("bam2", labels["bam2"], c2),
-    ]):
-        df = quiet_dfs[key]
-        fracs = []
-        ns    = []
-        for has_qz in [True, False]:
-            sub = df[df["has_quiet_zone"] == has_qz]
-            frac = sub["his_a_edited"].mean() if len(sub) > 0 else 0
-            fracs.append(frac)
-            ns.append(len(sub))
-        bars = ax.bar(x + i * bar_width, fracs, bar_width,
-                      label=label, color=color, alpha=0.8, edgecolor="white")
-        for bar, n in zip(bars, ns):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.005,
-                    f"n={n:,}", ha="center", va="bottom", fontsize=7)
-
-    ax.set_xticks(x + bar_width / 2)
-    ax.set_xticklabels(x_labels)
-    ax.set_ylabel("Fraction of reads with His A edited")
-    ax.set_title("His-A editing rate\nby quiet zone status")
-    ax.set_ylim(0, 1)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-    ax.legend(fontsize=9)
+        if box_data:
+            bp = ax.boxplot(box_data, patch_artist=True, notch=False,
+                            medianprops=dict(color="black", lw=1.5),
+                            flierprops=dict(marker=".", markersize=2,
+                                            alpha=0.3, color="grey"))
+            for patch, color in zip(bp["boxes"], box_colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.7)
+            ax.set_xticks(range(1, len(box_labels) + 1))
+            ax.set_xticklabels(
+                [f"{bt}\n(n={n:,})" for bt, n in zip(box_labels, box_ns)],
+                fontsize=7, rotation=30, ha="right"
+            )
+        ax.set_ylabel("Per-read A→G editing efficiency")
+        ax.set_title(f"{label} — editing efficiency by biotype")
+        ax.set_ylim(0, 1)
 
     plt.tight_layout()
-    plot_path = f"{output_prefix}_quiet_zone.png"
+    plot_path = f"{output_prefix}_efficiency_by_biotype.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Saved quiet zone plots → {plot_path}", file=sys.stderr)
+    print(f"  Saved editing efficiency by biotype → {plot_path}", file=sys.stderr)
 
-    # Save tables
+    # Save summary table
+    rows = []
     for key, label in labels.items():
-        quiet_dfs[key].to_csv(f"{output_prefix}_{key}_quiet_zone.csv", index=False)
-    print(f"  Saved quiet zone tables → {output_prefix}_bam*_quiet_zone.csv",
-          file=sys.stderr)
+        df = lib_dfs[key]
+        for bt in biotype_order:
+            sub = df[df["biotype"] == bt]["read_edit_eff"]
+            if len(sub) == 0:
+                continue
+            rows.append({
+                "library":  label,
+                "biotype":  bt,
+                "n_reads":  len(sub),
+                "mean":     sub.mean(),
+                "median":   sub.median(),
+                "std":      sub.std(),
+            })
+    pd.DataFrame(rows).to_csv(
+        f"{output_prefix}_efficiency_by_biotype.csv", index=False
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1361,6 +1619,9 @@ def parse_args():
     p.add_argument("--min_baseq", type=int, default=10)
     p.add_argument("--output", default="his_edit_comparison",
                    help="Output file prefix (default: his_edit_comparison)")
+    p.add_argument("--gene_list", default=None,
+                   help="Text file with one gene/transcript ID per line. "
+                        "If provided, only His sites on these genes are analysed.")
     p.add_argument("--chroms", nargs="*", default=None,
                    help="Restrict to specific chromosomes/contigs")
     return p.parse_args()
@@ -1377,6 +1638,26 @@ def main():
     print("Opening reference and parsing GTF…", file=sys.stderr)
     ref_fasta    = pysam.FastaFile(args.ref)
     cds_by_chrom = parse_gtf_cds(args.gtf)
+
+    # ── Gene list filter ──────────────────────────────────────────────────────
+    if args.gene_list:
+        with open(args.gene_list) as fh:
+            allowed_genes = {line.strip() for line in fh if line.strip()}
+        print(f"  Loaded {len(allowed_genes):,} genes from {args.gene_list}.",
+              file=sys.stderr)
+        # Keep CDS intervals whose gene_name is in the list
+        filtered = {}
+        for chrom, intervals in cds_by_chrom.items():
+            kept = [(s, e, st, tid, gname) for s, e, st, tid, gname in intervals
+                    if gname in allowed_genes]
+            if kept:
+                filtered[chrom] = kept
+        n_before = sum(len(v) for v in cds_by_chrom.values())
+        n_after  = sum(len(v) for v in filtered.values())
+        print(f"  Filtered CDS intervals: {n_before:,} → {n_after:,} "
+              f"({len(filtered):,} chromosomes retained).", file=sys.stderr)
+        cds_by_chrom = filtered
+
     if args.chroms:
         cds_by_chrom = {k: v for k, v in cds_by_chrom.items() if k in args.chroms}
 
@@ -1477,16 +1758,38 @@ def main():
         print(f"  Sites up in {args.label1:10s} (log2FC < 0) : "
               f"{(merged['log2fc'] < 0).sum():,}", file=sys.stderr)
 
+    # ── Biotype assignment ────────────────────────────────────────────────────
+    print("\nBuilding biotype index from GTF…", file=sys.stderr)
+    biotype_idx = parse_gtf_biotypes(args.gtf)
+
+    print("Assigning reads to biotypes…", file=sys.stderr)
+    biotype_maps = {}
+    for key, bam_path, label in [
+        ("bam1", args.bam1, args.label1),
+        ("bam2", args.bam2, args.label2),
+    ]:
+        print(f"  [{label}]…", file=sys.stderr)
+        biotype_maps[key] = assign_read_biotypes(
+            bam_path, biotype_idx, min_mapq=args.min_mapq
+        )
+
+    print("Generating biotype count plots…", file=sys.stderr)
+    plot_biotype_counts(
+        biotype_maps,
+        labels={"bam1": args.label1, "bam2": args.label2},
+        output_prefix=out,
+    )
+
     # ── Plots ─────────────────────────────────────────────────────────────────
-    print("\nGenerating periodicity plots…", file=sys.stderr)
+    # print("\nGenerating periodicity plots…", file=sys.stderr)
     bam1 = pysam.AlignmentFile(args.bam1, "rb")
     bam2 = pysam.AlignmentFile(args.bam2, "rb")
     ref_fasta = pysam.FastaFile(args.ref)
-    plot_periodicity(
-        sites, bam1, bam2, ref_fasta,
-        s1, s2, args.label1, args.label2,
-        out, args.window, args.min_mapq, args.min_baseq,
-    )
+    # plot_periodicity(
+    #     sites, bam1, bam2, ref_fasta,
+    #     s1, s2, args.label1, args.label2,
+    #     out, args.window, args.min_mapq, args.min_baseq,
+    # )
 
     print("\nCollecting read-level stratified data…", file=sys.stderr)
     strat_dfs     = {}
@@ -1502,6 +1805,10 @@ def main():
         )
         bam_fresh.close()
         strat_raw_dfs[key] = strat_raw
+        # Attach biotypes to strat_raw for downstream breakdowns
+        strat_raw["biotypes"] = strat_raw["read_name"].map(
+            lambda rn: ",".join(sorted(biotype_maps[key].get(rn, {"unassigned"})))
+        )
         strat_dfs[key]     = compute_stratified_log2fc(strat_raw)
         strat_raw.to_csv(f"{out}_{key}_his_a_stratified.csv.gz",
                          index=False, compression="gzip")
@@ -1511,6 +1818,13 @@ def main():
                     out, args.window, args.min_edit_fraction,
                     strat_raw_dfs=strat_raw_dfs)
 
+    print("\nGenerating editing efficiency by biotype plots…", file=sys.stderr)
+    plot_editing_efficiency_by_biotype(
+        strat_raw_dfs, biotype_maps,
+        labels={"bam1": args.label1, "bam2": args.label2},
+        output_prefix=out,
+    )
+
     print("\nGenerating His-A stratified plots…", file=sys.stderr)
     plot_his_a_stratified(
         strat_dfs,
@@ -1518,17 +1832,6 @@ def main():
         labels={"bam1": args.label1, "bam2": args.label2},
         output_prefix=out,
         window=args.window,
-    )
-
-    print("\nGenerating quiet zone plots…", file=sys.stderr)
-    quiet_dfs = {
-        key: compute_quiet_zone(strat_raw_dfs[key])
-        for key in ("bam1", "bam2")
-    }
-    plot_quiet_zone(
-        quiet_dfs,
-        labels={"bam1": args.label1, "bam2": args.label2},
-        output_prefix=out,
     )
 
     bam1.close()

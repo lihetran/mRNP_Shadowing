@@ -45,11 +45,35 @@ def reverseComplement(seq):
 
         return reverse_complement
 
-def mutateBam(input_bam):
-    # create a mutated bam file where all C's are changed to T's
-    # this will allow for better alignment of APOBEC edited reads to the reference sequence
-    # output is a bam file with the same header as the input bam file
+# def mutateBam(input_bam):
+#     # create a mutated bam file where all C's are changed to T's
+#     # this will allow for better alignment of APOBEC edited reads to the reference sequence
+#     # output is a bam file with the same header as the input bam file
+#
+#     mutated_bam = input_bam.replace('.bam', '_mutated.bam')
+#     read_dict = {}
+#     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as in_bam:
+#         with pysam.AlignmentFile(mutated_bam, "wb", template=in_bam) as out_bam:
+#             for read in in_bam:
+#                 seq = read.query_sequence
+#                 if seq is not None:
+#                     rc = reverseComplement(seq) # reverse complement the sequence bc of cDNA sequencing
+#                     new_seq, positions = replaceCharacter(rc, 'A', 'G')
+#                     read.query_sequence = new_seq
+#                     # # need to update the qualities too
+#                     # if read.query_qualities is not None:
+#                     #     quals = read.query_qualities
+#                     #     new_quals = [quals[i] for i in range(len(quals)) if i not in positions]
+#                     #     read.query_qualities = new_quals
+#                     out_bam.write(read)
+#                     read_dict[read.query_name] = rc # store the original read sequence for later
+#
+#     return mutated_bam, read_dict
 
+def mutateBam(input_bam):
+    # create a mutated bam file where all A's are changed to G's
+    # this will allow for better alignment of TadA edited reads to the reference sequence
+    # dorado handles strand orientation for cDNA, so no RC step needed
     mutated_bam = input_bam.replace('.bam', '_mutated.bam')
     read_dict = {}
     with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as in_bam:
@@ -57,17 +81,15 @@ def mutateBam(input_bam):
             for read in in_bam:
                 seq = read.query_sequence
                 if seq is not None:
-                    rc = reverseComplement(seq) # reverse complement the sequence bc of cDNA sequencing
-                    new_seq, positions = replaceCharacter(rc, 'A', 'G')
+                    new_seq, positions = replaceCharacter(seq, 'A', 'G')
+                    orig_quals = read.query_qualities
+                    read.query_qualities = None
                     read.query_sequence = new_seq
-                    # # need to update the qualities too
-                    # if read.query_qualities is not None:
-                    #     quals = read.query_qualities
-                    #     new_quals = [quals[i] for i in range(len(quals)) if i not in positions]
-                    #     read.query_qualities = new_quals
+                    if orig_quals is not None:
+                        read.query_qualities = orig_quals
                     out_bam.write(read)
-                    read_dict[read.query_name] = rc # store the original read sequence for later
-        
+                    read_dict[read.query_name] = seq
+
     return mutated_bam, read_dict
 
 def mutateFasta(input_fasta):
@@ -85,29 +107,55 @@ def mutateFasta(input_fasta):
     
     return output_fasta
 
+# def dorado_aligner(mutated_bam, ref_fasta, read_dict, out_bam):
+#
+#     tmp_bam = out_bam.replace('.bam', '_tmp.bam')
+#     # output is a bam file
+#     cmd = 'dorado aligner ' + str(ref_fasta) + ' ' + str(mutated_bam) + ' > ' + tmp_bam + ' --mm2-opts "-x map-ont --secondary=no"'
+#     print(cmd)
+#     # run the command
+#     subprocess.call(cmd, shell=True)
+#     # subprocess.run(['dorado aligner', ref_fasta, mutated_bam, '-o', out_bam], shell=True)
+#
+#     with pysam.AlignmentFile(tmp_bam, "rb") as bam:
+#          with pysam.AlignmentFile(out_bam, "wb", template=bam) as out_bam_file:
+#             for read in bam:
+#                 if not read.is_unmapped and not read.is_secondary and not read.is_supplementary:
+#                     read_id = read.query_name
+#                     if read_id in read_dict:
+#                         original_seq = read_dict[read_id]
+#                         read.query_sequence = original_seq
+#                         out_bam_file.write(read)
+#
+#
+#     bam.close()
+#     # sort and index the bam file
+#     sorted_bam = out_bam.replace('.bam', '_sorted.bam')
+#     subprocess.call('samtools sort ' + out_bam + ' > ' + sorted_bam, shell=True)
+#     subprocess.call('samtools index ' + sorted_bam, shell=True)
+#
+#     return sorted_bam
+
 def dorado_aligner(mutated_bam, ref_fasta, read_dict, out_bam):
-    
     tmp_bam = out_bam.replace('.bam', '_tmp.bam')
-    # output is a bam file
-    cmd = 'dorado aligner ' + str(ref_fasta) + ' ' + str(mutated_bam) + ' > ' + tmp_bam + ' --mm2-opts "-x map-ont --secondary=no"'
+
+    # Fix: --mm2-opts must come BEFORE the redirect
+    cmd = f'dorado aligner {ref_fasta} {mutated_bam} --mm2-opts "-x map-ont --secondary=no" > {tmp_bam}'
     print(cmd)
-    # run the command
     subprocess.call(cmd, shell=True)
-    # subprocess.run(['dorado aligner', ref_fasta, mutated_bam, '-o', out_bam], shell=True)
 
     with pysam.AlignmentFile(tmp_bam, "rb") as bam:
-         with pysam.AlignmentFile(out_bam, "wb", template=bam) as out_bam_file:
+        with pysam.AlignmentFile(out_bam, "wb", template=bam) as out_bam_file:
             for read in bam:
                 if not read.is_unmapped and not read.is_secondary and not read.is_supplementary:
                     read_id = read.query_name
                     if read_id in read_dict:
                         original_seq = read_dict[read_id]
+                        # Fix: clear qualities before changing sequence
+                        read.query_qualities = None
                         read.query_sequence = original_seq
                         out_bam_file.write(read)
 
-
-    bam.close()
-    # sort and index the bam file
     sorted_bam = out_bam.replace('.bam', '_sorted.bam')
     subprocess.call('samtools sort ' + out_bam + ' > ' + sorted_bam, shell=True)
     subprocess.call('samtools index ' + sorted_bam, shell=True)
@@ -173,6 +221,13 @@ def main():
     # mutate the bam file and reference fasta file
 
     mutated_bam, read_dict = mutateBam(args.reads_bam)
+    # Add this right after mutateBam returns
+    print("Sample read_dict entries:")
+    for i, (k, v) in enumerate(read_dict.items()):
+        if i >= 3:
+            break
+        print(f"{k}: {v[:50]}")  # first 50 bases of each
+
     mutated_ref = mutateFasta(args.ref_fasta)
     print(f'Mutated bam file: {mutated_bam}')
     print(f'Mutated reference fasta file: {mutated_ref}')
