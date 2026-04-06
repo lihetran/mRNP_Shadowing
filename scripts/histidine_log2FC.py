@@ -68,7 +68,7 @@ def parse_gtf_cds(gtf_path: str) -> dict:
 def parse_gtf_biotypes(gtf_path: str) -> dict:
     """
     Parse all features from the GTF that have a transcript_biotype attribute.
-    Returns a dict: chrom → sorted list of (start0, end0, biotype)
+    Returns a dict: chrom → sorted list of (start0, end0, biotype, gene_name)
     covering every feature interval (gene, transcript, exon, CDS, etc.).
     Using all feature types ensures reads in UTRs/introns are still assigned.
     """
@@ -80,20 +80,20 @@ def parse_gtf_biotypes(gtf_path: str) -> dict:
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 9:
                 continue
-            # Use transcript-level features to avoid redundant sub-feature hits
             if fields[2] not in ("transcript", "gene"):
                 continue
             m = re.search(r'transcript_biotype "([^"]+)"', fields[8])
             if not m:
-                # fall back to gene_biotype if transcript_biotype absent
                 m = re.search(r'gene_biotype "([^"]+)"', fields[8])
             if not m:
                 continue
-            chrom   = fields[0]
-            start   = int(fields[3]) - 1
-            end     = int(fields[4])
-            biotype = m.group(1)
-            idx[chrom].append((start, end, biotype))
+            gn = re.search(r'gene_name "([^"]+)"', fields[8])
+            chrom     = fields[0]
+            start     = int(fields[3]) - 1
+            end       = int(fields[4])
+            biotype   = m.group(1)
+            gene_name = gn.group(1) if gn else "."
+            idx[chrom].append((start, end, biotype, gene_name))
     for chrom in idx:
         idx[chrom].sort()
     return dict(idx)
@@ -104,17 +104,16 @@ def overlapping_biotypes(chrom: str,
                           read_end: int,
                           biotype_idx: dict) -> set:
     """
-    Return the set of all biotypes whose intervals overlap [read_start, read_end)
-    on chrom. Uses a linear scan over the sorted interval list — fast enough
-    for typical GTF sizes; replace with an interval tree if needed.
+    Return a set of (biotype, gene_name) tuples for all intervals overlapping
+    [read_start, read_end) on chrom.
     """
     intervals = biotype_idx.get(chrom, [])
     result = set()
-    for (start, end, biotype) in intervals:
+    for (start, end, biotype, gene_name) in intervals:
         if start >= read_end:
-            break   # sorted by start — no more overlaps possible
+            break
         if end > read_start:
-            result.add(biotype)
+            result.add((biotype, gene_name))
     return result
 
 
@@ -126,8 +125,19 @@ def assign_read_biotypes(bam_path: str,
     intervals overlap its alignment. Reads with no overlap get biotype
     'intergenic'.
 
-    Returns dict: read_name → frozenset of biotypes.
+    Ribosomal protein genes (gene_name matching RPL* or RPS*) are
+    reclassified from 'protein_coding' to 'ribosomal_protein' so they
+    can be distinguished from other protein-coding genes in plots.
+
+    Returns dict: read_name → frozenset of biotypes (strings).
     """
+    def _reclassify(biotype: str, gene_name: str) -> str:
+        if biotype == "protein_coding" and \
+           (gene_name.upper().startswith("RPL") or
+            gene_name.upper().startswith("RPS")):
+            return "ribosomal_protein"
+        return biotype
+
     read_biotypes = {}
     bam = pysam.AlignmentFile(bam_path, "rb")
     for read in bam:
@@ -135,14 +145,19 @@ def assign_read_biotypes(bam_path: str,
             continue
         if read.mapping_quality < min_mapq:
             continue
-        biotypes = overlapping_biotypes(
+        hits = overlapping_biotypes(
             read.reference_name,
             read.reference_start,
             read.reference_end,
             biotype_idx,
         )
-        read_biotypes[read.query_name] = frozenset(biotypes) if biotypes \
-                                         else frozenset(["intergenic"])
+        if hits:
+            biotypes = frozenset(
+                _reclassify(bt, gn) for bt, gn in hits
+            )
+        else:
+            biotypes = frozenset(["intergenic"])
+        read_biotypes[read.query_name] = biotypes
     bam.close()
     return read_biotypes
 
@@ -344,10 +359,18 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
                     codon = reverse_complement(codon)
                 if codon in HIS_CODONS:
                     if strand == "+":
+                        # CAT/CAC on plus strand: C at cds_start+i, A at +1, T/C at +2
                         codon_ref_start = cds_start + i
+                        edit_pos        = codon_ref_start + 1
                     else:
-                        codon_ref_start = cds_end - i - 3
-                    edit_pos  = codon_ref_start + 1
+                        # On minus strand, cds_seq[i:i+3] is the plus-strand sequence
+                        # whose reverse complement is the transcript codon CAT/CAC.
+                        # The plus-strand triplet is ATG or GTG (rev-comp of CAT/CAC).
+                        # The transcript A (edit target) is at transcript position 1,
+                        # which is the complement of the middle plus-strand base.
+                        # Genomic position of the middle base = cds_start + i + 1.
+                        codon_ref_start = cds_start + i
+                        edit_pos        = cds_start + i + 1
                     win_start = max(0, edit_pos - window)
                     win_end   = min(chrom_len, edit_pos + window + 1)
                     sites.append({
@@ -424,20 +447,14 @@ def count_mismatches_at_site(bam: pysam.AlignmentFile,
         for pread in pcolumn.pileups:
             if pread.is_del or pread.is_refskip:
                 continue
-            qbase = pread.alignment.query_sequence[pread.query_position].upper()
-            # For unstranded nanopore data: complement both ref and query for
-            # reverse-strand reads so everything is in transcript coordinates.
-            # A→G edits appear as ref=A,read=G on forward reads and
-            # ref=T,read=C on reverse reads in the raw alignment.
-            if pread.alignment.is_reverse:
-                qbase = complement_base(qbase)
+            qbase_raw = pread.alignment.query_sequence[pread.query_position].upper()
+            # Convert to transcript coordinates using XOR of read strand and gene strand:
+            # needs_complement when read orientation doesn't match gene orientation
+            needs_complement = pread.alignment.is_reverse != (strand == "-")
+            qbase = complement_base(qbase_raw) if needs_complement else qbase_raw
             counts[qbase] += 1
 
         total = sum(counts.values())
-        # ref_base in transcript coordinates: complement if position is on minus
-        # strand of reference (i.e. the majority of reads covering it are reverse)
-        # We use read-level complementing above, so ref_base stays as plus-strand
-        # for the position filter but we record it complemented for minus-strand sites
         pos_data[rel_pos] = {
             "ref_pos":  ref_pos,
             "ref_base": ref_base if strand == "+" else complement_base(ref_base),
@@ -918,22 +935,25 @@ def build_co_occurrence_matrix(sites: list,
                 continue
 
             is_rev = read.is_reverse
+            needs_complement = is_rev != (strand == "-")
+
             ag_rel_positions = []
             for qpos, rpos in read.get_aligned_pairs(matches_only=True):
                 if rpos < win_start or rpos >= win_end:
                     continue
                 ref_idx          = rpos - win_start
                 ref_base_genomic = ref_seq[ref_idx] if ref_idx < len(ref_seq) else "N"
-                ref_base_read    = complement_base(ref_base_genomic) if is_rev \
-                                   else ref_base_genomic
-                if ref_base_read != "A":
+                ref_base_tx      = complement_base(ref_base_genomic) \
+                                   if needs_complement else ref_base_genomic
+                if ref_base_tx != "A":
                     continue
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
                 qbase_raw = read.query_sequence[qpos].upper()
-                qbase     = complement_base(qbase_raw) if is_rev else qbase_raw
-                if qbase == "G":
+                qbase_tx  = complement_base(qbase_raw) \
+                            if needs_complement else qbase_raw
+                if qbase_tx == "G":
                     rel = rpos - edit_pos
                     if strand == "-":
                         rel = -rel
@@ -1130,16 +1150,6 @@ def collect_his_a_stratified(sites: list,
         ref_seq      = chrom_seq_cache[chrom][win_start:win_end]
         full_ref_seq = chrom_seq_cache[chrom]
 
-        # In transcript coordinates, an A→G edit is always ref=A, read=G.
-        # For unstranded nanopore reads this appears as:
-        #   forward read: ref=A, read=G  (plus-strand gene or reverse-strand gene)
-        #   reverse read: ref=T, read=C  (complement in raw alignment)
-        # So we complement both ref and query for reverse reads, then look for A→G.
-        # The genomic ref base at the His A is determined by gene strand:
-        #   plus-strand gene:  ref=A on plus strand
-        #   minus-strand gene: ref=T on plus strand (A on transcript)
-        ref_transcript_a = "A" if strand == "+" else "T"
-
         for read in bam.fetch(chrom, win_start, win_end):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
@@ -1148,38 +1158,44 @@ def collect_his_a_stratified(sites: list,
             if read.query_sequence is None:
                 continue
 
-            # Determine this read's view: reverse reads see complement of ref
             is_rev = read.is_reverse
+
+            # Convert genomic bases to transcript coordinates.
+            # A read is in transcript orientation when:
+            #   - it is forward on a plus-strand gene, OR
+            #   - it is reverse on a minus-strand gene
+            # In both cases (is_rev XOR gene_minus) == False → no complement needed.
+            # Otherwise complement both ref and query to get transcript bases.
+            needs_complement = is_rev != (strand == "-")
 
             ref_a_calls = {}
             for qpos, rpos in read.get_aligned_pairs(matches_only=True):
                 if rpos < win_start or rpos >= win_end:
                     continue
                 ref_base_genomic = ref_seq[rpos - win_start]
-                # In read-strand transcript space
-                ref_base_read = complement_base(ref_base_genomic) if is_rev \
-                                else ref_base_genomic
-                if ref_base_read != "A":
+                ref_base_tx = complement_base(ref_base_genomic) \
+                              if needs_complement else ref_base_genomic
+                if ref_base_tx != "A":
                     continue
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
                 qbase_raw = read.query_sequence[qpos].upper()
-                qbase = complement_base(qbase_raw) if is_rev else qbase_raw
-                if qbase in ("A", "G"):
+                qbase_tx  = complement_base(qbase_raw) \
+                            if needs_complement else qbase_raw
+                if qbase_tx in ("A", "G"):
                     rel = rpos - edit_pos
-                    # For minus-strand genes, mirror the relative position
                     if strand == "-":
                         rel = -rel
                     if -window <= rel <= window:
-                        ref_a_calls[rel] = qbase
+                        ref_a_calls[rel] = qbase_tx
 
             if 0 not in ref_a_calls:
                 continue
 
             his_a_edited = ref_a_calls[0] == "G"
 
-            # Per-read overall editing efficiency: genome-wide, read-strand-aware
+            # Per-read overall editing efficiency: genome-wide, transcript-aware
             edits  = 0
             num_as = 0
             for qpos, rpos in read.get_aligned_pairs():
@@ -1188,13 +1204,14 @@ def collect_his_a_stratified(sites: list,
                 if rpos >= len(full_ref_seq):
                     continue
                 ref_base_genomic = full_ref_seq[rpos]
-                ref_base_read = complement_base(ref_base_genomic) if is_rev \
-                                else ref_base_genomic
-                if ref_base_read == "A":
+                ref_base_tx = complement_base(ref_base_genomic) \
+                              if needs_complement else ref_base_genomic
+                if ref_base_tx == "A":
                     num_as += 1
                     qbase_raw = read.query_sequence[qpos].upper()
-                    qbase = complement_base(qbase_raw) if is_rev else qbase_raw
-                    if qbase == "G":
+                    qbase_tx  = complement_base(qbase_raw) \
+                                if needs_complement else qbase_raw
+                    if qbase_tx == "G":
                         edits += 1
             read_edit_eff = edits / num_as if num_as > 0 else np.nan
 
@@ -1715,20 +1732,17 @@ def main():
         s["rel_position_agg"].to_csv(f"{out}_{key}_meta_aggregation.csv", index=False)
         s["edited_sites"].to_csv(f"{out}_{key}_edited_sites.csv", index=False)
 
-    # Save merged per-site editing table
+    # Save merged per-site editing table — use pseudocount so sites with
+    # zero editing in one condition still contribute rather than being dropped
+    pseudo = 1e-3
     ha1 = s1["his_a_sites"][["site_id", "chrom", "edit_pos", "transcript",
                               "codon", "ag_edit_frac", "coverage"]].dropna()
     ha2 = s2["his_a_sites"][["site_id", "ag_edit_frac", "coverage"]].dropna()
     merged = ha1.merge(ha2, on="site_id",
                        suffixes=(f"_{args.label1}", f"_{args.label2}"))
-    # exclude sites where either condition has zero editing — no pseudocount
-    merged = merged[
-        (merged[f"ag_edit_frac_{args.label1}"] > 0) &
-        (merged[f"ag_edit_frac_{args.label2}"] > 0)
-    ].copy()
     merged["log2fc"] = np.log2(
-        merged[f"ag_edit_frac_{args.label2}"] /
-        merged[f"ag_edit_frac_{args.label1}"]
+        (merged[f"ag_edit_frac_{args.label2}"] + pseudo) /
+        (merged[f"ag_edit_frac_{args.label1}"] + pseudo)
     )
     merged = merged.sort_values("log2fc", ascending=False)
     merged.to_csv(f"{out}_per_site_log2fc.csv", index=False)
