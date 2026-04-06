@@ -340,10 +340,16 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
 
 
 
-def find_his_positions(ref_fasta: pysam.FastaFile,
-                       cds_by_chrom: dict,
-                       window: int) -> list:
-    # Collect all sites first, then assign per-transcript rank
+def find_codon_positions(ref_fasta: pysam.FastaFile,
+                         cds_by_chrom: dict,
+                         window: int,
+                         target_codons: set,
+                         codon_label: str = "codon") -> list:
+    """
+    General version of find_his_positions — finds any set of target codons.
+    edit_pos is always the middle base (position 1) of the codon, which is
+    the A in His (CAT/CAC) and equivalent position in control codons.
+    """
     sites = []
     for chrom, intervals in cds_by_chrom.items():
         try:
@@ -357,20 +363,9 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
                 codon = cds_seq[i:i+3]
                 if strand == "-":
                     codon = reverse_complement(codon)
-                if codon in HIS_CODONS:
-                    if strand == "+":
-                        # CAT/CAC on plus strand: C at cds_start+i, A at +1, T/C at +2
-                        codon_ref_start = cds_start + i
-                        edit_pos        = codon_ref_start + 1
-                    else:
-                        # On minus strand, cds_seq[i:i+3] is the plus-strand sequence
-                        # whose reverse complement is the transcript codon CAT/CAC.
-                        # The plus-strand triplet is ATG or GTG (rev-comp of CAT/CAC).
-                        # The transcript A (edit target) is at transcript position 1,
-                        # which is the complement of the middle plus-strand base.
-                        # Genomic position of the middle base = cds_start + i + 1.
-                        codon_ref_start = cds_start + i
-                        edit_pos        = cds_start + i + 1
+                if codon in target_codons:
+                    codon_ref_start = cds_start + i
+                    edit_pos        = cds_start + i + 1  # middle base, both strands
                     win_start = max(0, edit_pos - window)
                     win_end   = min(chrom_len, edit_pos + window + 1)
                     sites.append({
@@ -383,19 +378,14 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
                         "gene_name":   gname,
                         "win_start":   win_start,
                         "win_end":     win_end,
+                        "codon_label": codon_label,
                     })
 
-    # Assign 1-based rank of each His codon within its transcript,
-    # ordered by position in the CDS walk (transcript order).
     tid_counter: dict = collections.defaultdict(int)
     for site in sites:
         tid_counter[site["transcript"]] += 1
         site["his_rank"] = tid_counter[site["transcript"]]
 
-    # Deduplicate by edit_pos — overlapping isoforms/genes can produce
-    # multiple entries for the same genomic A, which would cause the same
-    # reads to be counted multiple times. Keep the first occurrence
-    # (lowest his_rank, first transcript encountered).
     seen_positions = set()
     deduped = []
     for site in sites:
@@ -404,9 +394,19 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
             seen_positions.add(key)
             deduped.append(site)
 
-    print(f"  Deduplicated {len(sites):,} → {len(deduped):,} unique His A positions.",
-          file=sys.stderr)
+    print(f"  [{codon_label}] {len(deduped):,} unique sites "
+          f"(deduplicated from {len(sites):,}).", file=sys.stderr)
     return deduped
+
+
+def find_his_positions(ref_fasta: pysam.FastaFile,
+                       cds_by_chrom: dict,
+                       window: int) -> list:
+    return find_codon_positions(
+        ref_fasta, cds_by_chrom, window,
+        target_codons=HIS_CODONS,
+        codon_label="His",
+    )
 
 
 def reverse_complement(seq: str) -> str:
@@ -442,6 +442,8 @@ def count_mismatches_at_site(bam: pysam.AlignmentFile,
             continue
         ref_base = ref_fasta.fetch(chrom, ref_pos, ref_pos + 1).upper()
         rel_pos  = ref_pos - edit_pos
+        if strand == "-":
+            rel_pos = -rel_pos
 
         counts = collections.Counter()
         for pread in pcolumn.pileups:
@@ -1612,6 +1614,117 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
     )
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Control codon specificity analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default control codons: CAA (Gln), ACA (Thr), TAT (Tyr)
+# All have an A at codon position 1, matching the His edit target position
+CONTROL_CODONS = {
+    "CAA": {"CAA"},          # Gln — same first two bases as His
+    "ACA": {"ACA"},          # Thr
+    "TAT": {"TAT", "TAC"},   # Tyr — two codons, both have A at position 1
+}
+
+
+def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
+                            his_agg_bam2: pd.DataFrame,
+                            control_aggs: dict,
+                            label1: str,
+                            label2: str,
+                            output_prefix: str,
+                            window: int):
+    """
+    Two-row figure showing meta-analysis editing profiles for His and each
+    control codon, one column per codon. Row 0 = BAM1, Row 1 = BAM2.
+    A separate panel overlays all codons for each BAM for direct comparison.
+    """
+    sns.set_theme(style="whitegrid", font_scale=1.0)
+    c1, c2 = COLORS["bam1"], COLORS["bam2"]
+
+    codon_names  = ["His"] + list(control_aggs.keys())
+    n_codons     = len(codon_names)
+    codon_colors = sns.color_palette("tab10", n_colors=n_codons)
+    codon_color_map = dict(zip(codon_names, codon_colors))
+
+    # ── Figure 1: per-BAM rows, per-codon columns ─────────────────────────────
+    ncols = n_codons + 1   # one col per codon + one overlay col
+    fig, axes = plt.subplots(2, ncols, figsize=(4 * ncols, 9), sharey=False)
+    fig.suptitle(
+        "Codon specificity: His vs control codons\n"
+        "(meta A→G editing fraction at position 1 of each codon)",
+        fontsize=12, fontweight="bold"
+    )
+
+    for row, (bam_label, color, his_agg) in enumerate([
+        (label1, c1, his_agg_bam1),
+        (label2, c2, his_agg_bam2),
+    ]):
+        # Individual codon panels
+        for col, codon_name in enumerate(codon_names):
+            ax = axes[row, col]
+            if codon_name == "His":
+                agg = his_agg
+            else:
+                agg = control_aggs[codon_name].get(bam_label, pd.DataFrame())
+
+            ax.axhline(0, color="grey", lw=0.8, ls="--", alpha=0.5)
+            ax.axvline(0, color="crimson", lw=1.5, ls="--", label="Position 1 (A)")
+            ax.axvspan(-1, 1, alpha=0.08, color=codon_color_map[codon_name])
+
+            if not agg.empty:
+                n = int(agg["n_transcripts"].max())
+                ax.plot(agg["rel_pos"], agg["mean_edit_frac"],
+                        color=codon_color_map[codon_name], lw=2,
+                        label=f"{codon_name} (n={n:,})")
+                ax.fill_between(
+                    agg["rel_pos"],
+                    agg["mean_edit_frac"] - agg["sem_edit_frac"],
+                    agg["mean_edit_frac"] + agg["sem_edit_frac"],
+                    alpha=0.2, color=codon_color_map[codon_name],
+                )
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        transform=ax.transAxes)
+
+            ax.set_xlim(-window, window)
+            ax.set_xlabel("Position relative to codon A")
+            ax.set_ylabel("Mean A→G edit fraction")
+            ax.set_title(f"{bam_label} — {codon_name}")
+            ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+            ax.legend(fontsize=8)
+
+        # Overlay panel (last column)
+        ax = axes[row, -1]
+        ax.axhline(0, color="grey", lw=0.8, ls="--", alpha=0.5)
+        ax.axvline(0, color="crimson", lw=1.5, ls="--", label="Position 1 (A)")
+        for codon_name in codon_names:
+            if codon_name == "His":
+                agg = his_agg
+            else:
+                agg = control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            if agg.empty:
+                continue
+            lw = 2.5 if codon_name == "His" else 1.5
+            ax.plot(agg["rel_pos"], agg["mean_edit_frac"],
+                    color=codon_color_map[codon_name], lw=lw,
+                    label=codon_name,
+                    ls="-" if codon_name == "His" else "--")
+        ax.set_xlim(-window, window)
+        ax.set_xlabel("Position relative to codon A")
+        ax.set_ylabel("Mean A→G edit fraction")
+        ax.set_title(f"{bam_label} — overlay")
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=1))
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plot_path = f"{output_prefix}_codon_specificity.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved codon specificity plots → {plot_path}", file=sys.stderr)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1639,6 +1752,11 @@ def parse_args():
     p.add_argument("--gene_list", default=None,
                    help="Text file with one gene/transcript ID per line. "
                         "If provided, only His sites on these genes are analysed.")
+    p.add_argument("--control_codons", nargs="*", default=None,
+                   help="Control codon names to run specificity analysis "
+                        f"(default: {list(CONTROL_CODONS.keys())}). "
+                        "Must be keys of the CONTROL_CODONS dict in the script, "
+                        "or pass none to skip.")
     p.add_argument("--chroms", nargs="*", default=None,
                    help="Restrict to specific chromosomes/contigs")
     return p.parse_args()
@@ -1772,7 +1890,59 @@ def main():
         print(f"  Sites up in {args.label1:10s} (log2FC < 0) : "
               f"{(merged['log2fc'] < 0).sum():,}", file=sys.stderr)
 
-    # ── Biotype assignment ────────────────────────────────────────────────────
+    # ── Control codon specificity analysis ───────────────────────────────────
+    control_codons_to_run = args.control_codons \
+                            if args.control_codons is not None \
+                            else list(CONTROL_CODONS.keys())
+
+    if control_codons_to_run:
+        print("\nRunning control codon specificity analysis…", file=sys.stderr)
+        # control_aggs: codon_name → {label → rel_agg DataFrame}
+        control_aggs = {}
+        ref_fasta_ctrl = pysam.FastaFile(args.ref)
+
+        for codon_name in control_codons_to_run:
+            if codon_name not in CONTROL_CODONS:
+                print(f"  WARNING: unknown control codon '{codon_name}', skipping.",
+                      file=sys.stderr)
+                continue
+            print(f"  [{codon_name}] Finding sites…", file=sys.stderr)
+            ctrl_sites = find_codon_positions(
+                ref_fasta_ctrl, cds_by_chrom, args.window,
+                target_codons=CONTROL_CODONS[codon_name],
+                codon_label=codon_name,
+            )
+            control_aggs[codon_name] = {}
+            for key, bam_path, label in [
+                ("bam1", args.bam1, args.label1),
+                ("bam2", args.bam2, args.label2),
+            ]:
+                print(f"  [{codon_name}] Pileup {label}…", file=sys.stderr)
+                bam_ctrl = pysam.AlignmentFile(bam_path, "rb")
+                ctrl_df  = aggregate_sites(
+                    ctrl_sites, bam_ctrl, ref_fasta_ctrl,
+                    min_coverage=args.min_coverage,
+                    min_mapq=args.min_mapq,
+                    min_baseq=args.min_baseq,
+                    label=f"{label}/{codon_name}",
+                )
+                bam_ctrl.close()
+                control_aggs[codon_name][label] = \
+                    transcript_normalised_agg(ctrl_df) if not ctrl_df.empty \
+                    else pd.DataFrame()
+
+        ref_fasta_ctrl.close()
+
+        print("\nGenerating codon specificity plots…", file=sys.stderr)
+        plot_codon_specificity(
+            his_agg_bam1=s1["rel_position_agg"],
+            his_agg_bam2=s2["rel_position_agg"],
+            control_aggs=control_aggs,
+            label1=args.label1,
+            label2=args.label2,
+            output_prefix=out,
+            window=args.window,
+        )
     print("\nBuilding biotype index from GTF…", file=sys.stderr)
     biotype_idx = parse_gtf_biotypes(args.gtf)
 
