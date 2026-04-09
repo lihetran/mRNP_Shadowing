@@ -44,45 +44,68 @@ HIS_CODONS = {"CAT", "CAC"}
 
 def parse_gtf(gtf_path: str) -> dict:
     """
-    Parse GTF CDS features. Returns:
+    Parse GTF to get gene body extent and CDS intervals per gene.
+    Returns:
         gene_name → {
             "chrom":      str,
             "strand":     "+" | "-",
+            "gene_start": int (0-based),
+            "gene_end":   int,
             "transcript": str,
             "gene_name":  str,
             "cds":        sorted list of (start0, end0)
         }
-    One entry per gene_name, using the first transcript encountered.
+    gene_start/gene_end span the full gene body (from gene feature or
+    min/max of CDS intervals as fallback).
     """
     genes = {}
+    gene_extents = {}   # gene_name → (start, end)
+
     with open(gtf_path) as fh:
         for line in fh:
             if line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
-            if len(fields) < 9 or fields[2] != "CDS":
+            if len(fields) < 9:
                 continue
-            chrom  = fields[0]
-            start  = int(fields[3]) - 1   # GTF 1-based → 0-based
-            end    = int(fields[4])
-            strand = fields[6]
-            m_tid  = re.search(r'transcript_id "([^"]+)"', fields[8])
-            m_gn   = re.search(r'gene_name "([^"]+)"', fields[8])
-            tid    = m_tid.group(1) if m_tid else "."
-            gname  = m_gn.group(1)  if m_gn  else tid
+            feature = fields[2]
+            chrom   = fields[0]
+            start   = int(fields[3]) - 1
+            end     = int(fields[4])
+            strand  = fields[6]
+            m_gn    = re.search(r'gene_name "([^"]+)"', fields[8])
+            m_tid   = re.search(r'transcript_id "([^"]+)"', fields[8])
+            gname   = m_gn.group(1)  if m_gn  else None
+            tid     = m_tid.group(1) if m_tid else "."
 
-            if gname not in genes:
-                genes[gname] = {
-                    "chrom":      chrom,
-                    "strand":     strand,
-                    "transcript": tid,
-                    "gene_name":  gname,
-                    "cds":        [],
-                }
-            genes[gname]["cds"].append((start, end))
+            if gname is None:
+                continue
 
-    # Sort CDS intervals; for minus-strand genes sort descending so we can
-    # walk them in transcript order later
+            if feature == "gene":
+                gene_extents[gname] = (start, end)
+
+            if feature == "CDS":
+                if gname not in genes:
+                    genes[gname] = {
+                        "chrom":      chrom,
+                        "strand":     strand,
+                        "transcript": tid,
+                        "gene_name":  gname,
+                        "cds":        [],
+                    }
+                genes[gname]["cds"].append((start, end))
+
+    # Attach gene body extent; fall back to min/max of CDS if no gene feature
+    for gname, g in genes.items():
+        if gname in gene_extents:
+            g["gene_start"], g["gene_end"] = gene_extents[gname]
+        else:
+            all_starts = [s for s, e in g["cds"]]
+            all_ends   = [e for s, e in g["cds"]]
+            g["gene_start"] = min(all_starts)
+            g["gene_end"]   = max(all_ends)
+
+    # Sort CDS intervals in transcript order
     for g in genes.values():
         g["cds"].sort(key=lambda x: x[0],
                       reverse=(g["strand"] == "-"))
@@ -157,71 +180,80 @@ def build_editing_matrix(bam: pysam.AlignmentFile,
                           min_mapq: int,
                           min_baseq: int) -> pd.DataFrame:
     """
-    For every CDS position in transcript order, compute:
+    For every position across the full gene body (gene_start to gene_end)
+    in transcript order, compute:
         - ref_base (transcript coordinates)
         - A, G, C, T counts (transcript coordinates)
         - coverage
         - ag_edit_frac = G/(A+G) where ref_base == A, else NaN
+        - in_cds: bool — whether position falls inside a CDS interval
 
-    Returns a DataFrame indexed by transcript position (0-based).
     Strand handling: uses read.is_reverse XOR (strand=="-") to convert
     each read to transcript coordinates before counting.
     """
-    chrom  = gene["chrom"]
-    strand = gene["strand"]
+    chrom      = gene["chrom"]
+    strand     = gene["strand"]
+    gene_start = gene["gene_start"]
+    gene_end   = gene["gene_end"]
+
+    # Build a set of CDS genomic positions for fast lookup
+    cds_positions = set()
+    for (cs, ce) in gene["cds"]:
+        cds_positions.update(range(cs, ce))
+
     records = []
-    tx_pos  = 0   # transcript coordinate counter
+    tx_pos  = 0
 
-    for (cds_start, cds_end) in gene["cds"]:
-        # Genomic positions in transcript order
-        if strand == "+":
-            gpos_range = range(cds_start, cds_end)
-        else:
-            gpos_range = range(cds_end - 1, cds_start - 1, -1)
+    # Walk all genomic positions across the gene body in transcript order
+    if strand == "+":
+        gpos_range = range(gene_start, gene_end)
+    else:
+        gpos_range = range(gene_end - 1, gene_start - 1, -1)
 
-        for gpos in gpos_range:
-            ref_base_genomic = ref_fasta.fetch(chrom, gpos, gpos + 1).upper()
-            ref_base_tx = complement_base(ref_base_genomic) \
-                          if strand == "-" else ref_base_genomic
+    for gpos in gpos_range:
+        ref_base_genomic = ref_fasta.fetch(chrom, gpos, gpos + 1).upper()
+        ref_base_tx = complement_base(ref_base_genomic) \
+                      if strand == "-" else ref_base_genomic
 
-            counts = collections.Counter()
-            for col in bam.pileup(
-                chrom, gpos, gpos + 1,
-                truncate=True,
-                min_mapping_quality=min_mapq,
-                min_base_quality=min_baseq,
-                stepper="samtools",
-            ):
-                if col.reference_pos != gpos:
+        counts = collections.Counter()
+        for col in bam.pileup(
+            chrom, gpos, gpos + 1,
+            truncate=True,
+            min_mapping_quality=min_mapq,
+            min_base_quality=min_baseq,
+            stepper="samtools",
+        ):
+            if col.reference_pos != gpos:
+                continue
+            for pread in col.pileups:
+                if pread.is_del or pread.is_refskip:
                     continue
-                for pread in col.pileups:
-                    if pread.is_del or pread.is_refskip:
-                        continue
-                    qbase_raw = pread.alignment.query_sequence[
-                        pread.query_position
-                    ].upper()
-                    needs_complement = pread.alignment.is_reverse != (strand == "-")
-                    qbase = complement_base(qbase_raw) if needs_complement \
-                            else qbase_raw
-                    counts[qbase] += 1
+                qbase_raw = pread.alignment.query_sequence[
+                    pread.query_position
+                ].upper()
+                needs_complement = pread.alignment.is_reverse != (strand == "-")
+                qbase = complement_base(qbase_raw) if needs_complement \
+                        else qbase_raw
+                counts[qbase] += 1
 
-            cov      = sum(counts.values())
-            ag_denom = counts["A"] + counts["G"]
-            ag_frac  = counts["G"] / ag_denom \
-                       if ref_base_tx == "A" and ag_denom > 0 else np.nan
+        cov      = sum(counts.values())
+        ag_denom = counts["A"] + counts["G"]
+        ag_frac  = counts["G"] / ag_denom \
+                   if ref_base_tx == "A" and ag_denom > 0 else np.nan
 
-            records.append({
-                "tx_pos":       tx_pos,
-                "gpos":         gpos,
-                "ref_base":     ref_base_tx,
-                "A":            counts["A"],
-                "G":            counts["G"],
-                "C":            counts["C"],
-                "T":            counts["T"],
-                "coverage":     cov,
-                "ag_edit_frac": ag_frac,
-            })
-            tx_pos += 1
+        records.append({
+            "tx_pos":       tx_pos,
+            "gpos":         gpos,
+            "ref_base":     ref_base_tx,
+            "in_cds":       gpos in cds_positions,
+            "A":            counts["A"],
+            "G":            counts["G"],
+            "C":            counts["C"],
+            "T":            counts["T"],
+            "coverage":     cov,
+            "ag_edit_frac": ag_frac,
+        })
+        tx_pos += 1
 
     return pd.DataFrame(records)
 
@@ -312,9 +344,10 @@ def plot_gene(gene_name: str,
     col_his = color.cmyk(0, 1, 1, 0)        # red    — His lines
     col_zero = color.cmyk(0, 0, 0, 1)       # black  — zero line
 
-    panel_width  = 12
-    panel_height = 3
-    panel_gap    = 1.5
+    panel_width   = 12
+    panel_height  = 3
+    panel_gap     = 1.5
+    bottom_margin = 1.5   # space below log2FC panel for x-axis labels
 
     c = canvas.canvas()
 
@@ -358,7 +391,7 @@ def plot_gene(gene_name: str,
         return g
 
     def make_log2fc_panel(ypos, share_xaxis):
-        """Build the log2FC panel with black dashed zero line."""
+        """Build the log2FC panel with horizontal black dashed zero line."""
         y_min = float(np.nanmin(log2fc_smooth)) if len(log2fc_smooth) > 0 else -2
         y_max = float(np.nanmax(log2fc_smooth)) if len(log2fc_smooth) > 0 else  2
         y_abs = max(abs(y_min), abs(y_max), 0.5)
@@ -369,13 +402,15 @@ def plot_gene(gene_name: str,
             height=panel_height,
             ypos=ypos,
             x=graph.axis.linkedaxis(share_xaxis.axes["x"]),
-            y=graph.axis.linear(min=y_min, max=y_max,
-                                title=f"log2FC ({label2}/{label1})"),
+            y=graph.axis.linear(
+                min=y_min, max=y_max,
+                title=f"log2FC ({label2}/{label1})",
+            ),
         )
 
-        # Black dashed zero line
+        # Horizontal black dashed zero line — y(x)=0 draws a horizontal line
         g.plot(
-            graph.data.function("x(y)=0", min=y_min, max=y_max),
+            graph.data.function("y(x)=0", min=x_min, max=x_max),
             [graph.style.line([col_zero, style.linewidth.thin,
                                style.linestyle.dashed])]
         )
@@ -399,10 +434,11 @@ def plot_gene(gene_name: str,
 
         return g
 
-    # Build panels — BAM1 first to establish reference x-axis
-    y0 = 0
-    y1 = panel_height + panel_gap
-    y2 = 2 * (panel_height + panel_gap)
+    # Build panels — BAM1 first to establish reference x-axis.
+    # Offset all panels by bottom_margin so log2FC axis labels aren't clipped.
+    y0 = bottom_margin
+    y1 = bottom_margin + panel_height + panel_gap
+    y2 = bottom_margin + 2 * (panel_height + panel_gap)
 
     g_bam1   = make_panel(ypos=y2, frac_data=frac1_smooth, col=col1,
                            bam_label=label1, share_xaxis=None)
@@ -414,13 +450,162 @@ def plot_gene(gene_name: str,
     c.insert(g_bam2)
     c.insert(g_bam1)
 
-    # Title
+    # Title above top panel
     pyx_text.set(pyx_text.LatexRunner)
     c.text(panel_width / 2, y2 + panel_height + 0.3,
            gene_name.replace("_", r"\_"),
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     c.writePDFfile(pdf_path)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b. Matplotlib version of per-gene plot
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_gene_mpl(gene_name: str,
+                  df1: pd.DataFrame,
+                  df2: pd.DataFrame,
+                  label1: str,
+                  label2: str,
+                  his_positions: list,
+                  pseudo: float,
+                  pdf_path: str,
+                  rolling_window: int = 10):
+    """
+    Three independent matplotlib panels (not sharing x-axis):
+      Panel 0 (top):    rolling mean edit frequency — BAM1
+      Panel 1 (middle): rolling mean edit frequency — BAM2
+      Panel 2 (bottom): log2FC (BAM2/BAM1) with dashed zero line
+
+    CDS regions shaded in light grey. His codon A positions marked
+    with vertical red lines across all panels.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    # Merge on tx_pos, restrict to ref=A
+    merged = df1[["tx_pos", "ref_base", "ag_edit_frac", "in_cds"]].merge(
+        df2[["tx_pos", "ag_edit_frac"]],
+        on="tx_pos", suffixes=(f"_{label1}", f"_{label2}")
+    )
+    ref_a  = merged[merged["ref_base"] == "A"].copy()
+    pos    = ref_a["tx_pos"].values
+    frac1  = ref_a[f"ag_edit_frac_{label1}"].fillna(0).values
+    frac2  = ref_a[f"ag_edit_frac_{label2}"].fillna(0).values
+    log2fc = np.log2((frac2 + pseudo) / (frac1 + pseudo))
+
+    def rolling(arr):
+        return pd.Series(arr).rolling(
+            rolling_window, center=True, min_periods=1
+        ).mean().values
+
+    frac1_s  = rolling(frac1)
+    frac2_s  = rolling(frac2)
+    log2fc_s = rolling(log2fc)
+
+    # CDS regions as contiguous blocks of tx_pos where in_cds=True
+    cds_blocks = []
+    in_cds = merged["in_cds"].values
+    tx_pos_all = merged["tx_pos"].values
+    in_block = False
+    block_start = None
+    for i, (tp, ic) in enumerate(zip(tx_pos_all, in_cds)):
+        if ic and not in_block:
+            block_start = tp
+            in_block = True
+        elif not ic and in_block:
+            cds_blocks.append((block_start, tx_pos_all[i - 1]))
+            in_block = False
+    if in_block:
+        cds_blocks.append((block_start, tx_pos_all[-1]))
+
+    col1    = "#1a1a1a"
+    col2    = "#1060c0"
+    col_fc  = "#5588aa"
+    col_his = "crimson"
+    col_cds = "#e8e8e8"   # light grey CDS shading
+
+    def _shade_cds(ax, ymin, ymax):
+        for (bs, be) in cds_blocks:
+            ax.axvspan(bs, be, color=col_cds, zorder=0)
+
+    def _add_his(ax):
+        for hp in his_positions:
+            ax.axvline(hp, color=col_his, lw=0.6, alpha=0.7, zorder=2)
+
+    def _style(ax):
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color("black")
+            spine.set_linewidth(0.8)
+        if len(pos) > 0:
+            ax.set_xlim(pos[0], pos[-1])
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 10))
+    fig.suptitle(gene_name, fontsize=16, fontweight="bold")
+    fig.subplots_adjust(hspace=0.45)
+
+    # ── Panel 0: BAM1 ─────────────────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(pos, frac1_s, color=col1, lw=1.2, zorder=3)
+    _add_his(ax)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel(f"{label1}\nEdit Freq", fontsize=12)
+    ax.set_xlabel("Position Along Transcript", fontsize=11)
+    ax.yaxis.set_major_locator(plt.MultipleLocator(0.5))
+    ax.tick_params(axis="both", labelsize=10)
+    _style(ax)
+
+    # ── Panel 1: BAM2 ─────────────────────────────────────────────────────────
+    ax = axes[1]
+    ax.plot(pos, frac2_s, color=col2, lw=1.2, zorder=3)
+    _add_his(ax)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel(f"{label2}\nEdit Freq", fontsize=12)
+    ax.set_xlabel("Position Along Transcript", fontsize=11)
+    ax.yaxis.set_major_locator(plt.MultipleLocator(0.5))
+    ax.tick_params(axis="both", labelsize=10)
+    _style(ax)
+
+    # ── Panel 2: log2FC ───────────────────────────────────────────────────────
+    ax = axes[2]
+    y_abs = max(np.nanmax(np.abs(log2fc_s)), 0.5) if len(log2fc_s) > 0 else 1
+    ax.plot(pos, log2fc_s, color=col_fc, lw=1.2, zorder=3)
+    ax.axhline(0, color="black", lw=1.0, ls="--", zorder=2)
+    _add_his(ax)
+    ax.set_ylim(-y_abs * 1.1, y_abs * 1.1)
+    ax.set_ylabel(f"log2FC\n({label2}/{label1})", fontsize=12)
+    ax.set_xlabel("Position Along Transcript", fontsize=11)
+    ax.tick_params(axis="both", labelsize=10)
+    _style(ax)
+
+    import matplotlib.lines as mlines
+
+    his_line = mlines.Line2D([], [], color=col_his, lw=1.2, alpha=0.7,
+                              label=f"His codon A (n={len(his_positions)})")
+    fig.legend(
+        handles=[his_line],
+        loc="upper right",
+        fontsize=11,
+        framealpha=0.8,
+        borderpad=0.6,
+    )
+
+    fig.text(0.01, 0.01,
+             f"His codons: {len(his_positions)}  |  "
+             f"ref=A positions: {len(pos)}  |  "
+             f"Gene body: {len(merged)} nt  |  "
+             f"rolling window: {rolling_window} nt  |  "
+             f"CDS shaded grey",
+             fontsize=9, color="grey")
+
+    with PdfPages(pdf_path) as pdf:
+        pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,8 +722,8 @@ def main():
 
         # One PDF per gene
         safe_name = re.sub(r"[^\w\-]", "_", gname)
-        gene_pdf  = str(pdf_dir / safe_name)
-        plot_gene(
+        gene_pdf  = str(pdf_dir / f"{safe_name}.pdf")
+        plot_gene_mpl(
             gname, df1, df2,
             args.label1, args.label2,
             his_positions,

@@ -747,9 +747,7 @@ def plot_comparison(s1: dict, s2: dict,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_comparison_plots.png"
-    svg_path = f"{output_prefix}_comparison_plots.svg"
-    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-    plt.savefig(svg_path, bbox_inches="tight")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved comparison plots → {plot_path}", file=sys.stderr)
 
@@ -862,9 +860,7 @@ def plot_rank_comparison(s1: dict, s2: dict,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_rank_plots.png"
-    svg_path = f"{output_prefix}_rank_plots.svg"
-    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-    plt.savefig(svg_path, bbox_inches="tight")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved rank comparison plots → {plot_path}", file=sys.stderr)
 
@@ -1724,11 +1720,343 @@ def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_codon_specificity.png"
-    svg_path = f"{output_prefix}_codon_specificity.svg"
-    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-    plt.savefig(svg_path, bbox_inches="tight")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved codon specificity plots → {plot_path}", file=sys.stderr)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pyx plotting functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pyx_meta_graph(c, xpos, ypos, datasets, window,
+                    y_title="A\u2192G edit frac",
+                    share_xaxis=None):
+    """
+    Insert one meta-analysis panel into canvas c.
+    datasets: list of (rel_agg DataFrame, pyx color, linestyle) tuples.
+              All datasets are plotted before the graph is inserted so
+              overlaying multiple lines on the same axes works correctly.
+    Returns the graph object for x-axis linking.
+    """
+    from pyx import graph, color, style
+
+    # Compute y_max across all datasets
+    y_max = 0.02
+    for rel_agg, col, ls in datasets:
+        if rel_agg.empty:
+            continue
+        frac = rel_agg["mean_edit_frac"].values
+        sem  = rel_agg["sem_edit_frac"].values
+        candidate = float(np.nanmax(frac + sem)) * 1.15 if len(frac) > 0 else 0
+        y_max = max(y_max, candidate)
+
+    x_axis = graph.axis.linear(min=-window, max=window,
+                                title="Position relative to His A") \
+             if share_xaxis is None \
+             else graph.axis.linkedaxis(share_xaxis.axes["x"])
+
+    g = graph.graphxy(
+        width=8, height=3,
+        xpos=xpos, ypos=ypos,
+        x=x_axis,
+        y=graph.axis.linear(min=0, max=y_max, title=y_title),
+    )
+
+    # Codon span and His A line — drawn first so data sits on top
+    g.plot(graph.data.function("x(y)=-1", min=0, max=y_max),
+           [graph.style.line([color.gray(0.8), style.linewidth.thin])])
+    g.plot(graph.data.function("x(y)=1", min=0, max=y_max),
+           [graph.style.line([color.gray(0.8), style.linewidth.thin])])
+    g.plot(graph.data.function("x(y)=0", min=0, max=y_max),
+           [graph.style.line([color.cmyk(0, 1, 1, 0),
+                              style.linewidth.thick,
+                              style.linestyle.dashed])])
+
+    # Plot each dataset
+    for rel_agg, col, ls in datasets:
+        if rel_agg.empty:
+            continue
+        pos  = rel_agg["rel_pos"].values
+        frac = rel_agg["mean_edit_frac"].values
+        sem  = rel_agg["sem_edit_frac"].values
+
+        # SEM dotted bounds
+        for pts in [list(zip(pos.tolist(), (frac - sem).tolist())),
+                    list(zip(pos.tolist(), (frac + sem).tolist()))]:
+            g.plot(graph.data.points(pts, x=1, y=2),
+                   [graph.style.line([col, style.linewidth.thin,
+                                      style.linestyle.dotted])])
+        # Mean line
+        g.plot(graph.data.points(list(zip(pos.tolist(), frac.tolist())), x=1, y=2),
+               [graph.style.line([col, style.linewidth.normal, ls])])
+
+    c.insert(g)
+    return g
+
+
+def _pyx_log2fc_graph(c, xpos, ypos, log2fc_agg, label1, label2, window,
+                      col1, col2, share_xaxis=None):
+    """Insert a log2FC panel into canvas c."""
+    from pyx import graph, color, style
+
+    if log2fc_agg.empty:
+        return None
+
+    pos    = log2fc_agg["rel_pos"].values
+    fc     = log2fc_agg["mean_log2fc"].values
+    sem_fc = log2fc_agg["sem_log2fc"].values
+
+    y_abs = max(np.nanmax(np.abs(fc)), 0.5) * 1.15
+    y_min, y_max = -y_abs, y_abs
+
+    x_axis = graph.axis.linear(min=-window, max=window,
+                                title="Position relative to His A") \
+             if share_xaxis is None \
+             else graph.axis.linkedaxis(share_xaxis.axes["x"])
+
+    g = graph.graphxy(
+        width=8, height=3,
+        xpos=xpos, ypos=ypos,
+        x=x_axis,
+        y=graph.axis.linear(min=y_min, max=y_max,
+                            title=f"log2FC ({label2}/{label1})"),
+    )
+
+    # Horizontal zero line
+    g.plot(graph.data.function("y(x)=0", min=-window, max=window),
+           [graph.style.line([color.cmyk(0, 0, 0, 1), style.linewidth.thin,
+                              style.linestyle.dashed])])
+
+    # His A vertical line
+    g.plot(graph.data.function("x(y)=0", min=y_min, max=y_max),
+           [graph.style.line([color.cmyk(0, 1, 1, 0),
+                              style.linewidth.thick,
+                              style.linestyle.dashed])])
+
+    # SEM dotted bounds
+    for pts in [list(zip(pos.tolist(), (fc - sem_fc).tolist())),
+                list(zip(pos.tolist(), (fc + sem_fc).tolist()))]:
+        g.plot(graph.data.points(pts, x=1, y=2),
+               [graph.style.line([color.gray(0.5), style.linewidth.thin,
+                                  style.linestyle.dotted])])
+
+    # log2FC line
+    g.plot(graph.data.points(list(zip(pos.tolist(), fc.tolist())), x=1, y=2),
+           [graph.style.line([color.cmyk(0, 0, 0, 1), style.linewidth.normal,
+                              style.linestyle.solid])])
+
+    c.insert(g)
+    return g
+
+
+def plot_comparison_pyx(s1: dict, s2: dict,
+                         label1: str, label2: str,
+                         output_prefix: str,
+                         window: int):
+    """
+    Pyx version of the comparison figure.
+    Layout (left→right, bottom→top):
+      Row 1 (bottom): log2FC meta-plot | CDF of His A editing
+      Row 0 (top):    BAM1 meta-plot   | BAM2 meta-plot
+    """
+    from pyx import canvas, color, style, text as pyx_text
+
+    col1 = color.cmyk(0, 0, 0, 1)
+    col2 = color.cmyk(1, 0.5, 0, 0)
+
+    panel_w = 8
+    panel_h = 3
+    gap     = 1.5
+
+    c = canvas.canvas()
+
+    # Row 0 (top): individual meta-plots
+    g1 = _pyx_meta_graph(c, xpos=0, ypos=panel_h + gap,
+                          datasets=[(s1["rel_position_agg"], col1,
+                                     style.linestyle.solid)],
+                          y_title=f"{label1} A\u2192G edit frac",
+                          window=window)
+    g2 = _pyx_meta_graph(c, xpos=panel_w + gap, ypos=panel_h + gap,
+                          datasets=[(s2["rel_position_agg"], col2,
+                                     style.linestyle.solid)],
+                          y_title=f"{label2} A\u2192G edit frac",
+                          window=window)
+
+    # Row 1 (bottom): log2FC and CDF
+    _pyx_log2fc_graph(c, xpos=0, ypos=0,
+                      log2fc_agg=s1["log2fc_agg"],
+                      label1=label1, label2=label2,
+                      window=window, col1=col1, col2=col2)
+    _pyx_cdf_graph(c, xpos=panel_w + gap, ypos=0,
+                   s1=s1, s2=s2, label1=label1, label2=label2,
+                   col1=col1, col2=col2)
+
+    pyx_text.set(pyx_text.LatexRunner)
+    plot_path = f"{output_prefix}_comparison_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved pyx comparison plots → {plot_path}.pdf", file=sys.stderr)
+
+
+def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2):
+    """CDF of His A editing fraction for both BAMs."""
+    from pyx import graph, style
+
+    g = graph.graphxy(
+        width=8, height=3,
+        xpos=xpos, ypos=ypos,
+        x=graph.axis.linear(min=0, max=1,
+                            title="A\u2192G edit frac at His A"),
+        y=graph.axis.linear(min=0, max=1,
+                            title="Cumulative fraction"),
+    )
+
+    for fracs, col in [(s1["edit_frac_dist"], col1),
+                        (s2["edit_frac_dist"], col2)]:
+        if len(fracs) == 0:
+            continue
+        sf  = np.sort(fracs.values)
+        cdf = np.arange(1, len(sf) + 1) / len(sf)
+        g.plot(graph.data.points(list(zip(sf.tolist(), cdf.tolist())), x=1, y=2),
+               [graph.style.line([col, style.linewidth.normal,
+                                  style.linestyle.solid])])
+
+    c.insert(g)
+    return g
+
+
+def plot_rank_comparison_pyx(s1: dict, s2: dict,
+                              label1: str, label2: str,
+                              output_prefix: str,
+                              window: int):
+    """
+    Pyx version of the rank comparison figure.
+    3 columns (ranks 1-3), 2 rows (overlaid meta-plot top, log2FC bottom).
+    Both BAMs are plotted before insertion so the overlay is correct.
+    """
+    from pyx import canvas, color, style, text as pyx_text
+
+    col1 = color.cmyk(0, 0, 0, 1)
+    col2 = color.cmyk(1, 0.5, 0, 0)
+
+    panel_w = 6
+    panel_h = 3
+    gap     = 1.2
+
+    c = canvas.canvas()
+
+    for col_idx, rank in enumerate([1, 2, 3]):
+        xpos = col_idx * (panel_w + gap)
+        r1   = s1["rank_agg"].get(rank, pd.DataFrame())
+        r2   = s2["rank_agg"].get(rank, pd.DataFrame())
+        rank_labels = {1: "1st", 2: "2nd", 3: "3rd"}
+        y_title = f"{rank_labels[rank]} His codon A\u2192G edit frac"
+
+        # Top row: both BAMs overlaid — passed as datasets list so both
+        # are plotted before c.insert(), fixing the overlay bug
+        g_top = _pyx_meta_graph(
+            c, xpos=xpos, ypos=panel_h + gap,
+            datasets=[
+                (r1, col1, style.linestyle.solid),
+                (r2, col2, style.linestyle.solid),
+            ],
+            y_title=y_title,
+            window=window,
+        )
+
+        # Bottom row: log2FC linked to top x-axis
+        rank_fc = s1["rank_log2fc_agg"].get(rank, pd.DataFrame())
+        _pyx_log2fc_graph(c, xpos=xpos, ypos=0,
+                           log2fc_agg=rank_fc,
+                           label1=label1, label2=label2,
+                           window=window, col1=col1, col2=col2,
+                           share_xaxis=g_top)
+
+    pyx_text.set(pyx_text.LatexRunner)
+    plot_path = f"{output_prefix}_rank_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved pyx rank plots → {plot_path}.pdf", file=sys.stderr)
+
+
+def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
+                                his_agg_bam2: pd.DataFrame,
+                                control_aggs: dict,
+                                label1: str,
+                                label2: str,
+                                output_prefix: str,
+                                window: int):
+    """
+    Pyx version of the codon specificity figure.
+    Layout: 2 rows (BAM1 top, BAM2 bottom) × (n_codons + 1) columns.
+    Last column in each row overlays all codons.
+    Each codon gets a distinct CMYK colour.
+    """
+    from pyx import canvas, color, style, text as pyx_text
+
+    codon_names = ["His"] + list(control_aggs.keys())
+
+    # Distinct CMYK colours for each codon
+    codon_colors_cmyk = [
+        color.cmyk(0, 1, 1, 0),        # red   — His
+        color.cmyk(1, 0.5, 0, 0),      # blue  — control 1
+        color.cmyk(0.1, 0.05, 0.9, 0), # green — control 2
+        color.cmyk(0.97, 0, 0.75, 0),  # teal  — control 3
+        color.cmyk(0, 0.6, 0.3, 0),    # pink  — control 4
+    ]
+    codon_color_map = {name: codon_colors_cmyk[i]
+                       for i, name in enumerate(codon_names)}
+
+    panel_w = 6
+    panel_h = 3
+    gap     = 1.2
+    row_gap = 1.5
+    ncols   = len(codon_names) + 1   # individual + overlay
+
+    c = canvas.canvas()
+
+    for row_idx, (bam_label, his_agg) in enumerate([
+        (label1, his_agg_bam1),
+        (label2, his_agg_bam2),
+    ]):
+        # pyx y increases upward: BAM1 on top = higher ypos
+        ypos = (1 - row_idx) * (panel_h + row_gap)
+
+        for col_idx, codon_name in enumerate(codon_names):
+            xpos = col_idx * (panel_w + gap)
+            agg  = his_agg if codon_name == "His" \
+                   else control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            col  = codon_color_map[codon_name]
+
+            _pyx_meta_graph(
+                c, xpos=xpos, ypos=ypos,
+                datasets=[(agg, col, style.linestyle.solid)],
+                y_title=f"{bam_label} {codon_name} edit frac",
+                window=window,
+            )
+
+        # Overlay column: all codons on the same panel
+        overlay_datasets = []
+        for codon_name in codon_names:
+            agg = his_agg if codon_name == "His" \
+                  else control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            ls  = style.linestyle.solid if codon_name == "His" \
+                  else style.linestyle.dashed
+            overlay_datasets.append((agg, codon_color_map[codon_name], ls))
+
+        xpos_overlay = len(codon_names) * (panel_w + gap)
+        _pyx_meta_graph(
+            c, xpos=xpos_overlay, ypos=ypos,
+            datasets=overlay_datasets,
+            y_title=f"{bam_label} edit frac (overlay)",
+            window=window,
+        )
+
+    pyx_text.set(pyx_text.LatexRunner)
+    plot_path = f"{output_prefix}_codon_specificity_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved pyx codon specificity plots → {plot_path}.pdf",
+          file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1949,6 +2277,15 @@ def main():
             output_prefix=out,
             window=args.window,
         )
+        plot_codon_specificity_pyx(
+            his_agg_bam1=s1["rel_position_agg"],
+            his_agg_bam2=s2["rel_position_agg"],
+            control_aggs=control_aggs,
+            label1=args.label1,
+            label2=args.label2,
+            output_prefix=out,
+            window=args.window,
+        )
     print("\nBuilding biotype index from GTF…", file=sys.stderr)
     biotype_idx = parse_gtf_biotypes(args.gtf)
 
@@ -1981,48 +2318,54 @@ def main():
     #     out, args.window, args.min_mapq, args.min_baseq,
     # )
 
-    print("\nCollecting read-level stratified data…", file=sys.stderr)
-    strat_dfs     = {}
-    strat_raw_dfs = {}
-    for key, label in [("bam1", args.label1), ("bam2", args.label2)]:
-        bam_fresh = pysam.AlignmentFile(
-            args.bam1 if key == "bam1" else args.bam2, "rb"
-        )
-        print(f"  [{label}]…", file=sys.stderr)
-        strat_raw = collect_his_a_stratified(
-            sites, bam_fresh, ref_fasta, args.window,
-            min_mapq=args.min_mapq, min_baseq=args.min_baseq,
-        )
-        bam_fresh.close()
-        strat_raw_dfs[key] = strat_raw
-        # Attach biotypes to strat_raw for downstream breakdowns
-        strat_raw["biotypes"] = strat_raw["read_name"].map(
-            lambda rn: ",".join(sorted(biotype_maps[key].get(rn, {"unassigned"})))
-        )
-        strat_dfs[key]     = compute_stratified_log2fc(strat_raw)
-        strat_raw.to_csv(f"{out}_{key}_his_a_stratified.csv.gz",
-                         index=False, compression="gzip")
+    # print("\nCollecting read-level stratified data…", file=sys.stderr)
+    # strat_dfs     = {}
+    # strat_raw_dfs = {}
+    # for key, label in [("bam1", args.label1), ("bam2", args.label2)]:
+    #     bam_fresh = pysam.AlignmentFile(
+    #         args.bam1 if key == "bam1" else args.bam2, "rb"
+    #     )
+    #     print(f"  [{label}]…", file=sys.stderr)
+    #     strat_raw = collect_his_a_stratified(
+    #         sites, bam_fresh, ref_fasta, args.window,
+    #         min_mapq=args.min_mapq, min_baseq=args.min_baseq,
+    #     )
+    #     bam_fresh.close()
+    #     strat_raw_dfs[key] = strat_raw
+    #     strat_raw["biotypes"] = strat_raw["read_name"].map(
+    #         lambda rn: ",".join(sorted(biotype_maps[key].get(rn, {"unassigned"})))
+    #     )
+    #     strat_dfs[key]     = compute_stratified_log2fc(strat_raw)
+    #     strat_raw.to_csv(f"{out}_{key}_his_a_stratified.csv.gz",
+    #                      index=False, compression="gzip")
 
-    print("\nGenerating comparison plots…", file=sys.stderr)
+    print("\nGenerating comparison plots (matplotlib)…", file=sys.stderr)
     plot_comparison(s1, s2, args.label1, args.label2,
-                    out, args.window, args.min_edit_fraction,
-                    strat_raw_dfs=strat_raw_dfs)
+                    out, args.window, args.min_edit_fraction)
 
-    print("\nGenerating editing efficiency by biotype plots…", file=sys.stderr)
-    plot_editing_efficiency_by_biotype(
-        strat_raw_dfs, biotype_maps,
-        labels={"bam1": args.label1, "bam2": args.label2},
-        output_prefix=out,
-    )
+    print("\nGenerating comparison plots (pyx)…", file=sys.stderr)
+    plot_comparison_pyx(s1, s2, args.label1, args.label2,
+                        out, args.window)
 
-    print("\nGenerating His-A stratified plots…", file=sys.stderr)
-    plot_his_a_stratified(
-        strat_dfs,
-        strat_raw_dfs=strat_raw_dfs,
-        labels={"bam1": args.label1, "bam2": args.label2},
-        output_prefix=out,
-        window=args.window,
-    )
+    print("\nGenerating rank comparison plots (pyx)…", file=sys.stderr)
+    plot_rank_comparison_pyx(s1, s2, args.label1, args.label2,
+                              out, args.window)
+
+    # print("\nGenerating editing efficiency by biotype plots…", file=sys.stderr)
+    # plot_editing_efficiency_by_biotype(
+    #     strat_raw_dfs, biotype_maps,
+    #     labels={"bam1": args.label1, "bam2": args.label2},
+    #     output_prefix=out,
+    # )
+
+    # print("\nGenerating His-A stratified plots…", file=sys.stderr)
+    # plot_his_a_stratified(
+    #     strat_dfs,
+    #     strat_raw_dfs=strat_raw_dfs,
+    #     labels={"bam1": args.label1, "bam2": args.label2},
+    #     output_prefix=out,
+    #     window=args.window,
+    # )
 
     bam1.close()
     bam2.close()
