@@ -747,7 +747,9 @@ def plot_comparison(s1: dict, s2: dict,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_comparison_plots.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    svg_path = f"{output_prefix}_comparison_plots.svg"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.savefig(svg_path, bbox_inches="tight")
     plt.close()
     print(f"  Saved comparison plots → {plot_path}", file=sys.stderr)
 
@@ -860,7 +862,9 @@ def plot_rank_comparison(s1: dict, s2: dict,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_rank_plots.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    svg_path = f"{output_prefix}_rank_plots.svg"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.savefig(svg_path, bbox_inches="tight")
     plt.close()
     print(f"  Saved rank comparison plots → {plot_path}", file=sys.stderr)
 
@@ -1720,7 +1724,9 @@ def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
 
     plt.tight_layout()
     plot_path = f"{output_prefix}_codon_specificity.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    svg_path = f"{output_prefix}_codon_specificity.svg"
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.savefig(svg_path, bbox_inches="tight")
     plt.close()
     print(f"  Saved codon specificity plots → {plot_path}", file=sys.stderr)
 
