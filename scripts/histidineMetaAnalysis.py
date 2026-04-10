@@ -51,9 +51,9 @@ def parse_gtf_cds(gtf_path: str) -> dict:
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 9 or fields[2] != "CDS":
                 continue
-            chrom  = fields[0]
-            start  = int(fields[3]) - 1
-            end    = int(fields[4])
+            chrom = fields[0]
+            start = int(fields[3]) - 1
+            end = int(fields[4])
             strand = fields[6]
             m = re.search(r'transcript_id "([^"]+)"', fields[8])
             tid = m.group(1) if m else "."
@@ -88,10 +88,10 @@ def parse_gtf_biotypes(gtf_path: str) -> dict:
             if not m:
                 continue
             gn = re.search(r'gene_name "([^"]+)"', fields[8])
-            chrom     = fields[0]
-            start     = int(fields[3]) - 1
-            end       = int(fields[4])
-            biotype   = m.group(1)
+            chrom = fields[0]
+            start = int(fields[3]) - 1
+            end = int(fields[4])
+            biotype = m.group(1)
             gene_name = gn.group(1) if gn else "."
             idx[chrom].append((start, end, biotype, gene_name))
     for chrom in idx:
@@ -100,9 +100,9 @@ def parse_gtf_biotypes(gtf_path: str) -> dict:
 
 
 def overlapping_biotypes(chrom: str,
-                          read_start: int,
-                          read_end: int,
-                          biotype_idx: dict) -> set:
+                         read_start: int,
+                         read_end: int,
+                         biotype_idx: dict) -> set:
     """
     Return a set of (biotype, gene_name) tuples for all intervals overlapping
     [read_start, read_end) on chrom.
@@ -118,8 +118,8 @@ def overlapping_biotypes(chrom: str,
 
 
 def assign_read_biotypes(bam_path: str,
-                          biotype_idx: dict,
-                          min_mapq: int = 0) -> dict:
+                         biotype_idx: dict,
+                         min_mapq: int = 0) -> dict:
     """
     Iterate every read in the BAM and assign it to all biotypes whose
     intervals overlap its alignment. Reads with no overlap get biotype
@@ -131,10 +131,11 @@ def assign_read_biotypes(bam_path: str,
 
     Returns dict: read_name → frozenset of biotypes (strings).
     """
+
     def _reclassify(biotype: str, gene_name: str) -> str:
         if biotype == "protein_coding" and \
-           (gene_name.upper().startswith("RPL") or
-            gene_name.upper().startswith("RPS")):
+                (gene_name.upper().startswith("RPL") or
+                 gene_name.upper().startswith("RPS")):
             return "ribosomal_protein"
         return biotype
 
@@ -163,8 +164,8 @@ def assign_read_biotypes(bam_path: str,
 
 
 def plot_biotype_counts(biotype_maps: dict,
-                         labels: dict,
-                         output_prefix: str):
+                        labels: dict,
+                        output_prefix: str):
     """
     For each library, plot a stacked bar of read counts by biotype.
     Reads assigned to multiple biotypes are counted once per biotype.
@@ -198,7 +199,7 @@ def plot_biotype_counts(biotype_maps: dict,
             rows.append({
                 "library": labels[key],
                 "biotype": bt,
-                "count":   counts.get(bt, 0),
+                "count": counts.get(bt, 0),
             })
     df = pd.DataFrame(rows)
 
@@ -236,12 +237,11 @@ def plot_biotype_counts(biotype_maps: dict,
     df.to_csv(f"{output_prefix}_biotype_counts.csv", index=False)
 
 
-
 def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
-                                        biotype_maps: dict,
-                                        labels: dict,
-                                        output_prefix: str,
-                                        min_reads: int = 50):
+                                       biotype_maps: dict,
+                                       labels: dict,
+                                       output_prefix: str,
+                                       min_reads: int = 50):
     """
     For each biotype, plot the CDF of per-read editing efficiency,
     overlaying both libraries. One panel per biotype with >= min_reads
@@ -260,18 +260,18 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
         raw = strat_raw_dfs[key]
         read_rows = (
             raw[raw["rel_pos"].isna()]
-               .drop_duplicates(subset=["read_name"])
-               [["read_name", "read_edit_eff"]]
-               .dropna(subset=["read_edit_eff"])
+            .drop_duplicates(subset=["read_name"])
+            [["read_name", "read_edit_eff"]]
+            .dropna(subset=["read_edit_eff"])
         )
         bmap = biotype_maps[key]
         rows = []
         for _, row in read_rows.iterrows():
             for bt in bmap.get(row["read_name"], {"unassigned"}):
                 rows.append({
-                    "read_name":     row["read_name"],
+                    "read_name": row["read_name"],
                     "read_edit_eff": row["read_edit_eff"],
-                    "biotype":       bt,
+                    "biotype": bt,
                 })
         lib_dfs[key] = pd.DataFrame(rows)
 
@@ -294,13 +294,13 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
     biotype_order = [bt for bt, _ in total_counts.most_common()
                      if bt in all_biotypes]
 
-    n_bt  = len(biotype_order)
+    n_bt = len(biotype_order)
     ncols = min(3, n_bt)
     nrows = (n_bt + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols,
-                              figsize=(6 * ncols, 4 * nrows),
-                              squeeze=False)
+                             figsize=(6 * ncols, 4 * nrows),
+                             squeeze=False)
     fig.suptitle(
         "Per-read A→G editing efficiency by biotype",
         fontsize=13, fontweight="bold"
@@ -309,12 +309,12 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
     for idx, bt in enumerate(biotype_order):
         ax = axes[idx // ncols][idx % ncols]
         for key, label, color in [("bam1", labels["bam1"], c1),
-                                   ("bam2", labels["bam2"], c2)]:
+                                  ("bam2", labels["bam2"], c2)]:
             sub = lib_dfs[key][lib_dfs[key]["biotype"] == bt]["read_edit_eff"]
             if len(sub) == 0:
                 continue
-            s      = np.sort(sub.values)
-            cdf    = np.arange(1, len(s) + 1) / len(s)
+            s = np.sort(sub.values)
+            cdf = np.arange(1, len(s) + 1) / len(s)
             median = float(np.median(s))
             ax.plot(s, cdf, color=color, lw=2,
                     label=f"{label} (n={len(s):,}, med={median:.3f})")
@@ -339,7 +339,6 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
     print(f"  Saved efficiency by biotype → {plot_path}", file=sys.stderr)
 
 
-
 def find_codon_positions(ref_fasta: pysam.FastaFile,
                          cds_by_chrom: dict,
                          window: int,
@@ -360,24 +359,24 @@ def find_codon_positions(ref_fasta: pysam.FastaFile,
             cds_seq = ref_fasta.fetch(chrom, cds_start, cds_end).upper()
             cds_len = cds_end - cds_start
             for i in range(0, cds_len - 2, 3):
-                codon = cds_seq[i:i+3]
+                codon = cds_seq[i:i + 3]
                 if strand == "-":
                     codon = reverse_complement(codon)
                 if codon in target_codons:
                     codon_ref_start = cds_start + i
-                    edit_pos        = cds_start + i + 1  # middle base, both strands
+                    edit_pos = cds_start + i + 1  # middle base, both strands
                     win_start = max(0, edit_pos - window)
-                    win_end   = min(chrom_len, edit_pos + window + 1)
+                    win_end = min(chrom_len, edit_pos + window + 1)
                     sites.append({
-                        "chrom":       chrom,
-                        "edit_pos":    edit_pos,
+                        "chrom": chrom,
+                        "edit_pos": edit_pos,
                         "codon_start": codon_ref_start,
-                        "strand":      strand,
-                        "codon":       codon,
-                        "transcript":  tid,
-                        "gene_name":   gname,
-                        "win_start":   win_start,
-                        "win_end":     win_end,
+                        "strand": strand,
+                        "codon": codon,
+                        "transcript": tid,
+                        "gene_name": gname,
+                        "win_start": win_start,
+                        "win_end": win_end,
                         "codon_label": codon_label,
                     })
 
@@ -422,26 +421,26 @@ def count_mismatches_at_site(bam: pysam.AlignmentFile,
                              site: dict,
                              min_mapq: int = 20,
                              min_baseq: int = 10) -> dict:
-    chrom     = site["chrom"]
-    edit_pos  = site["edit_pos"]
+    chrom = site["chrom"]
+    edit_pos = site["edit_pos"]
     win_start = site["win_start"]
-    win_end   = site["win_end"]
-    strand    = site["strand"]
-    pos_data  = {}
+    win_end = site["win_end"]
+    strand = site["strand"]
+    pos_data = {}
 
     for pcolumn in bam.pileup(
-        chrom, win_start, win_end,
-        truncate=True,
-        min_mapping_quality=min_mapq,
-        min_base_quality=min_baseq,
-        stepper="samtools",
-        ignore_overlaps=False,
+            chrom, win_start, win_end,
+            truncate=True,
+            min_mapping_quality=min_mapq,
+            min_base_quality=min_baseq,
+            stepper="samtools",
+            ignore_overlaps=False,
     ):
         ref_pos = pcolumn.reference_pos
         if ref_pos < win_start or ref_pos >= win_end:
             continue
         ref_base = ref_fasta.fetch(chrom, ref_pos, ref_pos + 1).upper()
-        rel_pos  = ref_pos - edit_pos
+        rel_pos = ref_pos - edit_pos
         if strand == "-":
             rel_pos = -rel_pos
 
@@ -458,7 +457,7 @@ def count_mismatches_at_site(bam: pysam.AlignmentFile,
 
         total = sum(counts.values())
         pos_data[rel_pos] = {
-            "ref_pos":  ref_pos,
+            "ref_pos": ref_pos,
             "ref_base": ref_base if strand == "+" else complement_base(ref_base),
             "A": counts.get("A", 0),
             "G": counts.get("G", 0),
@@ -479,7 +478,7 @@ def aggregate_sites(sites: list,
     records = []
     for i, site in enumerate(sites):
         if (i + 1) % 100 == 0:
-            print(f"  [{label}] Processing site {i+1}/{len(sites)}…", file=sys.stderr)
+            print(f"  [{label}] Processing site {i + 1}/{len(sites)}…", file=sys.stderr)
 
         pos_data = count_mismatches_at_site(
             bam, ref_fasta, site,
@@ -489,26 +488,26 @@ def aggregate_sites(sites: list,
             if counts["cov"] < min_coverage:
                 continue
             ag_denom = counts["A"] + counts["G"]
-            ag_edit  = counts["G"] / ag_denom \
-                       if counts["ref_base"] == "A" and ag_denom > 0 else np.nan
+            ag_edit = counts["G"] / ag_denom \
+                if counts["ref_base"] == "A" and ag_denom > 0 else np.nan
             records.append({
-                "site_id":      f"{site['chrom']}:{site['edit_pos']}",
-                "transcript":   site["transcript"],
-                "his_rank":     site["his_rank"],
-                "chrom":        site["chrom"],
-                "edit_pos":     site["edit_pos"],
-                "strand":       site["strand"],
-                "codon":        site["codon"],
-                "rel_pos":      rel_pos,
-                "ref_base":     counts["ref_base"],
+                "site_id": f"{site['chrom']}:{site['edit_pos']}",
+                "transcript": site["transcript"],
+                "his_rank": site["his_rank"],
+                "chrom": site["chrom"],
+                "edit_pos": site["edit_pos"],
+                "strand": site["strand"],
+                "codon": site["codon"],
+                "rel_pos": rel_pos,
+                "ref_base": counts["ref_base"],
                 "in_his_codon": rel_pos in (-1, 0, 1),
-                "A":            counts["A"],
-                "G":            counts["G"],
-                "C":            counts["C"],
-                "T":            counts["T"],
-                "coverage":     counts["cov"],
+                "A": counts["A"],
+                "G": counts["G"],
+                "C": counts["C"],
+                "T": counts["T"],
+                "coverage": counts["cov"],
                 "ag_edit_frac": ag_edit,
-                "is_his_A":     rel_pos == 0 and counts["ref_base"] == "A",
+                "is_his_A": rel_pos == 0 and counts["ref_base"] == "A",
             })
     return pd.DataFrame(records)
 
@@ -537,26 +536,26 @@ def transcript_normalised_agg(df: pd.DataFrame,
         df["ag_edit_frac"].notna() &
         (df["ref_base"] == "A") &
         (~df["in_his_codon"] | df["is_his_A"])
-    ].copy()
+        ].copy()
     ref_a["ag_edit_frac_ps"] = ref_a["ag_edit_frac"] + pseudo
 
     # Stage 1: per-transcript mean at each rel_pos
     tx_mean = (
         ref_a.groupby(group_cols + ["transcript", "rel_pos"])["ag_edit_frac_ps"]
-             .mean()
-             .reset_index()
-             .rename(columns={"ag_edit_frac_ps": "tx_mean_edit_frac"})
+        .mean()
+        .reset_index()
+        .rename(columns={"ag_edit_frac_ps": "tx_mean_edit_frac"})
     )
 
     # Stage 2: grand mean across transcripts
     agg = (
         tx_mean.groupby(group_cols + ["rel_pos"])
-               .agg(
-                   mean_edit_frac=("tx_mean_edit_frac", "mean"),
-                   sem_edit_frac=("tx_mean_edit_frac", lambda x: x.sem()),
-                   n_transcripts=("transcript", "nunique"),
-               )
-               .reset_index()
+        .agg(
+            mean_edit_frac=("tx_mean_edit_frac", "mean"),
+            sem_edit_frac=("tx_mean_edit_frac", lambda x: x.sem()),
+            n_transcripts=("transcript", "nunique"),
+        )
+        .reset_index()
     )
     return agg
 
@@ -580,11 +579,11 @@ def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
     edited = edited.sort_values("ag_edit_frac", ascending=False)
 
     return {
-        "his_a_sites":       his_a_df,
-        "rel_position_agg":  rel_agg,
-        "rank_agg":          rank_agg,
-        "edit_frac_dist":    his_a_df["ag_edit_frac"].dropna(),
-        "edited_sites":      edited,
+        "his_a_sites": his_a_df,
+        "rel_position_agg": rel_agg,
+        "rank_agg": rank_agg,
+        "edit_frac_dist": his_a_df["ag_edit_frac"].dropna(),
+        "edited_sites": edited,
     }
 
 
@@ -606,17 +605,18 @@ def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame,
         log2fc_agg      — DataFrame(rel_pos, mean_log2fc, sem_log2fc, n_transcripts)
         rank_log2fc_agg — dict: rank → same DataFrame restricted to that rank
     """
+
     def _tx_mean(df):
         ref_a = df[
             df["ag_edit_frac"].notna() &
             (df["ref_base"] == "A") &
             (~df["in_his_codon"] | df["is_his_A"])
-        ].copy()
+            ].copy()
         ref_a["ag_edit_frac_ps"] = ref_a["ag_edit_frac"] + pseudo
         return (
             ref_a.groupby(["transcript", "his_rank", "rel_pos"])["ag_edit_frac_ps"]
-                 .mean()
-                 .reset_index()
+            .mean()
+            .reset_index()
         )
 
     tm1 = _tx_mean(df1)
@@ -635,12 +635,12 @@ def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame,
             return pd.DataFrame()
         return (
             sub.groupby("rel_pos")
-               .agg(
-                   mean_log2fc=("log2fc", "mean"),
-                   sem_log2fc=("log2fc", lambda x: x.sem()),
-                   n_transcripts=("transcript", "nunique"),
-               )
-               .reset_index()
+            .agg(
+                mean_log2fc=("log2fc", "mean"),
+                sem_log2fc=("log2fc", lambda x: x.sem()),
+                n_transcripts=("transcript", "nunique"),
+            )
+            .reset_index()
         )
 
     log2fc_agg = _agg(merged)
@@ -653,8 +653,6 @@ def compute_log2fc_agg(df1: pd.DataFrame, df2: pd.DataFrame,
     return log2fc_agg, rank_log2fc_agg
 
 
-
-
 COLORS = {"bam1": "steelblue", "bam2": "coral"}
 
 
@@ -664,7 +662,6 @@ def plot_comparison(s1: dict, s2: dict,
                     window: int,
                     min_edit_frac: float,
                     strat_raw_dfs: dict = None):
-
     sns.set_theme(style="whitegrid", font_scale=1.1)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
@@ -683,9 +680,9 @@ def plot_comparison(s1: dict, s2: dict,
     # ── Panel 3: log2FC meta-plot ─────────────────────────────────────────────
     ax = axes[1, 0]
     log2fc_agg = s1["log2fc_agg"].set_index("rel_pos")
-    log2fc  = log2fc_agg["mean_log2fc"]
-    sem_fc  = log2fc_agg["sem_log2fc"]
-    common  = log2fc.index
+    log2fc = log2fc_agg["mean_log2fc"]
+    sem_fc = log2fc_agg["sem_log2fc"]
+    common = log2fc.index
 
     ax.axhline(0, color="grey", lw=1, ls="--")
     ax.axvline(0, color="crimson", lw=1.5, ls="--", label="His A")
@@ -725,14 +722,14 @@ def plot_comparison(s1: dict, s2: dict,
             raw = strat_raw_dfs[key]
             read_rows = (
                 raw[raw["rel_pos"].isna()]
-                   .drop_duplicates(subset=["read_name"])
-                   [["read_name", "read_edit_eff"]]
-                   .dropna(subset=["read_edit_eff"])
+                .drop_duplicates(subset=["read_name"])
+                [["read_name", "read_edit_eff"]]
+                .dropna(subset=["read_edit_eff"])
             )
             if len(read_rows) == 0:
                 continue
-            eff    = np.sort(read_rows["read_edit_eff"].values)
-            cdf    = np.arange(1, len(eff) + 1) / len(eff)
+            eff = np.sort(read_rows["read_edit_eff"].values)
+            cdf = np.arange(1, len(eff) + 1) / len(eff)
             median = float(np.median(eff))
             ax.plot(eff, cdf, color=color, lw=2, ls="--",
                     label=f"{label} read eff. (med={median:.3f})")
@@ -887,22 +884,22 @@ def compute_autocorrelation(rel_agg: pd.DataFrame, window: int) -> pd.DataFrame:
     vec[np.isnan(vec)] = np.nanmean(vec)
 
     # Mean-centre and autocorrelate
-    vec     = vec - vec.mean()
+    vec = vec - vec.mean()
     full_ac = np.correlate(vec, vec, mode="full")
-    mid     = len(full_ac) // 2
-    ac      = full_ac[mid:]
-    ac      = ac / ac[0]   # normalise so lag-0 = 1
+    mid = len(full_ac) // 2
+    ac = full_ac[mid:]
+    ac = ac / ac[0]  # normalise so lag-0 = 1
 
     lags = np.arange(len(ac))
     return pd.DataFrame({"lag": lags[:window + 1], "autocorr": ac[:window + 1]})
 
 
 def build_co_occurrence_matrix(sites: list,
-                                bam: pysam.AlignmentFile,
-                                ref_fasta: pysam.FastaFile,
-                                window: int,
-                                min_mapq: int = 20,
-                                min_baseq: int = 10) -> np.ndarray:
+                               bam: pysam.AlignmentFile,
+                               ref_fasta: pysam.FastaFile,
+                               window: int,
+                               min_mapq: int = 20,
+                               min_baseq: int = 10) -> np.ndarray:
     """
     For every read that spans a His site window, record which relative
     positions show an A→G mismatch (ref=A, read=G). Accumulate a
@@ -915,16 +912,16 @@ def build_co_occurrence_matrix(sites: list,
 
     Returns the raw co-occurrence count matrix (float64).
     """
-    n     = 2 * window + 1
-    mat   = np.zeros((n, n), dtype=np.float64)
+    n = 2 * window + 1
+    mat = np.zeros((n, n), dtype=np.float64)
     offset = window
 
     for site in sites:
-        chrom    = site["chrom"]
+        chrom = site["chrom"]
         edit_pos = site["edit_pos"]
         win_start = site["win_start"]
-        win_end   = site["win_end"]
-        strand    = site["strand"]
+        win_end = site["win_end"]
+        strand = site["strand"]
 
         ref_seq = ref_fasta.fetch(chrom, win_start, win_end).upper()
 
@@ -943,18 +940,18 @@ def build_co_occurrence_matrix(sites: list,
             for qpos, rpos in read.get_aligned_pairs(matches_only=True):
                 if rpos < win_start or rpos >= win_end:
                     continue
-                ref_idx          = rpos - win_start
+                ref_idx = rpos - win_start
                 ref_base_genomic = ref_seq[ref_idx] if ref_idx < len(ref_seq) else "N"
-                ref_base_tx      = complement_base(ref_base_genomic) \
-                                   if needs_complement else ref_base_genomic
+                ref_base_tx = complement_base(ref_base_genomic) \
+                    if needs_complement else ref_base_genomic
                 if ref_base_tx != "A":
                     continue
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
                 qbase_raw = read.query_sequence[qpos].upper()
-                qbase_tx  = complement_base(qbase_raw) \
-                            if needs_complement else qbase_raw
+                qbase_tx = complement_base(qbase_raw) \
+                    if needs_complement else qbase_raw
                 if qbase_tx == "G":
                     rel = rpos - edit_pos
                     if strand == "-":
@@ -978,7 +975,7 @@ def normalise_co_occurrence(mat: np.ndarray) -> np.ndarray:
     Divide each row by its diagonal (marginal count). Positions with zero
     marginal are set to NaN.
     """
-    diag   = np.diag(mat).copy()
+    diag = np.diag(mat).copy()
     normed = mat.astype(np.float64).copy()
     for i in range(len(diag)):
         if diag[i] > 0:
@@ -1028,8 +1025,8 @@ def plot_periodicity(sites: list,
     )
     gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.35)
 
-    tick_step  = max(1, window // 5)
-    tick_pos   = np.arange(0, 2 * window + 1, tick_step)
+    tick_step = max(1, window // 5)
+    tick_pos = np.arange(0, 2 * window + 1, tick_step)
     tick_label = [str(t - window) for t in tick_pos]
 
     # ── Panel [0, 0:2]: overlaid autocorrelation ──────────────────────────────
@@ -1122,11 +1119,11 @@ def plot_periodicity(sites: list,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collect_his_a_stratified(sites: list,
-                              bam: pysam.AlignmentFile,
-                              ref_fasta: pysam.FastaFile,
-                              window: int,
-                              min_mapq: int = 20,
-                              min_baseq: int = 10) -> pd.DataFrame:
+                             bam: pysam.AlignmentFile,
+                             ref_fasta: pysam.FastaFile,
+                             window: int,
+                             min_mapq: int = 20,
+                             min_baseq: int = 10) -> pd.DataFrame:
     """
     For each His site, iterate over reads spanning the His A (rel_pos=0).
     Classify each read as edited (G at His A) or unedited (A at His A).
@@ -1137,19 +1134,19 @@ def collect_his_a_stratified(sites: list,
         site_id, transcript, his_rank, rel_pos, his_a_edited, ag_edit
     where ag_edit is 1 if the read shows G at that ref=A position, 0 if A.
     """
-    records   = []
-    chrom_seq_cache: dict = {}   # chrom → full sequence, loaded once
+    records = []
+    chrom_seq_cache: dict = {}  # chrom → full sequence, loaded once
     for site in sites:
-        chrom     = site["chrom"]
-        edit_pos  = site["edit_pos"]
+        chrom = site["chrom"]
+        edit_pos = site["edit_pos"]
         win_start = site["win_start"]
-        win_end   = site["win_end"]
-        strand    = site["strand"]
+        win_end = site["win_end"]
+        strand = site["strand"]
 
         if chrom not in chrom_seq_cache:
             chrom_seq_cache[chrom] = ref_fasta.fetch(chrom).upper()
 
-        ref_seq      = chrom_seq_cache[chrom][win_start:win_end]
+        ref_seq = chrom_seq_cache[chrom][win_start:win_end]
         full_ref_seq = chrom_seq_cache[chrom]
 
         for read in bam.fetch(chrom, win_start, win_end):
@@ -1176,15 +1173,15 @@ def collect_his_a_stratified(sites: list,
                     continue
                 ref_base_genomic = ref_seq[rpos - win_start]
                 ref_base_tx = complement_base(ref_base_genomic) \
-                              if needs_complement else ref_base_genomic
+                    if needs_complement else ref_base_genomic
                 if ref_base_tx != "A":
                     continue
                 if read.query_qualities is not None:
                     if read.query_qualities[qpos] < min_baseq:
                         continue
                 qbase_raw = read.query_sequence[qpos].upper()
-                qbase_tx  = complement_base(qbase_raw) \
-                            if needs_complement else qbase_raw
+                qbase_tx = complement_base(qbase_raw) \
+                    if needs_complement else qbase_raw
                 if qbase_tx in ("A", "G"):
                     rel = rpos - edit_pos
                     if strand == "-":
@@ -1198,7 +1195,7 @@ def collect_his_a_stratified(sites: list,
             his_a_edited = ref_a_calls[0] == "G"
 
             # Per-read overall editing efficiency: genome-wide, transcript-aware
-            edits  = 0
+            edits = 0
             num_as = 0
             for qpos, rpos in read.get_aligned_pairs():
                 if rpos is None or qpos is None:
@@ -1207,26 +1204,26 @@ def collect_his_a_stratified(sites: list,
                     continue
                 ref_base_genomic = full_ref_seq[rpos]
                 ref_base_tx = complement_base(ref_base_genomic) \
-                              if needs_complement else ref_base_genomic
+                    if needs_complement else ref_base_genomic
                 if ref_base_tx == "A":
                     num_as += 1
                     qbase_raw = read.query_sequence[qpos].upper()
-                    qbase_tx  = complement_base(qbase_raw) \
-                                if needs_complement else qbase_raw
+                    qbase_tx = complement_base(qbase_raw) \
+                        if needs_complement else qbase_raw
                     if qbase_tx == "G":
                         edits += 1
             read_edit_eff = edits / num_as if num_as > 0 else np.nan
 
             # Emit one summary row per read for the efficiency CDF
             records.append({
-                "site_id":        f"{chrom}:{edit_pos}",
-                "transcript":     site["transcript"],
-                "his_rank":       site["his_rank"],
-                "rel_pos":        np.nan,          # sentinel: read-level summary row
-                "his_a_edited":   his_a_edited,
-                "ag_edit":        np.nan,
-                "read_name":      read.query_name,
-                "read_edit_eff":  read_edit_eff,
+                "site_id": f"{chrom}:{edit_pos}",
+                "transcript": site["transcript"],
+                "his_rank": site["his_rank"],
+                "rel_pos": np.nan,  # sentinel: read-level summary row
+                "his_a_edited": his_a_edited,
+                "ag_edit": np.nan,
+                "read_name": read.query_name,
+                "read_edit_eff": read_edit_eff,
             })
 
             # Record per-position rows (excluding His A and codon flanks)
@@ -1234,14 +1231,14 @@ def collect_his_a_stratified(sites: list,
                 if rel_pos in (0, -1, 1):
                     continue
                 records.append({
-                    "site_id":        f"{chrom}:{edit_pos}",
-                    "transcript":     site["transcript"],
-                    "his_rank":       site["his_rank"],
-                    "rel_pos":        rel_pos,
-                    "his_a_edited":   his_a_edited,
-                    "ag_edit":        1 if qbase == "G" else 0,
-                    "read_name":      read.query_name,
-                    "read_edit_eff":  read_edit_eff,
+                    "site_id": f"{chrom}:{edit_pos}",
+                    "transcript": site["transcript"],
+                    "his_rank": site["his_rank"],
+                    "rel_pos": rel_pos,
+                    "his_a_edited": his_a_edited,
+                    "ag_edit": 1 if qbase == "G" else 0,
+                    "read_name": read.query_name,
+                    "read_edit_eff": read_edit_eff,
                 })
 
     return pd.DataFrame(records)
@@ -1273,9 +1270,9 @@ def compute_stratified_log2fc(df: pd.DataFrame,
     # Stage 1: per-transcript mean editing fraction by his_a_edited status
     tx_mean = (
         df.groupby(["transcript", "his_rank", "rel_pos", "his_a_edited"])["ag_edit"]
-          .mean()
-          .reset_index()
-          .rename(columns={"ag_edit": "mean_edit"})
+        .mean()
+        .reset_index()
+        .rename(columns={"ag_edit": "mean_edit"})
     )
 
     # Pivot so edited and unedited are columns
@@ -1294,28 +1291,28 @@ def compute_stratified_log2fc(df: pd.DataFrame,
         return pd.DataFrame()
 
     tx_pivot["log2fc"] = np.log2(
-        (tx_pivot["edited"]   + pseudo) /
+        (tx_pivot["edited"] + pseudo) /
         (tx_pivot["unedited"] + pseudo)
     )
 
     # Stage 2: mean ± SEM across transcripts at each rel_pos
     agg = (
         tx_pivot.groupby("rel_pos")
-                .agg(
-                    mean_log2fc=("log2fc", "mean"),
-                    sem_log2fc=("log2fc", lambda x: x.sem()),
-                    n_transcripts=("transcript", "nunique"),
-                )
-                .reset_index()
+        .agg(
+            mean_log2fc=("log2fc", "mean"),
+            sem_log2fc=("log2fc", lambda x: x.sem()),
+            n_transcripts=("transcript", "nunique"),
+        )
+        .reset_index()
     )
     return agg
 
 
 def plot_his_a_stratified(strat_dfs: dict,
-                           strat_raw_dfs: dict,
-                           labels: dict,
-                           output_prefix: str,
-                           window: int):
+                          strat_raw_dfs: dict,
+                          labels: dict,
+                          output_prefix: str,
+                          window: int):
     """
     Two rows:
       Row 0: log2FC in editing (edited vs unedited reads) per BAM
@@ -1345,14 +1342,14 @@ def plot_his_a_stratified(strat_dfs: dict,
             ax.set_title(label)
             continue
 
-        fc     = agg.set_index("rel_pos")["mean_log2fc"]
+        fc = agg.set_index("rel_pos")["mean_log2fc"]
         sem_fc = agg.set_index("rel_pos")["sem_log2fc"]
-        pos    = fc.index
+        pos = fc.index
 
         ax.axhline(0, color="grey", lw=1, ls="--")
         ax.axvline(0, color="crimson", lw=1.5, ls="--", label="His A")
         ax.axvspan(-1, 1, alpha=0.08, color=color, label="His codon")
-        ax.axvline( 21, color="grey", lw=1, ls=":", alpha=0.6, label="±21 nt")
+        ax.axvline(21, color="grey", lw=1, ls=":", alpha=0.6, label="±21 nt")
         ax.axvline(-21, color="grey", lw=1, ls=":", alpha=0.6)
         ax.fill_between(pos, fc, 0,
                         where=(fc >= 0), interpolate=True,
@@ -1373,15 +1370,15 @@ def plot_his_a_stratified(strat_dfs: dict,
     ax.axhline(0, color="grey", lw=1, ls="--")
     ax.axvline(0, color="crimson", lw=1.5, ls="--", label="His A")
     ax.axvspan(-1, 1, alpha=0.08, color="grey")
-    ax.axvline( 21, color="grey", lw=1, ls=":", alpha=0.6, label="±21 nt")
+    ax.axvline(21, color="grey", lw=1, ls=":", alpha=0.6, label="±21 nt")
     ax.axvline(-21, color="grey", lw=1, ls=":", alpha=0.6)
     for key, label, color in [("bam1", labels["bam1"], c1), ("bam2", labels["bam2"], c2)]:
         agg = strat_dfs[key]
         if agg.empty:
             continue
-        fc     = agg.set_index("rel_pos")["mean_log2fc"]
+        fc = agg.set_index("rel_pos")["mean_log2fc"]
         sem_fc = agg.set_index("rel_pos")["sem_log2fc"]
-        pos    = fc.index
+        pos = fc.index
         ax.plot(pos, fc, color=color, lw=2, label=label)
         ax.fill_between(pos, fc - sem_fc, fc + sem_fc, alpha=0.15, color=color)
     ax.set_xlim(-window, window)
@@ -1393,11 +1390,11 @@ def plot_his_a_stratified(strat_dfs: dict,
     # ── Row 1: per-read editing efficiency CDFs ───────────────────────────────
     # Extract read-level rows (rel_pos is NaN), deduplicate by read_name
     # so each read contributes once even if it covers multiple His sites
-    ax_all   = fig.add_subplot(gs[1, 0])   # overall efficiency, both BAMs
-    ax_strat = fig.add_subplot(gs[1, 1])   # split by his_a_edited, both BAMs
-    ax_box   = fig.add_subplot(gs[1, 2])   # boxplot summary
+    ax_all = fig.add_subplot(gs[1, 0])  # overall efficiency, both BAMs
+    ax_strat = fig.add_subplot(gs[1, 1])  # split by his_a_edited, both BAMs
+    ax_box = fig.add_subplot(gs[1, 2])  # boxplot summary
 
-    box_data   = []
+    box_data = []
     box_labels = []
     box_colors = []
 
@@ -1405,9 +1402,9 @@ def plot_his_a_stratified(strat_dfs: dict,
         raw = strat_raw_dfs[key]
         read_rows = (
             raw[raw["rel_pos"].isna()]
-               .drop_duplicates(subset=["read_name"])
-               [["read_name", "his_a_edited", "read_edit_eff"]]
-               .dropna(subset=["read_edit_eff"])
+            .drop_duplicates(subset=["read_name"])
+            [["read_name", "his_a_edited", "read_edit_eff"]]
+            .dropna(subset=["read_edit_eff"])
         )
 
         # Overall CDF (all reads regardless of His A status)
@@ -1419,7 +1416,7 @@ def plot_his_a_stratified(strat_dfs: dict,
 
         # Stratified CDFs (edited vs unedited reads)
         for his_edited, ls, suffix in [(True, "-", " | His-A edited"),
-                                        (False, "--", " | His-A unedited")]:
+                                       (False, "--", " | His-A unedited")]:
             sub = read_rows[read_rows["his_a_edited"] == his_edited]["read_edit_eff"]
             if len(sub) == 0:
                 continue
@@ -1457,7 +1454,7 @@ def plot_his_a_stratified(strat_dfs: dict,
 
     # Boxplot
     bp = ax_box.boxplot(box_data, patch_artist=True, notch=True,
-                         medianprops=dict(color="black", lw=2))
+                        medianprops=dict(color="black", lw=2))
     for patch, color in zip(bp["boxes"], box_colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.6)
@@ -1473,11 +1470,10 @@ def plot_his_a_stratified(strat_dfs: dict,
     print(f"  Saved His-A stratified plots → {plot_path}", file=sys.stderr)
 
 
-
 def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
-                                        biotype_maps: dict,
-                                        labels: dict,
-                                        output_prefix: str):
+                                       biotype_maps: dict,
+                                       labels: dict,
+                                       output_prefix: str):
     """
     For each library, show the distribution of per-read editing efficiency
     broken down by transcript biotype.
@@ -1495,9 +1491,9 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
         raw = strat_raw_dfs[key]
         read_rows = (
             raw[raw["rel_pos"].isna()]
-               .drop_duplicates(subset=["read_name"])
-               [["read_name", "read_edit_eff"]]
-               .dropna(subset=["read_edit_eff"])
+            .drop_duplicates(subset=["read_name"])
+            [["read_name", "read_edit_eff"]]
+            .dropna(subset=["read_edit_eff"])
         )
         # Map each read to its biotype(s) and explode
         bmap = biotype_maps[key]
@@ -1542,7 +1538,7 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
             sub = np.sort(df[df["biotype"] == bt]["read_edit_eff"].values)
             if len(sub) == 0:
                 continue
-            cdf    = np.arange(1, len(sub) + 1) / len(sub)
+            cdf = np.arange(1, len(sub) + 1) / len(sub)
             median = float(np.median(sub))
             ax.plot(sub, cdf, color=color_map[bt], lw=1.5,
                     label=f"{bt} (n={len(sub):,}, med={median:.3f})")
@@ -1557,10 +1553,10 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
 
         # ── Bottom: boxplot per biotype ───────────────────────────────────────
         ax = axes[1, col]
-        box_data   = []
+        box_data = []
         box_colors = []
         box_labels = []
-        box_ns     = []
+        box_ns = []
         for bt in biotype_order:
             sub = df[df["biotype"] == bt]["read_edit_eff"].values
             if len(sub) == 0:
@@ -1602,17 +1598,16 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
             if len(sub) == 0:
                 continue
             rows.append({
-                "library":  label,
-                "biotype":  bt,
-                "n_reads":  len(sub),
-                "mean":     sub.mean(),
-                "median":   sub.median(),
-                "std":      sub.std(),
+                "library": label,
+                "biotype": bt,
+                "n_reads": len(sub),
+                "mean": sub.mean(),
+                "median": sub.median(),
+                "std": sub.std(),
             })
     pd.DataFrame(rows).to_csv(
         f"{output_prefix}_efficiency_by_biotype.csv", index=False
     )
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1622,19 +1617,19 @@ def plot_editing_efficiency_by_biotype(strat_raw_dfs: dict,
 # Default control codons: CAA (Gln), ACA (Thr), TAT (Tyr)
 # All have an A at codon position 1, matching the His edit target position
 CONTROL_CODONS = {
-    "CAA": {"CAA"},          # Gln — same first two bases as His
-    "ACA": {"ACA"},          # Thr
-    "TAT": {"TAT", "TAC"},   # Tyr — two codons, both have A at position 1
+    "CAA": {"CAA"},  # Gln — same first two bases as His
+    "ACA": {"ACA"},  # Thr
+    "TAT": {"TAT", "TAC"},  # Tyr — two codons, both have A at position 1
 }
 
 
 def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
-                            his_agg_bam2: pd.DataFrame,
-                            control_aggs: dict,
-                            label1: str,
-                            label2: str,
-                            output_prefix: str,
-                            window: int):
+                           his_agg_bam2: pd.DataFrame,
+                           control_aggs: dict,
+                           label1: str,
+                           label2: str,
+                           output_prefix: str,
+                           window: int):
     """
     Two-row figure showing meta-analysis editing profiles for His and each
     control codon, one column per codon. Row 0 = BAM1, Row 1 = BAM2.
@@ -1643,13 +1638,13 @@ def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
     sns.set_theme(style="whitegrid", font_scale=1.0)
     c1, c2 = COLORS["bam1"], COLORS["bam2"]
 
-    codon_names  = ["His"] + list(control_aggs.keys())
-    n_codons     = len(codon_names)
+    codon_names = ["His"] + list(control_aggs.keys())
+    n_codons = len(codon_names)
     codon_colors = sns.color_palette("tab10", n_colors=n_codons)
     codon_color_map = dict(zip(codon_names, codon_colors))
 
     # ── Figure 1: per-BAM rows, per-codon columns ─────────────────────────────
-    ncols = n_codons + 1   # one col per codon + one overlay col
+    ncols = n_codons + 1  # one col per codon + one overlay col
     fig, axes = plt.subplots(2, ncols, figsize=(4 * ncols, 9), sharey=False)
     fig.suptitle(
         "Codon specificity: His vs control codons\n"
@@ -1725,14 +1720,14 @@ def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
     print(f"  Saved codon specificity plots → {plot_path}", file=sys.stderr)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Pyx plotting functions
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pyx_meta_graph(c, xpos, ypos, datasets, window,
-                    y_title="A\u2192G edit frac",
-                    share_xaxis=None):
+                    y_title="A->G edit frac",
+                    share_xaxis=None,
+                    panel_w=5, panel_h=3):
     """
     Insert one meta-analysis panel into canvas c.
     datasets: list of (rel_agg DataFrame, pyx color, linestyle) tuples.
@@ -1748,17 +1743,17 @@ def _pyx_meta_graph(c, xpos, ypos, datasets, window,
         if rel_agg.empty:
             continue
         frac = rel_agg["mean_edit_frac"].values
-        sem  = rel_agg["sem_edit_frac"].values
+        sem = rel_agg["sem_edit_frac"].values
         candidate = float(np.nanmax(frac + sem)) * 1.15 if len(frac) > 0 else 0
         y_max = max(y_max, candidate)
 
     x_axis = graph.axis.linear(min=-window, max=window,
-                                title="Position relative to His A") \
-             if share_xaxis is None \
-             else graph.axis.linkedaxis(share_xaxis.axes["x"])
+                               title="Position relative to His A") \
+        if share_xaxis is None \
+        else graph.axis.linkedaxis(share_xaxis.axes["x"])
 
     g = graph.graphxy(
-        width=8, height=3,
+        width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
         x=x_axis,
         y=graph.axis.linear(min=0, max=y_max, title=y_title),
@@ -1778,9 +1773,9 @@ def _pyx_meta_graph(c, xpos, ypos, datasets, window,
     for rel_agg, col, ls in datasets:
         if rel_agg.empty:
             continue
-        pos  = rel_agg["rel_pos"].values
+        pos = rel_agg["rel_pos"].values
         frac = rel_agg["mean_edit_frac"].values
-        sem  = rel_agg["sem_edit_frac"].values
+        sem = rel_agg["sem_edit_frac"].values
 
         # SEM dotted bounds
         for pts in [list(zip(pos.tolist(), (frac - sem).tolist())),
@@ -1797,27 +1792,28 @@ def _pyx_meta_graph(c, xpos, ypos, datasets, window,
 
 
 def _pyx_log2fc_graph(c, xpos, ypos, log2fc_agg, label1, label2, window,
-                      col1, col2, share_xaxis=None):
+                      col1, col2, share_xaxis=None,
+                      panel_w=5, panel_h=3):
     """Insert a log2FC panel into canvas c."""
     from pyx import graph, color, style
 
     if log2fc_agg.empty:
         return None
 
-    pos    = log2fc_agg["rel_pos"].values
-    fc     = log2fc_agg["mean_log2fc"].values
+    pos = log2fc_agg["rel_pos"].values
+    fc = log2fc_agg["mean_log2fc"].values
     sem_fc = log2fc_agg["sem_log2fc"].values
 
     y_abs = max(np.nanmax(np.abs(fc)), 0.5) * 1.15
     y_min, y_max = -y_abs, y_abs
 
     x_axis = graph.axis.linear(min=-window, max=window,
-                                title="Position relative to His A") \
-             if share_xaxis is None \
-             else graph.axis.linkedaxis(share_xaxis.axes["x"])
+                               title="Position relative to His A") \
+        if share_xaxis is None \
+        else graph.axis.linkedaxis(share_xaxis.axes["x"])
 
     g = graph.graphxy(
-        width=8, height=3,
+        width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
         x=x_axis,
         y=graph.axis.linear(min=y_min, max=y_max,
@@ -1852,9 +1848,9 @@ def _pyx_log2fc_graph(c, xpos, ypos, log2fc_agg, label1, label2, window,
 
 
 def plot_comparison_pyx(s1: dict, s2: dict,
-                         label1: str, label2: str,
-                         output_prefix: str,
-                         window: int):
+                        label1: str, label2: str,
+                        output_prefix: str,
+                        window: int):
     """
     Pyx version of the comparison figure.
     Layout (left→right, bottom→top):
@@ -1866,57 +1862,58 @@ def plot_comparison_pyx(s1: dict, s2: dict,
     col1 = color.cmyk(0, 0, 0, 1)
     col2 = color.cmyk(1, 0.5, 0, 0)
 
-    panel_w = 8
+    panel_w = 5
     panel_h = 3
-    gap     = 1.5
+    gap = 2.0  # wide enough for y-axis labels of adjacent panels
 
     c = canvas.canvas()
 
     # Row 0 (top): individual meta-plots
     g1 = _pyx_meta_graph(c, xpos=0, ypos=panel_h + gap,
-                          datasets=[(s1["rel_position_agg"], col1,
-                                     style.linestyle.solid)],
-                          y_title=f"{label1} A\u2192G edit frac",
-                          window=window)
+                         datasets=[(s1["rel_position_agg"], col1,
+                                    style.linestyle.solid)],
+                         y_title=f"{label1} A->G edit frac",
+                         window=window, panel_w=panel_w, panel_h=panel_h)
     g2 = _pyx_meta_graph(c, xpos=panel_w + gap, ypos=panel_h + gap,
-                          datasets=[(s2["rel_position_agg"], col2,
-                                     style.linestyle.solid)],
-                          y_title=f"{label2} A\u2192G edit frac",
-                          window=window)
+                         datasets=[(s2["rel_position_agg"], col2,
+                                    style.linestyle.solid)],
+                         y_title=f"{label2} A->G edit frac",
+                         window=window, panel_w=panel_w, panel_h=panel_h)
 
     # Row 1 (bottom): log2FC and CDF
     _pyx_log2fc_graph(c, xpos=0, ypos=0,
                       log2fc_agg=s1["log2fc_agg"],
                       label1=label1, label2=label2,
-                      window=window, col1=col1, col2=col2)
+                      window=window, col1=col1, col2=col2,
+                      panel_w=panel_w, panel_h=panel_h)
     _pyx_cdf_graph(c, xpos=panel_w + gap, ypos=0,
                    s1=s1, s2=s2, label1=label1, label2=label2,
-                   col1=col1, col2=col2)
+                   col1=col1, col2=col2, panel_w=panel_w, panel_h=panel_h)
 
-    pyx_text.set(pyx_text.LatexRunner)
     plot_path = f"{output_prefix}_comparison_pyx"
     c.writePDFfile(plot_path)
     print(f"  Saved pyx comparison plots → {plot_path}.pdf", file=sys.stderr)
 
 
-def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2):
+def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2,
+                   panel_w=5, panel_h=3):
     """CDF of His A editing fraction for both BAMs."""
     from pyx import graph, style
 
     g = graph.graphxy(
-        width=8, height=3,
+        width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
         x=graph.axis.linear(min=0, max=1,
-                            title="A\u2192G edit frac at His A"),
+                            title="A->G edit frac at His A"),
         y=graph.axis.linear(min=0, max=1,
                             title="Cumulative fraction"),
     )
 
     for fracs, col in [(s1["edit_frac_dist"], col1),
-                        (s2["edit_frac_dist"], col2)]:
+                       (s2["edit_frac_dist"], col2)]:
         if len(fracs) == 0:
             continue
-        sf  = np.sort(fracs.values)
+        sf = np.sort(fracs.values)
         cdf = np.arange(1, len(sf) + 1) / len(sf)
         g.plot(graph.data.points(list(zip(sf.tolist(), cdf.tolist())), x=1, y=2),
                [graph.style.line([col, style.linewidth.normal,
@@ -1927,9 +1924,9 @@ def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2):
 
 
 def plot_rank_comparison_pyx(s1: dict, s2: dict,
-                              label1: str, label2: str,
-                              output_prefix: str,
-                              window: int):
+                             label1: str, label2: str,
+                             output_prefix: str,
+                             window: int):
     """
     Pyx version of the rank comparison figure.
     3 columns (ranks 1-3), 2 rows (overlaid meta-plot top, log2FC bottom).
@@ -1940,21 +1937,19 @@ def plot_rank_comparison_pyx(s1: dict, s2: dict,
     col1 = color.cmyk(0, 0, 0, 1)
     col2 = color.cmyk(1, 0.5, 0, 0)
 
-    panel_w = 6
+    panel_w = 4
     panel_h = 3
-    gap     = 1.2
+    gap = 2.0
 
     c = canvas.canvas()
 
     for col_idx, rank in enumerate([1, 2, 3]):
         xpos = col_idx * (panel_w + gap)
-        r1   = s1["rank_agg"].get(rank, pd.DataFrame())
-        r2   = s2["rank_agg"].get(rank, pd.DataFrame())
+        r1 = s1["rank_agg"].get(rank, pd.DataFrame())
+        r2 = s2["rank_agg"].get(rank, pd.DataFrame())
         rank_labels = {1: "1st", 2: "2nd", 3: "3rd"}
-        y_title = f"{rank_labels[rank]} His codon A\u2192G edit frac"
+        y_title = f"{rank_labels[rank]} His codon A->G edit frac"
 
-        # Top row: both BAMs overlaid — passed as datasets list so both
-        # are plotted before c.insert(), fixing the overlay bug
         g_top = _pyx_meta_graph(
             c, xpos=xpos, ypos=panel_h + gap,
             datasets=[
@@ -1963,29 +1958,29 @@ def plot_rank_comparison_pyx(s1: dict, s2: dict,
             ],
             y_title=y_title,
             window=window,
+            panel_w=panel_w, panel_h=panel_h,
         )
 
-        # Bottom row: log2FC linked to top x-axis
         rank_fc = s1["rank_log2fc_agg"].get(rank, pd.DataFrame())
         _pyx_log2fc_graph(c, xpos=xpos, ypos=0,
-                           log2fc_agg=rank_fc,
-                           label1=label1, label2=label2,
-                           window=window, col1=col1, col2=col2,
-                           share_xaxis=g_top)
+                          log2fc_agg=rank_fc,
+                          label1=label1, label2=label2,
+                          window=window, col1=col1, col2=col2,
+                          share_xaxis=g_top,
+                          panel_w=panel_w, panel_h=panel_h)
 
-    pyx_text.set(pyx_text.LatexRunner)
     plot_path = f"{output_prefix}_rank_pyx"
     c.writePDFfile(plot_path)
     print(f"  Saved pyx rank plots → {plot_path}.pdf", file=sys.stderr)
 
 
 def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
-                                his_agg_bam2: pd.DataFrame,
-                                control_aggs: dict,
-                                label1: str,
-                                label2: str,
-                                output_prefix: str,
-                                window: int):
+                               his_agg_bam2: pd.DataFrame,
+                               control_aggs: dict,
+                               label1: str,
+                               label2: str,
+                               output_prefix: str,
+                               window: int):
     """
     Pyx version of the codon specificity figure.
     Layout: 2 rows (BAM1 top, BAM2 bottom) × (n_codons + 1) columns.
@@ -1998,20 +1993,19 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
 
     # Distinct CMYK colours for each codon
     codon_colors_cmyk = [
-        color.cmyk(0, 1, 1, 0),        # red   — His
-        color.cmyk(1, 0.5, 0, 0),      # blue  — control 1
-        color.cmyk(0.1, 0.05, 0.9, 0), # green — control 2
+        color.cmyk(0, 1, 1, 0),  # red   — His
+        color.cmyk(1, 0.5, 0, 0),  # blue  — control 1
+        color.cmyk(0.1, 0.05, 0.9, 0),  # green — control 2
         color.cmyk(0.97, 0, 0.75, 0),  # teal  — control 3
-        color.cmyk(0, 0.6, 0.3, 0),    # pink  — control 4
+        color.cmyk(0, 0.6, 0.3, 0),  # pink  — control 4
     ]
     codon_color_map = {name: codon_colors_cmyk[i]
                        for i, name in enumerate(codon_names)}
 
-    panel_w = 6
-    panel_h = 3
-    gap     = 1.2
-    row_gap = 1.5
-    ncols   = len(codon_names) + 1   # individual + overlay
+    panel_w = 3
+    panel_h = 2.5
+    gap = 2.5  # wide enough for y-axis labels
+    row_gap = 2.0
 
     c = canvas.canvas()
 
@@ -2019,40 +2013,40 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
         (label1, his_agg_bam1),
         (label2, his_agg_bam2),
     ]):
-        # pyx y increases upward: BAM1 on top = higher ypos
         ypos = (1 - row_idx) * (panel_h + row_gap)
 
         for col_idx, codon_name in enumerate(codon_names):
             xpos = col_idx * (panel_w + gap)
-            agg  = his_agg if codon_name == "His" \
-                   else control_aggs[codon_name].get(bam_label, pd.DataFrame())
-            col  = codon_color_map[codon_name]
+            agg = his_agg if codon_name == "His" \
+                else control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            col = codon_color_map[codon_name]
+            # Only show y-axis title on the leftmost column
+            y_title = f"{bam_label} edit frac" if col_idx == 0 else ""
 
             _pyx_meta_graph(
                 c, xpos=xpos, ypos=ypos,
                 datasets=[(agg, col, style.linestyle.solid)],
-                y_title=f"{bam_label} {codon_name} edit frac",
-                window=window,
+                y_title=y_title,
+                window=window, panel_w=panel_w, panel_h=panel_h,
             )
 
-        # Overlay column: all codons on the same panel
+        # Overlay column — no y-axis title since it's not the leftmost
         overlay_datasets = []
         for codon_name in codon_names:
             agg = his_agg if codon_name == "His" \
-                  else control_aggs[codon_name].get(bam_label, pd.DataFrame())
-            ls  = style.linestyle.solid if codon_name == "His" \
-                  else style.linestyle.dashed
+                else control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            ls = style.linestyle.solid if codon_name == "His" \
+                else style.linestyle.dashed
             overlay_datasets.append((agg, codon_color_map[codon_name], ls))
 
         xpos_overlay = len(codon_names) * (panel_w + gap)
         _pyx_meta_graph(
             c, xpos=xpos_overlay, ypos=ypos,
             datasets=overlay_datasets,
-            y_title=f"{bam_label} edit frac (overlay)",
-            window=window,
+            y_title="",
+            window=window, panel_w=panel_w, panel_h=panel_h,
         )
 
-    pyx_text.set(pyx_text.LatexRunner)
     plot_path = f"{output_prefix}_codon_specificity_pyx"
     c.writePDFfile(plot_path)
     print(f"  Saved pyx codon specificity plots → {plot_path}.pdf",
@@ -2067,12 +2061,12 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Compare His A→G editing between two nanopore BAM files."
     )
-    p.add_argument("--bam1",   required=True, help="BAM file for condition 1")
-    p.add_argument("--bam2",   required=True, help="BAM file for condition 2")
+    p.add_argument("--bam1", required=True, help="BAM file for condition 1")
+    p.add_argument("--bam2", required=True, help="BAM file for condition 2")
     p.add_argument("--label1", default="BAM1", help="Label for condition 1 (default: BAM1)")
     p.add_argument("--label2", default="BAM2", help="Label for condition 2 (default: BAM2)")
-    p.add_argument("--ref",    required=True, help="Reference FASTA (indexed)")
-    p.add_argument("--gtf",    required=True, help="GTF annotation file")
+    p.add_argument("--ref", required=True, help="Reference FASTA (indexed)")
+    p.add_argument("--gtf", required=True, help="GTF annotation file")
     p.add_argument("--window", type=int, default=50,
                    help="Nucleotides either side of His A (default: 50)")
     p.add_argument("--min_coverage", type=int, default=10,
@@ -2098,14 +2092,14 @@ def parse_args():
 
 def main():
     args = parse_args()
-    out  = args.output
+    out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
     print("=== Histidine A→G Editing Comparison ===", file=sys.stderr)
 
     # ── Shared reference data (only parsed once) ──────────────────────────────
     print("Opening reference and parsing GTF…", file=sys.stderr)
-    ref_fasta    = pysam.FastaFile(args.ref)
+    ref_fasta = pysam.FastaFile(args.ref)
     cds_by_chrom = parse_gtf_cds(args.gtf)
 
     # ── Gene list filter ──────────────────────────────────────────────────────
@@ -2122,7 +2116,7 @@ def main():
             if kept:
                 filtered[chrom] = kept
         n_before = sum(len(v) for v in cds_by_chrom.values())
-        n_after  = sum(len(v) for v in filtered.values())
+        n_after = sum(len(v) for v in filtered.values())
         print(f"  Filtered CDS intervals: {n_before:,} → {n_after:,} "
               f"({len(filtered):,} chromosomes retained).", file=sys.stderr)
         cds_by_chrom = filtered
@@ -2144,7 +2138,7 @@ def main():
     ]:
         print(f"\nProcessing {label} ({bam_path})…", file=sys.stderr)
         bam = pysam.AlignmentFile(bam_path, "rb")
-        df  = aggregate_sites(
+        df = aggregate_sites(
             sites, bam, ref_fasta,
             min_coverage=args.min_coverage,
             min_mapq=args.min_mapq,
@@ -2176,7 +2170,7 @@ def main():
     # Transcript-normalised log2FC aggregations (window-level and rank-level)
     # g_rate is now present on both dfs after compute_summaries
     log2fc_agg, rank_log2fc_agg = compute_log2fc_agg(dfs["bam1"], dfs["bam2"])
-    s1["log2fc_agg"]      = log2fc_agg
+    s1["log2fc_agg"] = log2fc_agg
     s1["rank_log2fc_agg"] = rank_log2fc_agg
 
     # Save meta-aggregation tables
@@ -2188,7 +2182,7 @@ def main():
     # zero editing in one condition still contribute rather than being dropped
     pseudo = 1e-3
     ha1 = s1["his_a_sites"][["site_id", "chrom", "edit_pos", "transcript",
-                              "codon", "ag_edit_frac", "coverage"]].dropna()
+                             "codon", "ag_edit_frac", "coverage"]].dropna()
     ha2 = s2["his_a_sites"][["site_id", "ag_edit_frac", "coverage"]].dropna()
     merged = ha1.merge(ha2, on="site_id",
                        suffixes=(f"_{args.label1}", f"_{args.label2}"))
@@ -2226,8 +2220,8 @@ def main():
 
     # ── Control codon specificity analysis ───────────────────────────────────
     control_codons_to_run = args.control_codons \
-                            if args.control_codons is not None \
-                            else list(CONTROL_CODONS.keys())
+        if args.control_codons is not None \
+        else list(CONTROL_CODONS.keys())
 
     if control_codons_to_run:
         print("\nRunning control codon specificity analysis…", file=sys.stderr)
@@ -2253,7 +2247,7 @@ def main():
             ]:
                 print(f"  [{codon_name}] Pileup {label}…", file=sys.stderr)
                 bam_ctrl = pysam.AlignmentFile(bam_path, "rb")
-                ctrl_df  = aggregate_sites(
+                ctrl_df = aggregate_sites(
                     ctrl_sites, bam_ctrl, ref_fasta_ctrl,
                     min_coverage=args.min_coverage,
                     min_mapq=args.min_mapq,
@@ -2263,7 +2257,7 @@ def main():
                 bam_ctrl.close()
                 control_aggs[codon_name][label] = \
                     transcript_normalised_agg(ctrl_df) if not ctrl_df.empty \
-                    else pd.DataFrame()
+                        else pd.DataFrame()
 
         ref_fasta_ctrl.close()
 
@@ -2344,12 +2338,16 @@ def main():
                     out, args.window, args.min_edit_fraction)
 
     print("\nGenerating comparison plots (pyx)…", file=sys.stderr)
-    plot_comparison_pyx(s1, s2, args.label1, args.label2,
-                        out, args.window)
-
-    print("\nGenerating rank comparison plots (pyx)…", file=sys.stderr)
-    plot_rank_comparison_pyx(s1, s2, args.label1, args.label2,
-                              out, args.window)
+    try:
+        plot_comparison_pyx(s1, s2, args.label1, args.label2,
+                            out, args.window)
+        print("\nGenerating rank comparison plots (pyx)…", file=sys.stderr)
+        plot_rank_comparison_pyx(s1, s2, args.label1, args.label2,
+                                 out, args.window)
+    except Exception as e:
+        print(f"  WARNING: pyx plotting failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
 
     # print("\nGenerating editing efficiency by biotype plots…", file=sys.stderr)
     # plot_editing_efficiency_by_biotype(
