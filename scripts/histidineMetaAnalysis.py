@@ -1725,7 +1725,8 @@ def plot_codon_specificity(his_agg_bam1: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pyx_meta_graph(c, xpos, ypos, datasets, window,
-                    y_title="A->G edit frac",
+                    y_title="Edit Frac",
+                    x_title="Relative Position",
                     share_xaxis=None,
                     panel_w=5, panel_h=3):
     """
@@ -1748,7 +1749,7 @@ def _pyx_meta_graph(c, xpos, ypos, datasets, window,
         y_max = max(y_max, candidate)
 
     x_axis = graph.axis.linear(min=-window, max=window,
-                               title="Position relative to His A") \
+                               title=x_title) \
         if share_xaxis is None \
         else graph.axis.linkedaxis(share_xaxis.axes["x"])
 
@@ -1872,13 +1873,18 @@ def plot_comparison_pyx(s1: dict, s2: dict,
     g1 = _pyx_meta_graph(c, xpos=0, ypos=panel_h + gap,
                          datasets=[(s1["rel_position_agg"], col1,
                                     style.linestyle.solid)],
-                         y_title=f"{label1} A->G edit frac",
+                         y_title="Edit Frac",
                          window=window, panel_w=panel_w, panel_h=panel_h)
+    c.text(panel_w / 2, panel_h + gap + panel_h + 0.3, label1,
+           [pyx_text.halign.center, pyx_text.size.normalsize])
+
     g2 = _pyx_meta_graph(c, xpos=panel_w + gap, ypos=panel_h + gap,
                          datasets=[(s2["rel_position_agg"], col2,
                                     style.linestyle.solid)],
-                         y_title=f"{label2} A->G edit frac",
+                         y_title="Edit Frac",
                          window=window, panel_w=panel_w, panel_h=panel_h)
+    c.text(panel_w + gap + panel_w / 2, panel_h + gap + panel_h + 0.3, label2,
+           [pyx_text.halign.center, pyx_text.size.normalsize])
 
     # Row 1 (bottom): log2FC and CDF
     _pyx_log2fc_graph(c, xpos=0, ypos=0,
@@ -1904,7 +1910,7 @@ def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2,
         width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
         x=graph.axis.linear(min=0, max=1,
-                            title="A->G edit frac at His A"),
+                            title="Edit Frac"),
         y=graph.axis.linear(min=0, max=1,
                             title="Cumulative fraction"),
     )
@@ -1948,7 +1954,7 @@ def plot_rank_comparison_pyx(s1: dict, s2: dict,
         r1 = s1["rank_agg"].get(rank, pd.DataFrame())
         r2 = s2["rank_agg"].get(rank, pd.DataFrame())
         rank_labels = {1: "1st", 2: "2nd", 3: "3rd"}
-        y_title = f"{rank_labels[rank]} His codon A->G edit frac"
+        y_title = "Edit Frac" if col_idx == 0 else ""
 
         g_top = _pyx_meta_graph(
             c, xpos=xpos, ypos=panel_h + gap,
@@ -1960,6 +1966,9 @@ def plot_rank_comparison_pyx(s1: dict, s2: dict,
             window=window,
             panel_w=panel_w, panel_h=panel_h,
         )
+        c.text(xpos + panel_w / 2, panel_h + gap + panel_h + 0.3,
+               f"{rank_labels[rank]} His codon",
+               [pyx_text.halign.center, pyx_text.size.small])
 
         rank_fc = s1["rank_log2fc_agg"].get(rank, pd.DataFrame())
         _pyx_log2fc_graph(c, xpos=xpos, ypos=0,
@@ -2014,23 +2023,27 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
         (label2, his_agg_bam2),
     ]):
         ypos = (1 - row_idx) * (panel_h + row_gap)
+        # Only bottom row (row_idx==1) gets x-axis label
+        x_title = "Relative Position" if row_idx == 1 else ""
 
         for col_idx, codon_name in enumerate(codon_names):
             xpos = col_idx * (panel_w + gap)
             agg = his_agg if codon_name == "His" \
                 else control_aggs[codon_name].get(bam_label, pd.DataFrame())
             col = codon_color_map[codon_name]
-            # Only show y-axis title on the leftmost column
             y_title = f"{bam_label} edit frac" if col_idx == 0 else ""
 
-            _pyx_meta_graph(
+            g = _pyx_meta_graph(
                 c, xpos=xpos, ypos=ypos,
                 datasets=[(agg, col, style.linestyle.solid)],
                 y_title=y_title,
+                x_title=x_title,
                 window=window, panel_w=panel_w, panel_h=panel_h,
             )
+            c.text(xpos + panel_w / 2, ypos + panel_h + 0.3,
+                   codon_name,
+                   [pyx_text.halign.center, pyx_text.size.small])
 
-        # Overlay column — no y-axis title since it's not the leftmost
         overlay_datasets = []
         for codon_name in codon_names:
             agg = his_agg if codon_name == "His" \
@@ -2044,13 +2057,102 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
             c, xpos=xpos_overlay, ypos=ypos,
             datasets=overlay_datasets,
             y_title="",
+            x_title=x_title,
             window=window, panel_w=panel_w, panel_h=panel_h,
         )
+        c.text(xpos_overlay + panel_w / 2, ypos + panel_h + 0.3,
+               "Overlay",
+               [pyx_text.halign.center, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_codon_specificity_pyx"
     c.writePDFfile(plot_path)
     print(f"  Saved pyx codon specificity plots → {plot_path}.pdf",
           file=sys.stderr)
+
+
+def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
+                                       his_agg_bam2: pd.DataFrame,
+                                       control_aggs: dict,
+                                       label1: str,
+                                       label2: str,
+                                       output_prefix: str,
+                                       window: int):
+    """
+    Pyx overlay-only figure: one panel per BAM (stacked), all codons overlaid,
+    with a manually drawn legend showing a short line segment + codon name
+    for each codon.
+    """
+    from pyx import canvas, color, style, path, text as pyx_text
+
+    codon_names = ["His"] + list(control_aggs.keys())
+
+    codon_colors_cmyk = [
+        color.cmyk(0, 1, 1, 0),
+        color.cmyk(1, 0.5, 0, 0),
+        color.cmyk(0.1, 0.05, 0.9, 0),
+        color.cmyk(0.97, 0, 0.75, 0),
+        color.cmyk(0, 0.6, 0.3, 0),
+    ]
+    codon_color_map = {name: codon_colors_cmyk[i]
+                       for i, name in enumerate(codon_names)}
+
+    panel_w = 7
+    panel_h = 3.5
+    gap = 1.3  # vertical gap between the two panels
+    leg_x = panel_w + 0.6  # x position of legend (to the right of panel)
+    leg_lw = 0.8  # legend line length in cm
+    leg_dy = 0.55  # vertical spacing between legend entries
+
+    c = canvas.canvas()
+
+    for row_idx, (bam_label, his_agg) in enumerate([
+        (label1, his_agg_bam1),
+        (label2, his_agg_bam2),
+    ]):
+        ypos = (1 - row_idx) * (panel_h + gap)
+        x_title = "Relative Position" if row_idx == 1 else ""
+
+        overlay_datasets = []
+        for codon_name in codon_names:
+            agg = his_agg if codon_name == "His" \
+                else control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            ls = style.linestyle.solid if codon_name == "His" \
+                else style.linestyle.dashed
+            overlay_datasets.append((agg, codon_color_map[codon_name], ls))
+
+        g = _pyx_meta_graph(
+            c, xpos=0, ypos=ypos,
+            datasets=overlay_datasets,
+            y_title="Edit Frac",
+            x_title=x_title,
+            window=window, panel_w=panel_w, panel_h=panel_h,
+        )
+
+        # Panel title (BAM label) above panel
+        c.text(panel_w / 2, ypos + panel_h + 0.35, bam_label,
+               [pyx_text.halign.center, pyx_text.size.normalsize])
+
+        # Manual legend — only draw on the top panel to avoid duplication
+        if row_idx == 0:
+            leg_y_start = ypos + panel_h - 0.2
+            for j, codon_name in enumerate(codon_names):
+                col = codon_color_map[codon_name]
+                ls = style.linestyle.solid if codon_name == "His" \
+                    else style.linestyle.dashed
+                ly = leg_y_start - j * leg_dy
+
+                # Short line segment
+                c.stroke(
+                    path.line(leg_x, ly, leg_x + leg_lw, ly),
+                    [col, style.linewidth.normal, ls]
+                )
+                # Codon name label
+                c.text(leg_x + leg_lw + 0.15, ly, codon_name,
+                       [pyx_text.valign.middle, pyx_text.size.small])
+
+    plot_path = f"{output_prefix}_codon_overlay_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved pyx codon overlay plots → {plot_path}.pdf", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2272,6 +2374,15 @@ def main():
             window=args.window,
         )
         plot_codon_specificity_pyx(
+            his_agg_bam1=s1["rel_position_agg"],
+            his_agg_bam2=s2["rel_position_agg"],
+            control_aggs=control_aggs,
+            label1=args.label1,
+            label2=args.label2,
+            output_prefix=out,
+            window=args.window,
+        )
+        plot_codon_specificity_overlay_pyx(
             his_agg_bam1=s1["rel_position_agg"],
             his_agg_bam2=s2["rel_position_agg"],
             control_aggs=control_aggs,
