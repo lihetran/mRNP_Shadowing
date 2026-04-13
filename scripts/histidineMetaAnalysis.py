@@ -575,6 +575,15 @@ def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
             continue
         rank_agg[rank] = transcript_normalised_agg(sub)
 
+    # Per-codon meta-aggregation (CAT vs CAC)
+    codon_agg = {}
+    for codon in ["CAT", "CAC"]:
+        sub = df[df["codon"] == codon]
+        if sub.empty:
+            codon_agg[codon] = pd.DataFrame()
+        else:
+            codon_agg[codon] = transcript_normalised_agg(sub)
+
     edited = his_a_df[his_a_df["ag_edit_frac"] >= min_edit_frac].copy()
     edited = edited.sort_values("ag_edit_frac", ascending=False)
 
@@ -582,6 +591,7 @@ def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
         "his_a_sites": his_a_df,
         "rel_position_agg": rel_agg,
         "rank_agg": rank_agg,
+        "codon_agg": codon_agg,
         "edit_frac_dist": his_a_df["ag_edit_frac"].dropna(),
         "edited_sites": edited,
     }
@@ -994,11 +1004,14 @@ def plot_periodicity(sites: list,
                      output_prefix: str,
                      window: int,
                      min_mapq: int,
-                     min_baseq: int):
+                     min_baseq: int,
+                     max_sites: int = None):
     """
     Two-row figure:
       Row 0: autocorrelation of G/cov rate for BAM1 and BAM2 (overlaid)
       Row 1: normalised co-occurrence heatmaps for BAM1 and BAM2
+    max_sites: if set, randomly subsample this many sites for the
+               co-occurrence matrix to limit runtime.
     """
     sns.set_theme(style="whitegrid", font_scale=1.1)
     c1, c2 = COLORS["bam1"], COLORS["bam2"]
@@ -1007,12 +1020,20 @@ def plot_periodicity(sites: list,
     ac1 = compute_autocorrelation(s1["rel_position_agg"], window)
     ac2 = compute_autocorrelation(s2["rel_position_agg"], window)
 
-    print("  Building co-occurrence matrices (read-level, this may take a while)…",
-          file=sys.stderr)
+    # Subsample sites for co-occurrence if max_sites is set
+    co_sites = sites
+    if max_sites is not None and len(sites) > max_sites:
+        import random
+        co_sites = random.sample(sites, max_sites)
+        print(f"  Subsampled {max_sites:,}/{len(sites):,} sites for "
+              f"co-occurrence matrix.", file=sys.stderr)
+
+    print(f"  Building co-occurrence matrices from {len(co_sites):,} sites "
+          f"(read-level, this may take a while)…", file=sys.stderr)
     mat1 = build_co_occurrence_matrix(
-        sites, bam1, ref_fasta, window, min_mapq=min_mapq, min_baseq=min_baseq)
+        co_sites, bam1, ref_fasta, window, min_mapq=min_mapq, min_baseq=min_baseq)
     mat2 = build_co_occurrence_matrix(
-        sites, bam2, ref_fasta, window, min_mapq=min_mapq, min_baseq=min_baseq)
+        co_sites, bam2, ref_fasta, window, min_mapq=min_mapq, min_baseq=min_baseq)
 
     norm1 = normalise_co_occurrence(mat1)
     norm2 = normalise_co_occurrence(mat2)
@@ -1875,7 +1896,7 @@ def plot_comparison_pyx(s1: dict, s2: dict,
                                     style.linestyle.solid)],
                          y_title="Edit Frac",
                          window=window, panel_w=panel_w, panel_h=panel_h)
-    c.text(panel_w / 2, panel_h + gap + panel_h + 0.3, label1,
+    c.text(g1.xpos + g1.width / 2., g1.ypos + g1.height + 0.4, label1,
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     g2 = _pyx_meta_graph(c, xpos=panel_w + gap, ypos=panel_h + gap,
@@ -1883,7 +1904,7 @@ def plot_comparison_pyx(s1: dict, s2: dict,
                                     style.linestyle.solid)],
                          y_title="Edit Frac",
                          window=window, panel_w=panel_w, panel_h=panel_h)
-    c.text(panel_w + gap + panel_w / 2, panel_h + gap + panel_h + 0.3, label2,
+    c.text(g2.xpos + g2.width / 2., g2.ypos + g2.height + 0.4, label2,
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     # Row 1 (bottom): log2FC and CDF
@@ -1966,7 +1987,7 @@ def plot_rank_comparison_pyx(s1: dict, s2: dict,
             window=window,
             panel_w=panel_w, panel_h=panel_h,
         )
-        c.text(xpos + panel_w / 2, panel_h + gap + panel_h + 0.3,
+        c.text(g_top.xpos + g_top.width / 2., g_top.ypos + g_top.height + 0.4,
                f"{rank_labels[rank]} His codon",
                [pyx_text.halign.center, pyx_text.size.small])
 
@@ -2040,7 +2061,7 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
                 x_title=x_title,
                 window=window, panel_w=panel_w, panel_h=panel_h,
             )
-            c.text(xpos + panel_w / 2, ypos + panel_h + 0.3,
+            c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.3,
                    codon_name,
                    [pyx_text.halign.center, pyx_text.size.small])
 
@@ -2053,14 +2074,14 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
             overlay_datasets.append((agg, codon_color_map[codon_name], ls))
 
         xpos_overlay = len(codon_names) * (panel_w + gap)
-        _pyx_meta_graph(
+        g_ov = _pyx_meta_graph(
             c, xpos=xpos_overlay, ypos=ypos,
             datasets=overlay_datasets,
             y_title="",
             x_title=x_title,
             window=window, panel_w=panel_w, panel_h=panel_h,
         )
-        c.text(xpos_overlay + panel_w / 2, ypos + panel_h + 0.3,
+        c.text(g_ov.xpos + g_ov.width / 2., g_ov.ypos + g_ov.height + 0.3,
                "Overlay",
                [pyx_text.halign.center, pyx_text.size.small])
 
@@ -2098,7 +2119,7 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
 
     panel_w = 7
     panel_h = 3.5
-    gap = 1.3  # vertical gap between the two panels
+    gap = 1.0  # vertical gap between the two panels
     leg_x = panel_w + 0.6  # x position of legend (to the right of panel)
     leg_lw = 0.8  # legend line length in cm
     leg_dy = 0.55  # vertical spacing between legend entries
@@ -2128,31 +2149,124 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
             window=window, panel_w=panel_w, panel_h=panel_h,
         )
 
-        # Panel title (BAM label) above panel
-        c.text(panel_w / 2, ypos + panel_h + 0.35, bam_label,
+        c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.4, bam_label,
                [pyx_text.halign.center, pyx_text.size.normalsize])
 
         # Manual legend — only draw on the top panel to avoid duplication
         if row_idx == 0:
-            leg_y_start = ypos + panel_h - 0.2
+            leg_y_start = g.ypos + g.height - 0.2
+            leg_x_start = g.xpos + g.width + 0.4
             for j, codon_name in enumerate(codon_names):
                 col = codon_color_map[codon_name]
                 ls = style.linestyle.solid if codon_name == "His" \
                     else style.linestyle.dashed
                 ly = leg_y_start - j * leg_dy
 
-                # Short line segment
                 c.stroke(
-                    path.line(leg_x, ly, leg_x + leg_lw, ly),
+                    path.line(leg_x_start, ly, leg_x_start + leg_lw, ly),
                     [col, style.linewidth.normal, ls]
                 )
-                # Codon name label
-                c.text(leg_x + leg_lw + 0.15, ly, codon_name,
+                c.text(leg_x_start + leg_lw + 0.15, ly, codon_name,
                        [pyx_text.valign.middle, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_codon_overlay_pyx"
     c.writePDFfile(plot_path)
     print(f"  Saved pyx codon overlay plots → {plot_path}.pdf", file=sys.stderr)
+
+
+def plot_codon_type_comparison_pyx(s1: dict, s2: dict,
+                                   label1: str, label2: str,
+                                   output_prefix: str,
+                                   window: int):
+    """
+    Pyx figure comparing CAT vs CAC meta-analysis editing profiles.
+    Layout: 2 columns (CAT, CAC) x 2 rows (BAM1 top, BAM2 bottom).
+    Each panel overlays both codons for direct comparison, with a
+    third column showing the overlay of CAT and CAC on the same axes.
+    """
+    from pyx import canvas, color, style, text as pyx_text
+
+    col_cat = color.cmyk(0, 0, 0, 1)  # black — CAT
+    col_cac = color.cmyk(1, 0.5, 0, 0)  # blue  — CAC
+
+    panel_w = 5
+    panel_h = 3
+    gap = 2.0
+    row_gap = 2.0
+
+    codons = ["CAT", "CAC"]
+    codon_colors = {"CAT": col_cat, "CAC": col_cac}
+
+    c = canvas.canvas()
+
+    for row_idx, (bam_label, s) in enumerate([
+        (label1, s1),
+        (label2, s2),
+    ]):
+        ypos = (1 - row_idx) * (panel_h + row_gap)
+        x_title = "Relative Position" if row_idx == 1 else ""
+
+        # Individual codon panels
+        for col_idx, codon in enumerate(codons):
+            xpos = col_idx * (panel_w + gap)
+            agg = s["codon_agg"].get(codon, pd.DataFrame())
+            col = codon_colors[codon]
+            y_title = "Edit Frac" if col_idx == 0 else ""
+
+            g = _pyx_meta_graph(
+                c, xpos=xpos, ypos=ypos,
+                datasets=[(agg, col, style.linestyle.solid)],
+                y_title=y_title,
+                x_title=x_title,
+                window=window, panel_w=panel_w, panel_h=panel_h,
+            )
+            c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.3,
+                   codon,
+                   [pyx_text.halign.center, pyx_text.size.small])
+
+        # Overlay panel: both codons on same axes
+        xpos_ov = len(codons) * (panel_w + gap)
+        g_ov = _pyx_meta_graph(
+            c, xpos=xpos_ov, ypos=ypos,
+            datasets=[
+                (s["codon_agg"].get("CAT", pd.DataFrame()),
+                 col_cat, style.linestyle.solid),
+                (s["codon_agg"].get("CAC", pd.DataFrame()),
+                 col_cac, style.linestyle.dashed),
+            ],
+            y_title="",
+            x_title=x_title,
+            window=window, panel_w=panel_w, panel_h=panel_h,
+        )
+        c.text(g_ov.xpos + g_ov.width / 2., g_ov.ypos + g_ov.height + 0.3,
+               "CAT vs CAC",
+               [pyx_text.halign.center, pyx_text.size.small])
+
+        # BAM label to the left of the leftmost panel
+        c.text(-0.2, ypos + panel_h / 2., bam_label,
+               [pyx_text.halign.boxright, pyx_text.valign.middle,
+                pyx_text.size.small])
+
+    # Manual legend top-right of the overlay panel on the top row
+    g_top_ov_ypos = panel_h + row_gap
+    leg_x = len(codons) * (panel_w + gap) + panel_w + 0.4
+    leg_lw = 0.8
+    leg_dy = 0.55
+    from pyx import path
+    for j, (codon, col, ls) in enumerate([
+        ("CAT", col_cat, style.linestyle.solid),
+        ("CAC", col_cac, style.linestyle.dashed),
+    ]):
+        ly = g_top_ov_ypos + panel_h - 0.3 - j * leg_dy
+        c.stroke(path.line(leg_x, ly, leg_x + leg_lw, ly),
+                 [col, style.linewidth.normal, ls])
+        c.text(leg_x + leg_lw + 0.15, ly, codon,
+               [pyx_text.valign.middle, pyx_text.size.small])
+
+    plot_path = f"{output_prefix}_codon_type_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved pyx codon type comparison → {plot_path}.pdf",
+          file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2182,6 +2296,9 @@ def parse_args():
     p.add_argument("--gene_list", default=None,
                    help="Text file with one gene/transcript ID per line. "
                         "If provided, only His sites on these genes are analysed.")
+    p.add_argument("--max_sites", type=int, default=None,
+                   help="Max His sites to use for co-occurrence matrix "
+                        "(randomly subsampled; default: use all sites)")
     p.add_argument("--control_codons", nargs="*", default=None,
                    help="Control codon names to run specificity analysis "
                         f"(default: {list(CONTROL_CODONS.keys())}). "
@@ -2413,15 +2530,17 @@ def main():
     )
 
     # ── Plots ─────────────────────────────────────────────────────────────────
-    # print("\nGenerating periodicity plots…", file=sys.stderr)
     bam1 = pysam.AlignmentFile(args.bam1, "rb")
     bam2 = pysam.AlignmentFile(args.bam2, "rb")
     ref_fasta = pysam.FastaFile(args.ref)
-    # plot_periodicity(
-    #     sites, bam1, bam2, ref_fasta,
-    #     s1, s2, args.label1, args.label2,
-    #     out, args.window, args.min_mapq, args.min_baseq,
-    # )
+
+    print("\nGenerating periodicity plots…", file=sys.stderr)
+    plot_periodicity(
+        sites, bam1, bam2, ref_fasta,
+        s1, s2, args.label1, args.label2,
+        out, args.window, args.min_mapq, args.min_baseq,
+        max_sites=args.max_sites,
+    )
 
     # print("\nCollecting read-level stratified data…", file=sys.stderr)
     # strat_dfs     = {}
@@ -2455,6 +2574,9 @@ def main():
         print("\nGenerating rank comparison plots (pyx)…", file=sys.stderr)
         plot_rank_comparison_pyx(s1, s2, args.label1, args.label2,
                                  out, args.window)
+        print("\nGenerating codon type comparison plots (pyx)…", file=sys.stderr)
+        plot_codon_type_comparison_pyx(s1, s2, args.label1, args.label2,
+                                       out, args.window)
     except Exception as e:
         print(f"  WARNING: pyx plotting failed: {e}", file=sys.stderr)
         import traceback

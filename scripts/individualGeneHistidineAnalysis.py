@@ -551,6 +551,7 @@ def plot_gene_mpl(gene_name: str,
 
     # ── Panel 0: BAM1 ─────────────────────────────────────────────────────────
     ax = axes[0]
+    _shade_cds(ax, 0, 1)
     ax.plot(pos, frac1_s, color=col1, lw=1.2, zorder=3)
     _add_his(ax)
     ax.set_ylim(0, 1)
@@ -562,6 +563,7 @@ def plot_gene_mpl(gene_name: str,
 
     # ── Panel 1: BAM2 ─────────────────────────────────────────────────────────
     ax = axes[1]
+    _shade_cds(ax, 0, 1)
     ax.plot(pos, frac2_s, color=col2, lw=1.2, zorder=3)
     _add_his(ax)
     ax.set_ylim(0, 1)
@@ -574,6 +576,7 @@ def plot_gene_mpl(gene_name: str,
     # ── Panel 2: log2FC ───────────────────────────────────────────────────────
     ax = axes[2]
     y_abs = max(np.nanmax(np.abs(log2fc_s)), 0.5) if len(log2fc_s) > 0 else 1
+    _shade_cds(ax, -y_abs * 1.1, y_abs * 1.1)
     ax.plot(pos, log2fc_s, color=col_fc, lw=1.2, zorder=3)
     ax.axhline(0, color="black", lw=1.0, ls="--", zorder=2)
     _add_his(ax)
@@ -584,11 +587,13 @@ def plot_gene_mpl(gene_name: str,
     _style(ax)
 
     import matplotlib.lines as mlines
+    import matplotlib.patches as mpatches
 
-    his_line = mlines.Line2D([], [], color=col_his, lw=1.2, alpha=0.7,
-                              label=f"His codon A (n={len(his_positions)})")
+    his_line  = mlines.Line2D([], [], color=col_his, lw=1.2, alpha=0.7,
+                               label=f"His codon A (n={len(his_positions)})")
+    cds_patch = mpatches.Patch(color=col_cds, label="CDS")
     fig.legend(
-        handles=[his_line],
+        handles=[his_line, cds_patch],
         loc="upper right",
         fontsize=11,
         framealpha=0.8,
