@@ -121,15 +121,17 @@ def assign_read_biotypes(bam_path: str,
                          biotype_idx: dict,
                          min_mapq: int = 0) -> dict:
     """
-    Iterate every read in the BAM and assign it to all biotypes whose
-    intervals overlap its alignment. Reads with no overlap get biotype
-    'intergenic'.
+    Iterate every primary read alignment in the BAM and assign it to all
+    biotypes whose intervals overlap its alignment. Reads with no overlap
+    get biotype 'intergenic'.
+
+    Note: counts alignments, not unique read names. For chimeric long reads
+    that have multiple primary alignments, each alignment is counted separately.
 
     Ribosomal protein genes (gene_name matching RPL* or RPS*) are
-    reclassified from 'protein_coding' to 'ribosomal_protein' so they
-    can be distinguished from other protein-coding genes in plots.
+    reclassified from 'protein_coding' to 'ribosomal_protein'.
 
-    Returns dict: read_name → frozenset of biotypes (strings).
+    Returns dict: alignment_id (int) → frozenset of biotypes.
     """
 
     def _reclassify(biotype: str, gene_name: str) -> str:
@@ -140,6 +142,7 @@ def assign_read_biotypes(bam_path: str,
         return biotype
 
     read_biotypes = {}
+    aln_id = 0
     bam = pysam.AlignmentFile(bam_path, "rb")
     for read in bam:
         if read.is_unmapped or read.is_secondary or read.is_supplementary:
@@ -158,8 +161,10 @@ def assign_read_biotypes(bam_path: str,
             )
         else:
             biotypes = frozenset(["intergenic"])
-        read_biotypes[read.query_name] = biotypes
+        read_biotypes[aln_id] = biotypes
+        aln_id += 1
     bam.close()
+    print(f"  Counted {aln_id:,} primary alignments.", file=sys.stderr)
     return read_biotypes
 
 
@@ -560,6 +565,91 @@ def transcript_normalised_agg(df: pd.DataFrame,
     return agg
 
 
+def collect_his_site_reads(sites: list,
+                           bam: pysam.AlignmentFile,
+                           min_mapq: int = 20) -> set:
+    """
+    Collect the set of query names of all reads that span at least one
+    His site window. These are the reads that contributed to the meta plots.
+    """
+    read_names = set()
+    for site in sites:
+        for read in bam.fetch(site["chrom"], site["win_start"], site["win_end"]):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if read.mapping_quality < min_mapq:
+                continue
+            read_names.add(read.query_name)
+    return read_names
+
+
+def compute_read_edit_efficiency(bam_path: str,
+                                 ref_fasta: pysam.FastaFile,
+                                 min_mapq: int = 20,
+                                 min_baseq: int = 10,
+                                 restrict_to_reads: set = None) -> np.ndarray:
+    """
+    For every primary read in the BAM (optionally restricted to
+    restrict_to_reads), compute genome-wide A->G editing efficiency
+    as G / (A + G) at all ref=A positions on that read.
+
+    restrict_to_reads: if provided, only reads whose query_name is in
+    this set are included. Pass the output of collect_his_site_reads
+    to restrict to reads that went into the meta plots.
+
+    Returns a 1-D array of per-read efficiencies.
+    """
+    effs = []
+    bam = pysam.AlignmentFile(bam_path, "rb")
+
+    for read in bam:
+        if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+        if read.mapping_quality < min_mapq:
+            continue
+        if read.query_sequence is None:
+            continue
+        if restrict_to_reads is not None and \
+                read.query_name not in restrict_to_reads:
+            continue
+
+        chrom = read.reference_name
+        try:
+            chrom_seq = ref_fasta.fetch(chrom)
+        except (KeyError, ValueError):
+            continue
+
+        is_rev = read.is_reverse
+        # For genome-wide efficiency we use read strand only (no gene strand
+        # context available), which is consistent with how nanopore reads
+        # are oriented: reverse reads see complement of the reference.
+        n_a = 0
+        n_g = 0
+        for qpos, rpos in read.get_aligned_pairs(matches_only=True):
+            if rpos is None or rpos >= len(chrom_seq):
+                continue
+            ref_base = chrom_seq[rpos].upper()
+            ref_base_read = complement_base(ref_base) if is_rev else ref_base
+            if ref_base_read != "A":
+                continue
+            if read.query_qualities is not None:
+                if read.query_qualities[qpos] < min_baseq:
+                    continue
+            qbase_raw = read.query_sequence[qpos].upper()
+            qbase = complement_base(qbase_raw) if is_rev else qbase_raw
+            if qbase == "A":
+                n_a += 1
+            elif qbase == "G":
+                n_g += 1
+
+        ag_total = n_a + n_g
+        if ag_total > 0:
+            effs.append(n_g / ag_total)
+
+    bam.close()
+    return np.array(effs)
+
+
 def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
     his_a_df = df[df["is_his_A"]].copy()
 
@@ -594,6 +684,7 @@ def compute_summaries(df: pd.DataFrame, min_edit_frac: float) -> dict:
         "codon_agg": codon_agg,
         "edit_frac_dist": his_a_df["ag_edit_frac"].dropna(),
         "edited_sites": edited,
+        "read_eff_dist": np.array([]),  # filled in main after BAM scan
     }
 
 
@@ -670,8 +761,7 @@ def plot_comparison(s1: dict, s2: dict,
                     label1: str, label2: str,
                     output_prefix: str,
                     window: int,
-                    min_edit_frac: float,
-                    strat_raw_dfs: dict = None):
+                    min_edit_frac: float):
     sns.set_theme(style="whitegrid", font_scale=1.1)
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
@@ -714,7 +804,7 @@ def plot_comparison(s1: dict, s2: dict,
 
     # ── Panel 4: CDFs — His A editing fraction + overall read efficiency ──────
     ax = axes[1, 1]
-    # His A editing fraction CDF
+    # His A editing fraction CDF (solid)
     for fracs, label, color in [
         (s1["edit_frac_dist"], label1, c1),
         (s2["edit_frac_dist"], label2, c2),
@@ -726,25 +816,20 @@ def plot_comparison(s1: dict, s2: dict,
             ax.plot(sf, cdf, color=color, lw=2,
                     label=f"{label} His A (med={median:.3f})")
             ax.axvline(median, color=color, lw=1, ls="--", alpha=0.7)
-    # Overall read efficiency CDF (dashed)
-    if strat_raw_dfs is not None:
-        for key, label, color in [("bam1", label1, c1), ("bam2", label2, c2)]:
-            raw = strat_raw_dfs[key]
-            read_rows = (
-                raw[raw["rel_pos"].isna()]
-                .drop_duplicates(subset=["read_name"])
-                [["read_name", "read_edit_eff"]]
-                .dropna(subset=["read_edit_eff"])
-            )
-            if len(read_rows) == 0:
-                continue
-            eff = np.sort(read_rows["read_edit_eff"].values)
-            cdf = np.arange(1, len(eff) + 1) / len(eff)
-            median = float(np.median(eff))
-            ax.plot(eff, cdf, color=color, lw=2, ls="--",
-                    label=f"{label} read eff. (med={median:.3f})")
+
+    # Per-read genome-wide A->G efficiency CDF (dashed)
+    for s, label, color in [(s1, label1, c1), (s2, label2, c2)]:
+        eff = s.get("read_eff_dist", np.array([]))
+        if len(eff) == 0:
+            continue
+        eff = np.sort(eff)
+        cdf = np.arange(1, len(eff) + 1) / len(eff)
+        median = float(np.median(eff))
+        ax.plot(eff, cdf, color=color, lw=2, ls="--",
+                label=f"{label} read eff. (med={median:.3f})")
+
     ax.axhline(0.5, color="grey", lw=0.8, ls=":", alpha=0.6)
-    ax.set_xlabel("A→G fraction")
+    ax.set_xlabel("A->G fraction")
     ax.set_ylabel("Cumulative fraction")
     ax.set_title("CDF: His A editing (solid) vs\noverall read efficiency (dashed)")
     ax.set_xlim(0, 1)
@@ -1924,27 +2009,36 @@ def plot_comparison_pyx(s1: dict, s2: dict,
 
 def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2, col1, col2,
                    panel_w=5, panel_h=3):
-    """CDF of His A editing fraction for both BAMs."""
+    """CDF of His A editing fraction (solid) and per-read efficiency (dashed)."""
     from pyx import graph, style
 
     g = graph.graphxy(
         width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
-        x=graph.axis.linear(min=0, max=1,
-                            title="Edit Frac"),
-        y=graph.axis.linear(min=0, max=1,
-                            title="Cumulative fraction"),
+        x=graph.axis.linear(min=0, max=1, title="A->G edit frac"),
+        y=graph.axis.linear(min=0, max=1, title="Cumulative fraction"),
     )
 
-    for fracs, col in [(s1["edit_frac_dist"], col1),
-                       (s2["edit_frac_dist"], col2)]:
-        if len(fracs) == 0:
-            continue
-        sf = np.sort(fracs.values)
-        cdf = np.arange(1, len(sf) + 1) / len(sf)
-        g.plot(graph.data.points(list(zip(sf.tolist(), cdf.tolist())), x=1, y=2),
-               [graph.style.line([col, style.linewidth.normal,
-                                  style.linestyle.solid])])
+    for s, col in [(s1, col1), (s2, col2)]:
+        # His A site editing — solid
+        fracs = s["edit_frac_dist"]
+        if len(fracs) > 0:
+            sf = np.sort(fracs.values)
+            cdf = np.arange(1, len(sf) + 1) / len(sf)
+            g.plot(graph.data.points(list(zip(sf.tolist(), cdf.tolist())),
+                                     x=1, y=2),
+                   [graph.style.line([col, style.linewidth.normal,
+                                      style.linestyle.solid])])
+
+        # Per-read genome-wide efficiency — dashed
+        eff = s.get("read_eff_dist", np.array([]))
+        if len(eff) > 0:
+            eff_s = np.sort(eff)
+            cdf_e = np.arange(1, len(eff_s) + 1) / len(eff_s)
+            g.plot(graph.data.points(list(zip(eff_s.tolist(), cdf_e.tolist())),
+                                     x=1, y=2),
+                   [graph.style.line([col, style.linewidth.normal,
+                                      style.linestyle.dashed])])
 
     c.insert(g)
     return g
@@ -2119,7 +2213,7 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
 
     panel_w = 7
     panel_h = 3.5
-    gap = 1.0  # vertical gap between the two panels
+    gap = 1.5  # vertical gap between the two panels
     leg_x = panel_w + 0.6  # x position of legend (to the right of panel)
     leg_lw = 0.8  # legend line length in cm
     leg_dy = 0.55  # vertical spacing between legend entries
@@ -2385,6 +2479,34 @@ def main():
     # compute_summaries adds g_rate column in-place; call before compute_log2fc_agg
     s1 = compute_summaries(dfs["bam1"], min_edit_frac=args.min_edit_fraction)
     s2 = compute_summaries(dfs["bam2"], min_edit_frac=args.min_edit_fraction)
+
+    # Per-read genome-wide A->G efficiency for CDF overlay
+    # Restricted to reads that span a His site window — same population
+    # as the meta plots, avoiding rRNA and other non-His-site reads.
+    print("  Collecting reads overlapping His sites…", file=sys.stderr)
+    bam1_tmp = pysam.AlignmentFile(args.bam1, "rb")
+    bam2_tmp = pysam.AlignmentFile(args.bam2, "rb")
+    his_reads_bam1 = collect_his_site_reads(sites, bam1_tmp, min_mapq=args.min_mapq)
+    his_reads_bam2 = collect_his_site_reads(sites, bam2_tmp, min_mapq=args.min_mapq)
+    bam1_tmp.close()
+    bam2_tmp.close()
+    print(f"    BAM1: {len(his_reads_bam1):,} reads spanning His sites.",
+          file=sys.stderr)
+    print(f"    BAM2: {len(his_reads_bam2):,} reads spanning His sites.",
+          file=sys.stderr)
+
+    print("  Computing per-read editing efficiency (BAM1)…", file=sys.stderr)
+    s1["read_eff_dist"] = compute_read_edit_efficiency(
+        args.bam1, ref_fasta, min_mapq=args.min_mapq, min_baseq=args.min_baseq,
+        restrict_to_reads=his_reads_bam1)
+    print(f"    {len(s1['read_eff_dist']):,} reads with A coverage.",
+          file=sys.stderr)
+    print("  Computing per-read editing efficiency (BAM2)…", file=sys.stderr)
+    s2["read_eff_dist"] = compute_read_edit_efficiency(
+        args.bam2, ref_fasta, min_mapq=args.min_mapq, min_baseq=args.min_baseq,
+        restrict_to_reads=his_reads_bam2)
+    print(f"    {len(s2['read_eff_dist']):,} reads with A coverage.",
+          file=sys.stderr)
 
     # Transcript-normalised log2FC aggregations (window-level and rank-level)
     # g_rate is now present on both dfs after compute_summaries

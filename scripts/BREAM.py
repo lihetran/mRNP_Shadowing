@@ -6,7 +6,7 @@ April 10, 2026 LT
 
 Joint Probability Shadowing Analysis
 =====================================
-Adapts the oligoShadowingJointProbability.py algorithm to nanopore BAM data.
+Adapts the oligoShadowingJointProbability.py algorithm (BREAM) to nanopore BAM data.
 
 For each high-coverage gene:
   1. Build a reference editing frequency from BAM1 (P(edit) and P(no-edit)
@@ -357,7 +357,6 @@ def get_meta_read(joint_probs: dict) -> list:
 
     return meta
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. His codon tx positions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -377,7 +376,6 @@ def find_his_codon_tx_positions(ref_fasta: pysam.FastaFile,
         if tx_seq[i:i+3] in HIS_CODONS:
             his_pos.append(i + 1)
     return his_pos
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Plotting (pyx)
