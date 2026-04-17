@@ -963,7 +963,7 @@ def plot_rank_comparison(s1: dict, s2: dict,
 
 def compute_autocorrelation(rel_agg: pd.DataFrame, window: int) -> pd.DataFrame:
     """
-    Compute the normalised autocorrelation of the mean A→G edit fraction
+    Compute the normalised autocorrelation of the mean edit fraction
     vector across the window (ref=A positions only). Positions not present
     in rel_agg (non-A ref bases) are filled with the mean before correlating.
     A peak at lag 21 would indicate ~21 nt periodicity in editing.
@@ -974,16 +974,14 @@ def compute_autocorrelation(rel_agg: pd.DataFrame, window: int) -> pd.DataFrame:
     idx = rel_agg.set_index("rel_pos")["mean_edit_frac"]
     vec = np.array([idx.get(p, np.nan) for p in all_pos])
 
-    # Fill missing positions (non-A ref) with the mean so they don't
-    # artificially drive the autocorrelation
+    # Fill missing positions (non-A ref) with the mean, not sure if this is the right approach
     vec[np.isnan(vec)] = np.nanmean(vec)
 
-    # Mean-centre and autocorrelate
     vec = vec - vec.mean()
     full_ac = np.correlate(vec, vec, mode="full")
     mid = len(full_ac) // 2
     ac = full_ac[mid:]
-    ac = ac / ac[0]  # normalise so lag-0 = 1
+    ac = ac / ac[0]
 
     lags = np.arange(len(ac))
     return pd.DataFrame({"lag": lags[:window + 1], "autocorr": ac[:window + 1]})
