@@ -53,16 +53,16 @@ def main():
             abs_pos = abs_indices[i] 
             print(f"{i:<8} {str(abs_pos):<12} {ref_base:<10} {read_base:<10}")
 
-    # # Alignment visualization
-    # print()
-    # print("Alignment:")
-    # match_string = ''.join(
-    #     '|' if r == q else '*'
-    #     for r, q in zip(ref_string, read_string)
-    # )
-    # print(f"  REF:  {ref_string}")
-    # print(f"        {match_string}")
-    # print(f"  READ: {read_string}")
+    # Alignment visualization
+    print()
+    print("Alignment:")
+    match_string = ''.join(
+        '|' if r == q else '*'
+        for r, q in zip(ref_string, read_string)
+    )
+    print(f"  REF:  {ref_string}")
+    print(f"        {match_string}")
+    print(f"  READ: {read_string}")
 
 
 if __name__ == '__main__':

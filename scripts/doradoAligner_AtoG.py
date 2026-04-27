@@ -40,10 +40,10 @@ def replaceCharacter(seq, char1, char2):
 
 def reverseComplement(seq):
 
-        complement = {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A'}
-        reverse_complement = "".join(complement.get(base, base) for base in reversed(seq.upper()))
+    complement = {'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A'}
+    reverse_complement = "".join(complement.get(base, base) for base in reversed(seq.upper()))
 
-        return reverse_complement
+    return reverse_complement
 
 # def mutateBam(input_bam):
 #     # create a mutated bam file where all C's are changed to T's
