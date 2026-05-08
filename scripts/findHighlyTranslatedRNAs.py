@@ -51,9 +51,12 @@ def join_dataframes(rpf_df, rna_df, mapping_df):
     final_df['TE_score'] = final_df['RPF_RPKM'] / final_df['RNA_RPKM']
     # get deciles
     final_df['decile_rank'] = pd.qcut(final_df['TE_score'], 10, labels = False)
+    # get quartiles
+    final_df['quartile_rank'] = pd.qcut(final_df['TE_score'], 4, labels = False)
     top = final_df[final_df['decile_rank'] == 9]
     top_list = top['gene_name'].tolist()
     return final_df, top_list
+
 
 def plot_distribution(final_df, outfile):
     '''
@@ -96,6 +99,27 @@ def main(args):
     # write genes to txt file
     with open(listFile, 'a') as f:
         for gene in top_list:
+            f.write(gene + '\n')
+    f.close()
+    # write each quartile to a list
+    q1_df = final_df[final_df['quartile_rank'] == 1]
+    q2_df = final_df[final_df['quartile_rank'] == 2]
+    q3_df = final_df[final_df['quartile_rank'] == 3]
+    q4_df = final_df[final_df['quartile_rank'] == 4]
+    with open('q1_genes.txt', 'a') as f:
+        for gene in q1_df['gene_name'].tolist():
+            f.write(gene + '\n')
+    f.close()
+    with open('q2_genes.txt', 'a') as f:
+        for gene in q2_df['gene_name'].tolist():
+            f.write(gene + '\n')
+    f.close()
+    with open('q3_genes.txt', 'a') as f:
+        for gene in q3_df['gene_name'].tolist():
+            f.write(gene + '\n')
+    f.close()
+    with open('q4_genes.txt', 'a') as f:
+        for gene in q4_df['gene_name'].tolist():
             f.write(gene + '\n')
     f.close()
 
