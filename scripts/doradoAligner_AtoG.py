@@ -167,22 +167,29 @@ def get_editing_efficiency(bam_file, ref_dict):
     efficiencies = []
     for read in bam_file:
         if not read.is_unmapped and not read.is_secondary and not read.is_supplementary:
-            # if read.reference_name not in ['I', 'V', 'cerENO2']: # leave these out, they're rRNA and spike-in controls
-            read_seq = read.query_sequence.upper()
-            # ref_seq = ref_seq.upper()
-            ref_seq = ref_dict[read.reference_name].seq.upper()
-            aligned_pairs = read.get_aligned_pairs()
-            edits = 0
-            numAs = 0
-            for read_pos, ref_pos in aligned_pairs:
-                if ref_pos is not None and read_pos is not None:
-                    if read_seq[read_pos] == 'G' and ref_seq[ref_pos] == 'A':
-                        edits += 1
-                        numAs += 1
-                    elif ref_seq[ref_pos] == 'A':
-                        numAs += 1
+            if read.reference_name not in ['XII']: # leave these out, they're rRNA
+                read_seq = read.query_sequence.upper()
+                # ref_seq = ref_seq.upper()
+                ref_seq = ref_dict[read.reference_name].seq.upper()
+                aligned_pairs = read.get_aligned_pairs()
+                edits = 0
+                numAs = 0
+                for read_pos, ref_pos in aligned_pairs:
+                    if ref_pos is not None and read_pos is not None:
+                        if read.is_reverse:
+                            if read_seq[read_pos] == 'C' and ref_seq[ref_pos] == 'T':
+                                edits += 1
+                                numAs += 1
+                            elif ref_seq[ref_pos] == 'T':
+                                numAs += 1
+                        else:
+                            if read_seq[read_pos] == 'G' and ref_seq[ref_pos] == 'A':
+                                edits += 1
+                                numAs += 1
+                            elif ref_seq[ref_pos] == 'A':
+                                numAs += 1
 
-            efficiencies.append(edits / numAs if numAs > 0 else 0)
+                efficiencies.append(edits / numAs if numAs > 0 else 0)
 
     return efficiencies
 

@@ -84,7 +84,7 @@ def main(args):
     rna_file = args[2]
     mappingFile = args[3]
     outFile = args[4]
-    listFile = args[5]
+    # listFile = args[5]
 
     rpf_df = parseRPFData(rpf_file)
     print(rpf_df.head())
@@ -95,33 +95,35 @@ def main(args):
 
     final_df, top_list = join_dataframes(rpf_df, rna_df, mapping_df)
     print(final_df.head())
-    plot_distribution(final_df, outFile)
+    # plot_distribution(final_df, outFile)
+    # write final_df to parquet
+    final_df.to_parquet(outFile)
     # write genes to txt file
-    with open(listFile, 'a') as f:
-        for gene in top_list:
-            f.write(gene + '\n')
-    f.close()
-    # write each quartile to a list
-    q1_df = final_df[final_df['quartile_rank'] == 1]
-    q2_df = final_df[final_df['quartile_rank'] == 2]
-    q3_df = final_df[final_df['quartile_rank'] == 3]
-    q4_df = final_df[final_df['quartile_rank'] == 4]
-    with open('q1_genes.txt', 'a') as f:
-        for gene in q1_df['gene_name'].tolist():
-            f.write(gene + '\n')
-    f.close()
-    with open('q2_genes.txt', 'a') as f:
-        for gene in q2_df['gene_name'].tolist():
-            f.write(gene + '\n')
-    f.close()
-    with open('q3_genes.txt', 'a') as f:
-        for gene in q3_df['gene_name'].tolist():
-            f.write(gene + '\n')
-    f.close()
-    with open('q4_genes.txt', 'a') as f:
-        for gene in q4_df['gene_name'].tolist():
-            f.write(gene + '\n')
-    f.close()
+    # with open(listFile, 'a') as f:
+    #     for gene in top_list:
+    #         f.write(gene + '\n')
+    # f.close()
+    # # write each quartile to a list
+    # q1_df = final_df[final_df['quartile_rank'] == 1]
+    # q2_df = final_df[final_df['quartile_rank'] == 2]
+    # q3_df = final_df[final_df['quartile_rank'] == 3]
+    # q4_df = final_df[final_df['quartile_rank'] == 4]
+    # with open('q1_genes.txt', 'a') as f:
+    #     for gene in q1_df['gene_name'].tolist():
+    #         f.write(gene + '\n')
+    # f.close()
+    # with open('q2_genes.txt', 'a') as f:
+    #     for gene in q2_df['gene_name'].tolist():
+    #         f.write(gene + '\n')
+    # f.close()
+    # with open('q3_genes.txt', 'a') as f:
+    #     for gene in q3_df['gene_name'].tolist():
+    #         f.write(gene + '\n')
+    # f.close()
+    # with open('q4_genes.txt', 'a') as f:
+    #     for gene in q4_df['gene_name'].tolist():
+    #         f.write(gene + '\n')
+    # f.close()
 
 
 if __name__ == "__main__":
