@@ -1,17 +1,35 @@
 '''
-May 18, 2026 LT
-*Script was developed with assistance from Claude
+October 20, 2025
+LT
 
 This script processes a BAM file to extract per-read info and saves data
 efficiently using a generator and chunked parquet files.
 
-Updated from previous version to use GTF annotations for strand determination, which is critical for correctly identifying A-to-G edits on the correct strand. The GTF parsing
-builds an interval tree index for fast lookup of transcript features by genomic position. Each read is assigned a strand based on the best overlapping transcript, and if no transcript overlaps, it falls back to using the
-strand and transcript_id. Main difference from shadowingBamToParquetWithGTF.py is I'm forcing all information to be in the sense direction.
-Should make downstream analyses easier.
+Updated: added global_edit_freq and n_a_positions columns to support fast
+         PCA filtering and CDF plotting.
+
+         global_edit_freq  — edit freq over all A positions in the read
+         n_a_positions     — number of non-indel A positions
+
+Updated: parquet chunks are no longer split by chromosome. Instead, 'chrom'
+         is included as a field in each read record, and all chromosomes are
+         written into a single set of chunked parquet files.
+
+Updated: strand is now determined from a GTF annotation file rather than
+         read.is_reverse, which is unreliable for direct cDNA sequencing.
+         For each read, the transcript with the most overlap is used to
+         determine strand and assign transcript_id and gene_name fields.
+         If no transcript overlaps, read.is_reverse is used as fallback
+         and transcript_id/gene_name are set to None.
+
+Updated: added read_start and read_end (genomic coordinates from
+         read.reference_start and read.reference_end) to support fast
+         vectorised overlap filtering in downstream analysis scripts.
+         These are always in plus-strand genomic coordinates regardless
+         of gene strand, captured before any strand-flipping.
 
 Usage:
-  python shadowingBamToParquetWithGTF2.py <bam_file> <reference_fasta> <output_dir> --gtf <gtf_file>
+  python shadowingBamToParquet.py <bam_file> <reference_fasta> <output_dir> --gtf <gtf_file>
 '''
 
 import argparse
@@ -58,6 +76,7 @@ def build_strand_index(gtf_path):
                 'strand':        strand,
                 'transcript_id': attrs.get('transcript_id', None),
                 'gene_name':     attrs.get('gene_name', None),
+                'gene_biotype':  attrs.get('gene_biotype', None),
             }
             if chrom not in index:
                 index[chrom] = IntervalTree()
@@ -67,15 +86,15 @@ def build_strand_index(gtf_path):
 
 def get_transcript_info(strand_index, chrom, read_start, read_end, is_reverse):
     '''Look up the transcript with the most overlap with the read.
-    Returns (strand, transcript_id, gene_name).
+    Returns (strand, transcript_id, gene_name, gene_biotype).
     Falls back to is_reverse strand and None IDs if no transcript overlaps.'''
     tree = strand_index.get(chrom)
     if tree is None:
-        return ('-' if is_reverse else '+'), None, None
+        return ('-' if is_reverse else '+'), None, None, None
 
     overlaps = tree.overlap(read_start, read_end)
     if not overlaps:
-        return ('-' if is_reverse else '+'), None, None
+        return ('-' if is_reverse else '+'), None, None, None
 
     # Pick transcript with most overlap with the read
     best_data    = None
@@ -84,9 +103,10 @@ def get_transcript_info(strand_index, chrom, read_start, read_end, is_reverse):
         overlap = min(read_end, interval.end) - max(read_start, interval.begin)
         if overlap > best_overlap:
             best_overlap = overlap
-            best_data = interval.data
+            best_data    = interval.data
 
-    return best_data['strand'], best_data['transcript_id'], best_data['gene_name']
+    return (best_data['strand'], best_data['transcript_id'],
+            best_data['gene_name'], best_data['gene_biotype'])
 
 
 def reverse_complement_str(seq):
@@ -94,14 +114,16 @@ def reverse_complement_str(seq):
     comp = str.maketrans('ACGTacgt ', 'TGCAtgca ')
     return seq.translate(comp)[::-1]
 
+
 def get_absolute_positions(read):
     '''Use pysam get_aligned_pairs() for ref positions — avoids custom CIGAR
     parsing errors. Returns list of ref positions (int or None for insertions).'''
     return [p[1] for p in read.get_aligned_pairs()]
 
-def read_generator(bam_path, ref_sequence, chrom, strand_index):
+
+def read_generator(bam_path, ref_sequence, chrom, strand_index, coding_only=False):
     '''Yield one read dict at a time. Includes chrom as a field.'''
-    ref_seq = ref_sequence.upper()
+    ref_seq = str(ref_sequence).upper()
     with pysam.AlignmentFile(bam_path, "rb") as bam:
         for read in bam.fetch(chrom):
             if read.is_unmapped:
@@ -110,20 +132,32 @@ def read_generator(bam_path, ref_sequence, chrom, strand_index):
             bar_seq  = read.get_tag('cS') if read.has_tag('cS') else None
             read_seq = read.query_sequence.upper()
 
-            aligned_pairs = read.get_aligned_pairs()
+            # Capture genomic coordinates before any strand-flipping.
+            # Always in plus-strand space; used for fast overlap filtering
+            # downstream via vectorised read_start < win_end and
+            # read_end > win_start comparisons.
+            read_start = read.reference_start
+            read_end   = read.reference_end
+
+            aligned_pairs    = read.get_aligned_pairs()
             absolute_indices = get_absolute_positions(read)
 
-            # Determine strand, transcript_id, and gene_name from GTF
-            gene_strand, transcript_id, gene_name = get_transcript_info(
+            # Determine strand, transcript_id, gene_name, and gene_biotype from GTF
+            gene_strand, transcript_id, gene_name, gene_biotype = get_transcript_info(
                 strand_index, chrom,
-                read.reference_start, read.reference_end,
+                read_start, read_end,
                 read.is_reverse
             )
+
+            # Optionally skip non-protein-coding reads
+            if coding_only and gene_biotype != 'protein_coding':
+                continue
+
             is_reverse = (gene_strand == '-')
 
-            edits = []
+            edits       = []
             read_string = []
-            ref_string = []
+            ref_string  = []
 
             for read_pos, ref_pos in aligned_pairs:
                 if ref_pos is not None and read_pos is not None:
@@ -149,18 +183,17 @@ def read_generator(bam_path, ref_sequence, chrom, strand_index):
 
             # If minus-strand, flip everything to sense orientation
             if is_reverse:
-                read_string = reverse_complement_str(read_string)
-                ref_string = reverse_complement_str(ref_string)
-                edit_string = edit_string[::-1]
+                read_string      = reverse_complement_str(read_string)
+                ref_string       = reverse_complement_str(ref_string)
+                edit_string      = edit_string[::-1]
                 absolute_indices = absolute_indices[::-1]
 
             # global_edit_freq
-            # Edit freq over all non-indel A (fwd) or T (rev) positions in the read.
-            target_base = 'A' if not is_reverse else 'T'
+            # Edit freq over all non-indel A positions in the read (always sense orientation).
             a_idx_all = [i for i, c in enumerate(ref_string)
-                         if c == target_base and i < len(edit_string)
+                         if c == 'A' and i < len(edit_string)
                          and edit_string[i] != '2']
-            n_a_all = len(a_idx_all)
+            n_a_all   = len(a_idx_all)
             global_edit_freq = (
                 sum(1 for i in a_idx_all if edit_string[i] == '1') / n_a_all
                 if n_a_all > 0 else 0.0
@@ -172,7 +205,10 @@ def read_generator(bam_path, ref_sequence, chrom, strand_index):
                 'is_reverse':                is_reverse,
                 'transcript_id':             transcript_id,
                 'gene_name':                 gene_name,
+                'gene_biotype':              gene_biotype,
                 'read_id':                   read.query_name,
+                'read_start':                read_start,
+                'read_end':                  read_end,
                 'edit_string':               edit_string,
                 'barcode':                   barcode,
                 'bar_seq':                   bar_seq,
@@ -203,13 +239,15 @@ def write_chunk(df, base_path, chunk_index):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert BAM file to parquet chunks."
+        description="Convert BAM file to parquet chunks for PCA pipeline."
     )
     parser.add_argument("bam_file",      type=str, help="Input BAM file")
     parser.add_argument("ref_fasta",     type=str, help="Reference FASTA file")
     parser.add_argument("output_dir",    type=str, help="Output directory for parquet chunks")
     parser.add_argument("--gtf",         type=str, required=True,
                         help="GTF annotation file for strand determination")
+    parser.add_argument("--coding_only", action="store_true",
+                        help="Only write reads assigned to protein-coding genes")
     parser.add_argument("--chunk_size",  type=int, default=50000,
                         help="Rows per output parquet chunk (default: 50000)")
 
@@ -237,7 +275,8 @@ def main():
         print(f"Processing chromosome {chrom}...")
         chrom_total = 0
 
-        for record in read_generator(bam_file, ref_seq.seq, chrom, strand_index):
+        for record in read_generator(bam_file, ref_seq.seq, chrom, strand_index,
+                                     coding_only=args.coding_only):
             rows.append(record)
             total += 1
             chrom_total += 1

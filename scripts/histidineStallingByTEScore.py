@@ -552,18 +552,16 @@ def plot_te_quartiles_pyx(bam_agg: dict,
     For each BAM, produce one panel per TE quartile (Q1–Q4) showing the His
     A→G editing meta-plot.  All four quartile panels are overlaid in a final
     summary panel.  Layout: 2 rows (one per BAM) × 5 panels (Q1–Q4 + overlay).
-
-    Colour ramp: light → dark blue for Q1 → Q4 (higher TE = more intense).
     """
     from pyx import canvas, color, style, path, text as pyx_text
 
     quartile_labels = [1, 2, 3, 4]
     # Light→dark CMYK blue ramp
     quartile_colors = [
-        color.cmyk(0.6, 0.3, 0.0, 0.0),   # Q1 — light blue
-        color.cmyk(0.8, 0.4, 0.0, 0.0),   # Q2
-        color.cmyk(1.0, 0.5, 0.0, 0.1),   # Q3
-        color.cmyk(1.0, 0.6, 0.0, 0.3),   # Q4 — dark blue
+        color.cmyk(0.45, 0.07, 0.00, 0.02),  # Q1 — sky blue      (#56B4E9)
+        color.cmyk(0.57, 0.00, 0.43, 0.20),  # Q2 — bluish green  (#009E73)
+        color.cmyk(0.00, 0.68, 0.79, 0.09),  # Q3 — vermillion    (#D55E00)
+        color.cmyk(0.00, 0.38, 0.83, 0.00),  # Q4 — orange        (#E69F00)
     ]
     q_color_map = dict(zip(quartile_labels, quartile_colors))
 
@@ -667,10 +665,10 @@ def parse_args():
                    help="Parquet with 'gene_name' and 'quartile_rank' columns. "
                         "If provided, genes are stratified into TE quartiles for meta plots.")
     p.add_argument("--control_codons", nargs="*", default=None,
-                   help="Control codon names to run specificity analysis "
-                        f"(default: {list(CONTROL_CODONS.keys())}). "
-                        "Must be keys of the CONTROL_CODONS dict in the script, "
-                        "or pass none to skip.")
+                   help="Control codon names for specificity analysis. "
+                        f"Available: {list(CONTROL_CODONS.keys())}. "
+                        "Pass one or more names to enable (e.g. --control_codons Asn Tyr). "
+                        "Omitting this flag skips all control codon analysis.")
     p.add_argument("--chroms", nargs="*", default=None,
                    help="Restrict to specific chromosomes/contigs")
     return p.parse_args()
@@ -741,9 +739,10 @@ def main():
     }
 
     # ── Control codon specificity analysis ────────────────────────────────────
-    control_names = args.control_codons \
-        if args.control_codons is not None \
-        else list(CONTROL_CODONS.keys())
+    # Only runs when --control_codons is explicitly provided on the command line.
+    # nargs="*" means: flag absent → None (skip); flag present with no args → []
+    # (also skip); flag present with names → run those.
+    control_names = args.control_codons  # None if flag not given
 
     # control_aggs[codon_name][bam_label] = aggregated DataFrame
     control_aggs: dict[str, dict[str, pd.DataFrame]] = {}

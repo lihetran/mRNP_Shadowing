@@ -78,11 +78,14 @@ def load_parquet_chunks(parquet_dir: str, gene: dict) -> pd.DataFrame:
 
 
 def _gpos_to_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
-    chrom      = gene["chrom"]
-    strand     = gene["strand"]
+    '''
+    This function maps genomic positions to transcript positions for a given gene.
+    '''
+    chrom = gene["chrom"]
+    strand = gene["strand"]
     gene_start = gene["gene_start"]
-    gene_end   = gene["gene_end"]
-    chrom_seq  = ref_fasta.fetch(chrom).upper()
+    gene_end = gene["gene_end"]
+    chrom_seq = ref_fasta.fetch(chrom).upper()
     gpos_to_tx = {}
     tx_pos = 0
     if strand == "+":
