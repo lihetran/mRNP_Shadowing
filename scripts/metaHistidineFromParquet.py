@@ -237,40 +237,73 @@ def count_mismatches_at_site(ref_fasta: pysam.FastaFile,
     """
     Parquet-compatible pileup. Pre-fetches window sequence once.
     Returns {rel_pos: {ref_pos, ref_base, A, G, C, T, cov}}.
+
+    Uses edit_string + absolute_indices which are both already in sense
+    (transcript) orientation from the parquet generator. For minus-strand
+    genes the generator reverses both, so index i in edit_string correctly
+    corresponds to index i in absolute_indices.
+
+    edit_string encoding (in transcript/sense coordinates):
+        '1' = A->G edit
+        '0' = no edit at a ref=A position
+        '2' = indel or non-target ref base
+
+    Only '0' and '1' positions contribute counts (as A and G respectively).
     """
     chrom     = site["chrom"]
     edit_pos  = site["edit_pos"]
     win_start = site["win_start"]
     win_end   = site["win_end"]
     strand    = site["strand"]
+    gene_minus = (strand == "-")
 
     win_seq = ref_fasta.fetch(chrom, win_start, win_end).upper()
     counts_by_rel = collections.defaultdict(lambda: collections.Counter())
 
     for read in dataframe.itertuples():
-        for i, (query_pos, ref_pos) in enumerate(read.aligned_pairs):
-            if ref_pos is None or query_pos is None:
+        edit_str    = read.edit_string
+        abs_indices = read.absolute_indices  # sense-oriented for minus-strand
+
+        for i, ref_pos in enumerate(abs_indices):
+            if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+                continue  # None or NaN (None becomes NaN after parquet round-trip)
+            if i >= len(edit_str):
                 continue
+            ref_pos = int(ref_pos)
             if not (win_start <= ref_pos < win_end):
                 continue
 
-            rel_pos   = ref_pos - edit_pos
-            if strand == "-":
+            edit_val = edit_str[i]
+            if edit_val == "2":
+                continue
+
+            # Verify ref base is A in transcript coordinates.
+            # edit_string '0' is set for ANY non-indel position regardless
+            # of ref base, so we must confirm ref=A using win_seq.
+            ref_base_genomic = win_seq[int(ref_pos) - win_start]
+            ref_base_tx = complement_base(ref_base_genomic) \
+                          if gene_minus else ref_base_genomic
+            if ref_base_tx != "A":
+                continue
+
+            rel_pos = ref_pos - edit_pos
+            if gene_minus:
                 rel_pos = -rel_pos
             rel_pos = int(rel_pos)
 
-            read_base = read.read_sequence_aligned[i].upper()
-            if read_base == ' ':
-                continue
-
-            counts_by_rel[rel_pos][read_base] += 1
+            # '1' = A->G edit → count as G
+            # '0' = no edit at ref=A → count as A
+            qbase = "G" if edit_val == "1" else "A"
+            counts_by_rel[rel_pos][qbase] += 1
 
     pos_data = {}
     for rel_pos, counts in counts_by_rel.items():
-        gpos = int(edit_pos + rel_pos) if strand == "+" else int(edit_pos - rel_pos)
+        gpos             = int(edit_pos + rel_pos) if strand == "+" \
+                           else int(edit_pos - rel_pos)
         ref_base_genomic = win_seq[gpos - win_start]
         ref_base         = complement_base(ref_base_genomic) \
-                           if strand == "-" else ref_base_genomic
+                           if gene_minus else ref_base_genomic
+
         total = sum(counts.values())
         pos_data[rel_pos] = {
             "ref_pos":  gpos,
@@ -581,37 +614,89 @@ def _pyx_log2fc_graph(c, xpos, ypos, log2fc_agg, label1, label2, window,
 
 def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2,
                    col1, col2, panel_w=5, panel_h=3):
-    """CDF of His A edit frac (solid) and per-read efficiency (dashed)."""
-    from pyx import graph, style
+    """CDF of per-read global A->G editing efficiency for both libraries."""
+    from pyx import graph, style, path, text as pyx_text
 
     g = graph.graphxy(
         width=panel_w, height=panel_h,
         xpos=xpos, ypos=ypos,
-        x=graph.axis.linear(min=0, max=1, title="A->G edit frac"),
+        x=graph.axis.linear(min=0, max=1, title="Edit Freq per Read"),
         y=graph.axis.linear(min=0, max=1, title="Cumulative fraction"),
     )
 
-    for s, col in [(s1, col1), (s2, col2)]:
-        fracs = s["edit_frac_dist"]
-        if len(fracs) > 0:
-            sf  = np.sort(fracs.values if hasattr(fracs, "values") else fracs)
-            cdf = np.arange(1, len(sf) + 1) / len(sf)
-            g.plot(graph.data.points(list(zip(sf.tolist(), cdf.tolist())),
-                                     x=1, y=2),
-                   [graph.style.line([col, style.linewidth.normal,
-                                      style.linestyle.solid])])
-
+    for s, col, label in [(s1, col1, label1), (s2, col2, label2)]:
         eff = s.get("read_eff_dist", np.array([]))
-        if len(eff) > 0:
-            eff_s = np.sort(eff)
-            cdf_e = np.arange(1, len(eff_s) + 1) / len(eff_s)
-            g.plot(graph.data.points(list(zip(eff_s.tolist(), cdf_e.tolist())),
-                                     x=1, y=2),
-                   [graph.style.line([col, style.linewidth.normal,
-                                      style.linestyle.dashed])])
+        if len(eff) == 0:
+            continue
+        eff_s = np.sort(eff)
+        cdf   = np.arange(1, len(eff_s) + 1) / len(eff_s)
+        g.plot(graph.data.points(list(zip(eff_s.tolist(), cdf.tolist())),
+                                 x=1, y=2),
+               [graph.style.line([col, style.linewidth.normal,
+                                  style.linestyle.solid])])
 
     c.insert(g)
     return g
+
+
+def plot_cdf_pyx(s1: dict, s2: dict,
+                  label1: str, label2: str,
+                  output_prefix: str):
+    """
+    Standalone CDF figure of per-read global A->G editing efficiency.
+    One panel with both libraries overlaid and a legend.
+    """
+    from pyx import canvas, graph, color, style, path, text as pyx_text
+
+    col1    = color.cmyk(0, 0, 0, 1)
+    col2    = color.cmyk(1, 0.5, 0, 0)
+    panel_w = 7
+    panel_h = 5
+    leg_lw  = 0.8
+    leg_dy  = 0.55
+
+    c = canvas.canvas()
+
+    g = graph.graphxy(
+        width=panel_w, height=panel_h,
+        xpos=0, ypos=0,
+        x=graph.axis.linear(min=0, max=1, title="A->G edit freq per read"),
+        y=graph.axis.linear(min=0, max=1, title="Cumulative fraction"),
+    )
+
+    for s, col, label, ls in [
+        (s1, col1, label1, style.linestyle.solid),
+        (s2, col2, label2, style.linestyle.solid),
+    ]:
+        eff = s.get("read_eff_dist", np.array([]))
+        if len(eff) == 0:
+            continue
+        eff_s = np.sort(eff)
+        cdf   = np.arange(1, len(eff_s) + 1) / len(eff_s)
+        g.plot(graph.data.points(list(zip(eff_s.tolist(), cdf.tolist())),
+                                 x=1, y=2),
+               [graph.style.line([col, style.linewidth.normal, ls])])
+
+    c.insert(g)
+
+    # Title
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.4,
+           "Per-read A->G editing efficiency",
+           [pyx_text.halign.center, pyx_text.size.normalsize])
+
+    # Legend to the right of the panel
+    leg_x     = g.xpos + g.width + 0.4
+    leg_y_top = g.ypos + g.height - 0.3
+    for j, (label, col) in enumerate([(label1, col1), (label2, col2)]):
+        ly = leg_y_top - j * leg_dy
+        c.stroke(path.line(leg_x, ly, leg_x + leg_lw, ly),
+                 [col, style.linewidth.normal, style.linestyle.solid])
+        c.text(leg_x + leg_lw + 0.15, ly, label,
+               [pyx_text.valign.middle, pyx_text.size.small])
+
+    plot_path = f"{output_prefix}_editing_efficiency_cdf_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -981,8 +1066,16 @@ def main():
     print("\nLoading parquet chunks...", file=sys.stderr)
     df_all1 = load_all_parquet_chunks(args.parquet1)
     df_all2 = load_all_parquet_chunks(args.parquet2)
-    print(f"  {args.label1}: {len(df_all1):,} reads", file=sys.stderr)
-    print(f"  {args.label2}: {len(df_all2):,} reads", file=sys.stderr)
+
+    for df, label in [(df_all1, args.label1), (df_all2, args.label2)]:
+        n_total   = len(df)
+        n_rev     = df["is_reverse"].sum() if "is_reverse" in df.columns else 0
+        n_fwd     = n_total - n_rev
+        pct_rev   = 100 * n_rev / n_total if n_total > 0 else 0.0
+        print(f"  {label}: {n_total:,} reads  |  "
+              f"forward: {n_fwd:,} ({100-pct_rev:.1f}%)  |  "
+              f"reverse (minus-strand gene): {n_rev:,} ({pct_rev:.1f}%)",
+              file=sys.stderr)
 
     # ── Collect reads spanning His sites (for efficiency CDF) ─────────────────
     print("\nCollecting reads overlapping His sites...", file=sys.stderr)
@@ -1003,11 +1096,11 @@ def main():
     s1 = compute_summaries(agg_df1, args.min_edit_frac)
     s2 = compute_summaries(agg_df2, args.min_edit_frac)
 
-    # Fill read efficiency distributions
-    s1["read_eff_dist"] = compute_read_edit_efficiency_from_dataframe(
-        df_all1, restrict_to_reads=his_reads1)
-    s2["read_eff_dist"] = compute_read_edit_efficiency_from_dataframe(
-        df_all2, restrict_to_reads=his_reads2)
+    # Fill read efficiency distributions — global_edit_freq per read
+    s1["read_eff_dist"] = df_all1["global_edit_freq"].dropna().values \
+                          if "global_edit_freq" in df_all1.columns else np.array([])
+    s2["read_eff_dist"] = df_all2["global_edit_freq"].dropna().values \
+                          if "global_edit_freq" in df_all2.columns else np.array([])
 
     # Fill log2FC
     log2fc_agg, rank_log2fc_agg = compute_log2fc_agg(agg_df1, agg_df2)
@@ -1060,6 +1153,7 @@ def main():
                                   out, args.window)
         plot_codon_type_comparison_pyx(s1, s2, args.label1, args.label2,
                                         out, args.window)
+        plot_cdf_pyx(s1, s2, args.label1, args.label2, out)
         if control_aggs:
             plot_codon_specificity_pyx(
                 his_agg_bam1=s1["rel_position_agg"],
