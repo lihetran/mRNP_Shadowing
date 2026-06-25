@@ -61,6 +61,7 @@ import pysam
 import numpy as np
 import pandas as pd
 import scipy.stats
+from logJosh import Tee
 
 
 # ── Histidine codons ──────────────────────────────────────────────────────────
@@ -678,4 +679,5 @@ def main():
 
 
 if __name__ == "__main__":
+    Tee()
     main()
