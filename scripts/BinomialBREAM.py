@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Binomial Shadowing Analysis
-============================
+Binomial Shadowing Analysis (parquet input)
+===========================================
 For each high-coverage gene, slides a window across the transcript and
 tests whether each read shows fewer A->G edits than expected under a
-binomial null model derived from BAM1 (reference/WT).
+binomial null model derived from the reference/WT library (parquet1).
 
 At each window position for each read:
   - n = number of ref=A sites covered by the read in the window
   - k = number of those sites showing a G (i.e. edited)
-  - p = mean background edit probability across those sites (from BAM1)
+  - p = mean background edit probability across those sites (from parquet1)
   - p_value = P(X <= k | n, p)  [lower-tail binomial test for protection]
 
 A low p-value means the read has fewer edits than expected — consistent
@@ -22,10 +22,20 @@ Outputs per gene:
     tick marks below each trace.
   - Summary CSV with median -log10(p) per gene.
 
+Input format
+------------
+Both libraries are read from directories of parquet chunks. Each chunk is a
+DataFrame with (at least) these columns:
+  - chrom        : reference contig name
+  - gene_strand  : "+" or "-"
+  - read_id      : unique read identifier
+  - aligned_pairs: list of (read_pos, ref_pos) tuples (None for indels)
+  - edit_string  : per-aligned-pair code, "0"=ref(A), "1"=edit(G), "2"=skip
+
 Usage:
     python3 binomialShadowing.py \
-        --bam1 reference.bam --label1 "WT" \
-        --bam2 query.bam     --label2 "3-AT" \
+        --parquet1 reference_chunks/ --label1 "WT" \
+        --parquet2 query_chunks/     --label2 "3-AT" \
         --ref reference.fa \
         --gtf annotation.gtf \
         --output output_prefix \
@@ -33,12 +43,10 @@ Usage:
         [--min_coverage 50] \
         [--min_sites 5] \
         [--num_reads 10] \
-        [--min_mapq 20] \
-        [--min_baseq 10] \
         [--gene_list genes.txt]
 
 Requirements:
-    pip install pysam pandas numpy scipy
+    pip install pysam pandas numpy scipy pyarrow
     pyx (for plotting)
 """
 
@@ -55,12 +63,20 @@ import pandas as pd
 import scipy.stats
 
 
+# ── Histidine codons ──────────────────────────────────────────────────────────
+HIS_CODONS = {"CAT", "CAC"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1b. Parquet-compatible input functions
-#     (mirrors jointProbShadowing.py parquet functions)
+# 1. Parquet input helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_parquet_chunks(parquet_dir: str, gene: dict) -> pd.DataFrame:
+    """
+    Read all parquet chunks in a directory and return the rows belonging to
+    this gene's contig and strand. Streams one chunk at a time to keep peak
+    memory bounded by a single chunk plus the matching rows.
+    """
     parquet_dir = Path(parquet_dir)
     chunks = sorted(parquet_dir.glob("*.parquet"))
     if not chunks:
@@ -77,81 +93,126 @@ def load_parquet_chunks(parquet_dir: str, gene: dict) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
+def cds_length(gene: dict) -> int:
+    """Total length of the spliced coding sequence (sum of CDS segments)."""
+    return sum(ce - cs for (cs, ce) in gene["cds"])
+
+
 def _gpos_to_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
-    '''
-    This function maps genomic positions to transcript positions for a given gene.
-    '''
-    chrom = gene["chrom"]
-    strand = gene["strand"]
-    gene_start = gene["gene_start"]
-    gene_end = gene["gene_end"]
+    """
+    Map genomic positions to spliced-CDS (transcript) positions for ref=A sites.
+
+    tx_pos increments contiguously over the concatenated CDS segments in
+    transcript order (5'->3'); introns and UTRs are skipped entirely, so
+    positions in this map line up exactly with the His-codon coordinates
+    produced by find_his_codon_tx_positions (which concatenates the same CDS
+    segments). Only ref=A (transcript-strand A) positions are recorded.
+
+    Note: gene["cds"] is already sorted in transcript order by parse_gtf
+    (ascending for "+" strand, descending for "-"), so iterating the list
+    in order walks the CDS 5'->3'.
+    """
+    chrom     = gene["chrom"]
+    strand    = gene["strand"]
     chrom_seq = ref_fasta.fetch(chrom).upper()
+
     gpos_to_tx = {}
     tx_pos = 0
-    if strand == "+":
-        for gpos in range(gene_start, gene_end):
-            if chrom_seq[gpos] == "A":
-                gpos_to_tx[gpos] = tx_pos
-            tx_pos += 1
-    else:
-        for gpos in range(gene_end - 1, gene_start - 1, -1):
-            if chrom_seq[gpos] == "T":  # ref=T on minus strand = A in transcript
-                gpos_to_tx[gpos] = tx_pos
-            tx_pos += 1
+    for (cs, ce) in gene["cds"]:
+        if strand == "+":
+            for gpos in range(cs, ce):
+                if chrom_seq[gpos] == "A":
+                    gpos_to_tx[gpos] = tx_pos
+                tx_pos += 1
+        else:
+            for gpos in range(ce - 1, cs - 1, -1):
+                if chrom_seq[gpos] == "T":  # ref=T on minus strand = A in transcript
+                    gpos_to_tx[gpos] = tx_pos
+                tx_pos += 1
     return gpos_to_tx
 
 
-def build_reference_freq_parquet(parquet_dir, ref_fasta, gene):
-    df = load_parquet_chunks(parquet_dir, gene)
+def mean_cds_coverage_parquet(df: pd.DataFrame, gene: dict) -> float:
+    """
+    Mean read depth across CDS positions, computed from aligned_pairs.
+    Depth is averaged over CDS positions that have at least one aligned read
+    (mirrors the pileup-based behaviour of the previous BAM implementation).
+    """
+    if df.empty:
+        return 0.0
+    cds_positions = set()
+    for (s, e) in gene["cds"]:
+        cds_positions.update(range(s, e))
+    if not cds_positions:
+        return 0.0
+
+    coverage = collections.Counter()
+    for _, row in df.iterrows():
+        for read_pos, ref_pos in row["aligned_pairs"]:
+            if ref_pos is None or read_pos is None:
+                continue
+            if ref_pos in cds_positions:
+                coverage[ref_pos] += 1
+
+    if not coverage:
+        return 0.0
+    return sum(coverage.values()) / len(coverage)
+
+
+def build_reference_freq_parquet(df: pd.DataFrame, gpos_to_tx: dict) -> dict:
+    """
+    Returns {tx_pos: p_edit} where p_edit = G/(A+G) at each ref=A position
+    across the gene body, from the reference library.
+    Clamped to [1e-6, 1-1e-6] to avoid degenerate binomial probabilities.
+    """
     if df.empty:
         return {}
-    gpos_to_tx  = _gpos_to_tx_map(gene, ref_fasta)
     edit_counts = collections.defaultdict(lambda: [0, 0])
     for _, row in df.iterrows():
+        es = row["edit_string"]
         for i, (read_pos, ref_pos) in enumerate(row["aligned_pairs"]):
             if ref_pos is None or read_pos is None:
                 continue
-            if i >= len(row["edit_string"]):
+            if i >= len(es):
                 continue
-            ev = row["edit_string"][i]
+            ev = es[i]
             if ev == "2" or ref_pos not in gpos_to_tx:
                 continue
-            tx = gpos_to_tx[ref_pos]
-            edit_counts[tx][int(ev)] += 1
+            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
+
     ref_freq = {}
     for tx, (n0, n1) in edit_counts.items():
         total = n0 + n1
         if total > 0:
-            p = max(1e-6, min(1 - 1e-6, n1 / total))
-            ref_freq[tx] = p
+            p = n1 / total
+            ref_freq[tx] = max(1e-6, min(1 - 1e-6, p))
     return ref_freq
 
 
-def collect_read_edits_parquet(parquet_dir, ref_fasta, gene):
-    df = load_parquet_chunks(parquet_dir, gene)
+def collect_read_edits_parquet(df: pd.DataFrame, gpos_to_tx: dict) -> dict:
+    """
+    Returns {read_id: {tx_pos: 0_or_1}} for all reads covering the gene,
+    from the query library.
+    """
     if df.empty:
         return {}
-    gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
     read_edits = collections.defaultdict(dict)
     for _, row in df.iterrows():
+        es = row["edit_string"]
         for i, (read_pos, ref_pos) in enumerate(row["aligned_pairs"]):
             if ref_pos is None or read_pos is None:
                 continue
-            if i >= len(row["edit_string"]):
+            if i >= len(es):
                 continue
-            ev = row["edit_string"][i]
+            ev = es[i]
             if ev == "2" or ref_pos not in gpos_to_tx:
                 continue
             read_edits[row["read_id"]][gpos_to_tx[ref_pos]] = int(ev)
     return dict(read_edits)
 
 
-# ── Histidine codons ──────────────────────────────────────────────────────────
-HIS_CODONS = {"CAT", "CAC"}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Shared helpers (identical to jointProbShadowing.py)
+# 2. Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def complement_base(b: str) -> str:
@@ -202,36 +263,6 @@ def parse_gtf(gtf_path: str) -> dict:
     return genes
 
 
-def mean_cds_coverage(bam: pysam.AlignmentFile, gene: dict,
-                       min_mapq: int) -> float:
-    total, bases = 0, 0
-    for (s, e) in gene["cds"]:
-        for col in bam.pileup(gene["chrom"], s, e, truncate=True,
-                              min_mapping_quality=min_mapq,
-                              stepper="samtools"):
-            total += col.nsegments
-            bases += 1
-    return total / bases if bases > 0 else 0.0
-
-
-def filter_high_coverage_genes(genes, bam1_path, bam2_path,
-                                 min_coverage, min_mapq):
-    passing = []
-    bam1 = pysam.AlignmentFile(bam1_path, "rb")
-    bam2 = pysam.AlignmentFile(bam2_path, "rb")
-    for i, (gname, gene) in enumerate(genes.items()):
-        if (i + 1) % 200 == 0:
-            print(f"  Coverage check {i+1}/{len(genes)}…", file=sys.stderr)
-        if (mean_cds_coverage(bam1, gene, min_mapq) >= min_coverage and
-                mean_cds_coverage(bam2, gene, min_mapq) >= min_coverage):
-            passing.append(gname)
-    bam1.close()
-    bam2.close()
-    print(f"  {len(passing):,}/{len(genes):,} genes pass coverage filter.",
-          file=sys.stderr)
-    return passing
-
-
 def find_his_codon_tx_positions(ref_fasta, gene):
     chrom, strand = gene["chrom"], gene["strand"]
     tx_seq = ""
@@ -251,120 +282,7 @@ def find_his_codon_tx_positions(ref_fasta, gene):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Build reference edit probability per tx_pos from BAM1
-#    (identical to jointProbShadowing.py build_reference_freq,
-#     but stores only freq_edit = P(edit) since the binomial only needs p)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_reference_freq(bam, ref_fasta, gene, min_mapq, min_baseq):
-    """
-    Returns {tx_pos: p_edit} where p_edit = G/(A+G) at each ref=A
-    position across the gene body, from BAM1.
-    Clamped to [1e-6, 1-1e-6] to avoid degenerate binomial probabilities.
-    """
-    chrom      = gene["chrom"]
-    strand     = gene["strand"]
-    gene_start = gene["gene_start"]
-    gene_end   = gene["gene_end"]
-    chrom_seq  = ref_fasta.fetch(chrom).upper()
-
-    ref_freq = {}
-    tx_pos   = 0
-
-    if strand == "+":
-        gpos_range = range(gene_start, gene_end)
-    else:
-        gpos_range = range(gene_end - 1, gene_start - 1, -1)
-
-    for gpos in gpos_range:
-        ref_base_tx = chrom_seq[gpos] if strand == "+" \
-                      else complement_base(chrom_seq[gpos])
-
-        if ref_base_tx == "A":
-            counts = collections.Counter()
-            for col in bam.pileup(chrom, gpos, gpos + 1, truncate=True,
-                                   min_mapping_quality=min_mapq,
-                                   min_base_quality=min_baseq,
-                                   stepper="samtools"):
-                if col.reference_pos != gpos:
-                    continue
-                for pread in col.pileups:
-                    if pread.is_del or pread.is_refskip:
-                        continue
-                    qbase_raw = pread.alignment.query_sequence[
-                        pread.query_position].upper()
-                    needs_complement = (pread.alignment.is_reverse !=
-                                        (strand == "-"))
-                    qbase = complement_base(qbase_raw) \
-                            if needs_complement else qbase_raw
-                    if qbase in ("A", "G"):
-                        counts[qbase] += 1
-
-            ag_total = counts["A"] + counts["G"]
-            if ag_total > 0:
-                p = counts["G"] / ag_total
-                ref_freq[tx_pos] = max(1e-6, min(1 - 1e-6, p))
-
-        tx_pos += 1
-
-    return ref_freq
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Collect per-read edit observations from BAM2
-#    (identical to jointProbShadowing.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def collect_read_edits(bam, ref_fasta, gene, min_mapq, min_baseq):
-    """
-    Returns {read_name: {tx_pos: 0_or_1}} for all reads covering the gene.
-    """
-    chrom      = gene["chrom"]
-    strand     = gene["strand"]
-    gene_start = gene["gene_start"]
-    gene_end   = gene["gene_end"]
-    chrom_seq  = ref_fasta.fetch(chrom).upper()
-
-    gpos_to_tx = {}
-    tx_pos = 0
-    if strand == "+":
-        for gpos in range(gene_start, gene_end):
-            if chrom_seq[gpos] == "A":
-                gpos_to_tx[gpos] = tx_pos
-            tx_pos += 1
-    else:
-        for gpos in range(gene_end - 1, gene_start - 1, -1):
-            if complement_base(chrom_seq[gpos]) == "A":
-                gpos_to_tx[gpos] = tx_pos
-            tx_pos += 1
-
-    read_edits = collections.defaultdict(dict)
-    for read in bam.fetch(chrom, gene_start, gene_end):
-        if read.is_unmapped or read.is_secondary or read.is_supplementary:
-            continue
-        if read.mapping_quality < min_mapq:
-            continue
-        if read.query_sequence is None:
-            continue
-        needs_complement = read.is_reverse != (strand == "-")
-        for qpos, rpos in read.get_aligned_pairs(matches_only=True):
-            if rpos not in gpos_to_tx:
-                continue
-            if read.query_qualities is not None:
-                if read.query_qualities[qpos] < min_baseq:
-                    continue
-            qbase_raw = read.query_sequence[qpos].upper()
-            qbase = complement_base(qbase_raw) if needs_complement else qbase_raw
-            if qbase in ("A", "G"):
-                read_edits[read.query_name][gpos_to_tx[rpos]] = \
-                    1 if qbase == "G" else 0
-
-    return dict(read_edits)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Compute binomial p-values per read per window position
-#    This replaces compute_joint_prob_per_read from jointProbShadowing.py.
+# 3. Compute binomial p-values per read per window position
 #
 #    At each window centre:
 #      n = number of ref=A sites in window covered by this read
@@ -420,7 +338,7 @@ def compute_binomial_pvals_per_read(read_edits, ref_freq, nt_window,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Meta read aggregation (same structure as jointProbShadowing.py)
+# 4. Meta read aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_meta_read(binomial_scores):
@@ -447,7 +365,7 @@ def get_meta_read(binomial_scores):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Plotting (pyx) — same layout as jointProbShadowing.py
+# 5. Plotting (pyx)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
@@ -459,7 +377,7 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
     """
     from pyx import canvas, graph, color, style, path, text as pyx_text
 
-    col_qry  = color.cmyk(1, 0.5, 0, 0)     # blue  — query BAM traces
+    col_qry  = color.cmyk(1, 0.5, 0, 0)     # blue  — query traces
     col_his  = color.cmyk(0, 1, 1, 0)       # red   — His codon lines
     col_sig  = color.cmyk(0, 0, 0, 0.4)     # grey  — significance threshold
     col_edit = color.cmyk(0, 0, 0, 1)       # black — edit ticks
@@ -601,21 +519,18 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. CLI
+# 6. CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Binomial test for editing protection in sliding windows."
+        description="Binomial test for editing protection in sliding windows "
+                    "(parquet input)."
     )
-    p.add_argument("--bam1",     required=False, default=None,
-                   help="Reference BAM. Use --parquet1 instead for parquet input.")
-    p.add_argument("--bam2",     required=False, default=None,
-                   help="Query BAM. Use --parquet2 instead for parquet input.")
-    p.add_argument("--parquet1", default=None,
-                   help="Parquet chunk directory for reference library.")
-    p.add_argument("--parquet2", default=None,
-                   help="Parquet chunk directory for query library.")
+    p.add_argument("--parquet1", required=True,
+                   help="Parquet chunk directory for the reference/WT library.")
+    p.add_argument("--parquet2", required=True,
+                   help="Parquet chunk directory for the query library.")
     p.add_argument("--label1", default="BAM1")
     p.add_argument("--label2", default="BAM2")
     p.add_argument("--ref",    required=True)
@@ -628,8 +543,6 @@ def parse_args():
                    help="Min ref=A sites per window to run the test (default: 5)")
     p.add_argument("--num_reads", type=int, default=10,
                    help="Number of individual reads to plot per gene (default: 10)")
-    p.add_argument("--min_mapq",  type=int, default=20)
-    p.add_argument("--min_baseq", type=int, default=10)
     p.add_argument("--gene_list", default=None)
     return p.parse_args()
 
@@ -639,7 +552,7 @@ def main():
     out  = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
-    print("=== Binomial Shadowing Analysis ===", file=sys.stderr)
+    print("=== Binomial Shadowing Analysis (parquet) ===", file=sys.stderr)
 
     print("\nParsing GTF…", file=sys.stderr)
     genes = parse_gtf(args.gtf)
@@ -651,58 +564,49 @@ def main():
         genes = {k: v for k, v in genes.items() if k in allowed}
         print(f"  {len(genes):,} after gene list filter.", file=sys.stderr)
 
-    print(f"\nFiltering genes (mean CDS coverage >= {args.min_coverage}x)…",
-          file=sys.stderr)
-    passing = filter_high_coverage_genes(
-        genes, args.bam1, args.bam2,
-        min_coverage=args.min_coverage, min_mapq=args.min_mapq,
-    )
-    if not passing:
-        print("ERROR: No genes passed coverage filter.", file=sys.stderr)
-        sys.exit(1)
-
-    if not args.bam1 and not args.parquet1:
-        print("ERROR: provide --bam1 or --parquet1", file=sys.stderr)
-        sys.exit(1)
-    if not args.bam2 and not args.parquet2:
-        print("ERROR: provide --bam2 or --parquet2", file=sys.stderr)
-        sys.exit(1)
-
-    use_parquet = bool(args.parquet1 or args.parquet2)
-    ref_fasta   = pysam.FastaFile(args.ref)
-
-    if not use_parquet:
-        bam1 = pysam.AlignmentFile(args.bam1, "rb")
-        bam2 = pysam.AlignmentFile(args.bam2, "rb")
+    ref_fasta = pysam.FastaFile(args.ref)
 
     pdf_dir = Path(f"{out}_gene_pdfs")
     pdf_dir.mkdir(parents=True, exist_ok=True)
     summary_rows = []
 
-    print(f"\nProcessing {len(passing):,} genes…", file=sys.stderr)
+    gene_names = list(genes.keys())
+    n_pass = 0
 
-    for i, gname in enumerate(passing):
-        if (i + 1) % 10 == 0:
-            print(f"  {i+1}/{len(passing)}: {gname}…", file=sys.stderr)
+    print(f"\nProcessing {len(gene_names):,} genes "
+          f"(mean CDS coverage >= {args.min_coverage}x)…", file=sys.stderr)
+
+    for i, gname in enumerate(gene_names):
+        if (i + 1) % 50 == 0:
+            print(f"  {i+1}/{len(gene_names)} scanned, "
+                  f"{n_pass} passing…", file=sys.stderr)
 
         gene     = genes[gname]
-        gene_len = gene["gene_end"] - gene["gene_start"]
+        # Window sliding and His-codon marks live in spliced-CDS coordinates,
+        # so the transcript extent is the summed CDS length (not the genomic
+        # span, which would include introns/UTRs).
+        gene_len = cds_length(gene)
 
-        if args.parquet1:
-            ref_freq = build_reference_freq_parquet(
-                args.parquet1, ref_fasta, gene)
-        else:
-            ref_freq = build_reference_freq(
-                bam1, ref_fasta, gene, args.min_mapq, args.min_baseq)
+        # Load this gene's reads once per library.
+        df_ref = load_parquet_chunks(args.parquet1, gene)
+        df_qry = load_parquet_chunks(args.parquet2, gene)
+        if df_ref.empty or df_qry.empty:
+            continue
+
+        # Coverage filter (both libraries must pass).
+        cov_ref = mean_cds_coverage_parquet(df_ref, gene)
+        cov_qry = mean_cds_coverage_parquet(df_qry, gene)
+        if cov_ref < args.min_coverage or cov_qry < args.min_coverage:
+            continue
+        n_pass += 1
+
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+
+        ref_freq = build_reference_freq_parquet(df_ref, gpos_to_tx)
         if not ref_freq:
             continue
 
-        if args.parquet2:
-            read_edits = collect_read_edits_parquet(
-                args.parquet2, ref_fasta, gene)
-        else:
-            read_edits = collect_read_edits(
-                bam2, ref_fasta, gene, args.min_mapq, args.min_baseq)
+        read_edits = collect_read_edits_parquet(df_qry, gpos_to_tx)
         if not read_edits:
             continue
 
@@ -731,6 +635,8 @@ def main():
             "n_his_codons":      len(his_positions),
             "gene_len":          gene_len,
             "n_ref_a_sites":     len(ref_freq),
+            "mean_cov_ref":      cov_ref,
+            "mean_cov_query":    cov_qry,
             "median_neg_log10p": float(np.median(all_scores)),
             "frac_sig_windows":  frac_sig,
         })
@@ -753,10 +659,14 @@ def main():
             print(f"  WARNING: pyx plot failed for {gname}: {e}",
                   file=sys.stderr)
 
-    if not use_parquet:
-        bam1.close()
-        bam2.close()
     ref_fasta.close()
+
+    print(f"\n  {n_pass:,}/{len(gene_names):,} genes passed coverage filter.",
+          file=sys.stderr)
+
+    if not summary_rows:
+        print("ERROR: No genes produced output.", file=sys.stderr)
+        sys.exit(1)
 
     summary_df = pd.DataFrame(summary_rows).sort_values(
         "median_neg_log10p", ascending=False)
