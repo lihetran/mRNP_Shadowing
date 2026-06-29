@@ -257,6 +257,64 @@ def build_reference_freq(df: pd.DataFrame, gpos_to_tx: dict,
     return ref_freq
 
 
+def build_reference_freq_and_coverage(df: pd.DataFrame, gpos_to_tx: dict,
+                                       gene: dict) -> tuple:
+    """
+    Like build_reference_freq but also returns per-tx-position coverage:
+    the number of reference reads contributing an A or G call at each
+    tx position (= the denominator of the background estimate).
+
+    Returns (ref_freq, ref_cov) where:
+      ref_freq = {tx_pos: p_edit}
+      ref_cov  = {tx_pos: n_reads_with_AG_call}
+    """
+    if df.empty:
+        return {}, {}
+
+    min_gp = min(gpos_to_tx.keys(), default=None)
+    max_gp = max(gpos_to_tx.keys(), default=None)
+    if min_gp is None:
+        return {}, {}
+
+    if "read_start" in df.columns and "read_end" in df.columns:
+        sub = df[(df["read_start"] <= max_gp) & (df["read_end"] >= min_gp)]
+    else:
+        sub = df
+
+    edit_counts = collections.defaultdict(lambda: [0, 0])
+
+    for read in sub.itertuples():
+        edit_str    = read.edit_string
+        abs_indices = read.absolute_indices
+        n_edit      = len(edit_str)
+
+        for i, ref_pos in enumerate(abs_indices):
+            if ref_pos is None:
+                continue
+            if isinstance(ref_pos, float) and ref_pos != ref_pos:
+                continue
+            ref_pos = int(ref_pos)
+            if ref_pos < min_gp or ref_pos > max_gp:
+                continue
+            if ref_pos not in gpos_to_tx:
+                continue
+            if i >= n_edit:
+                continue
+            ev = edit_str[i]
+            if ev == "2":
+                continue
+            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
+
+    ref_freq = {}
+    ref_cov  = {}
+    for tx, (n0, n1) in edit_counts.items():
+        total = n0 + n1
+        if total > 0:
+            ref_freq[tx] = max(1e-6, min(1 - 1e-6, n1 / total))
+            ref_cov[tx]  = total
+    return ref_freq, ref_cov
+
+
 def collect_read_edits(df: pd.DataFrame, gpos_to_tx: dict,
                         gene: dict) -> dict:
     """
@@ -379,7 +437,8 @@ def get_meta_read(binomial_scores: dict) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
-                   read_edits, label1, label2, gene_len, num_reads, pdf_path):
+                   read_edits, label1, label2, gene_len, num_reads, pdf_path,
+                   ref_cov=None):
     from pyx import canvas, graph, color, style, text as pyx_text
 
     col_qry  = color.cmyk(1, 0.5, 0, 0)
@@ -387,12 +446,14 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
     col_sig  = color.cmyk(0, 0, 0, 0.4)
     col_edit = color.cmyk(0, 0, 0, 1)
     col_no   = color.cmyk(0, 0.8, 1, 0)
+    col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)   # green — background coverage
 
     x_min, x_max = 0, gene_len
     panel_w  = 12
     tick_h   = 0.25
     read_h   = 1.2
     gap      = 0.6
+    cov_h    = 1.5
     sig_line = -math.log10(0.05)
 
     all_y      = [e[3] for e in meta]
@@ -429,8 +490,40 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
                     [graph.style.line([col_qry, style.linewidth.normal,
                                        style.linestyle.solid])])
     c.insert(g_meta)
-    c.text(g_meta.xpos + g_meta.width / 2.,
-           g_meta.ypos + g_meta.height + 0.4,
+
+    # ── Background coverage panel above the meta plot ─────────────────────────
+    cov_ypos = meta_ypos + 3 + gap
+    title_y  = cov_ypos + 3 + 0.4   # default if no coverage panel drawn
+
+    if ref_cov:
+        cov_items = sorted(ref_cov.items())
+        cov_x     = [tx for tx, _ in cov_items]
+        cov_y     = [n  for _, n  in cov_items]
+        cov_y_max = max(cov_y) * 1.1 if cov_y else 1.0
+
+        g_cov = graph.graphxy(
+            width=panel_w, height=cov_h,
+            xpos=0, ypos=cov_ypos,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=cov_y_max,
+                                title="Ref cov"),
+        )
+        # His codon lines on the coverage panel too
+        for hp in his_positions:
+            g_cov.plot(
+                graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
+                [graph.style.line([col_his, style.linewidth.thin,
+                                   style.linestyle.solid])])
+        # Coverage as filled impulses / line
+        if len(cov_items) > 0:
+            g_cov.plot(
+                graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
+                [graph.style.line([col_cov, style.linewidth.normal,
+                                   style.linestyle.solid])])
+        c.insert(g_cov)
+        title_y = g_cov.ypos + g_cov.height + 0.4
+
+    c.text(g_meta.xpos + g_meta.width / 2., title_y,
            f"{gene_name} - {label2} binomial protection (ref: {label1})",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
@@ -503,6 +596,16 @@ def parse_args():
                    help="Number of genes to plot, ranked by number of "
                         "CDS-spanning query reads (default: 10)")
     p.add_argument("--gene_list",    default=None)
+    p.add_argument("--require_his_codon", action="store_true",
+                   help="Only process genes that contain at least one His "
+                        "codon (CAT/CAC).")
+    p.add_argument("--background_all_reads", action="store_true",
+                   help="When --cds_spanning is set, build the reference "
+                        "background frequencies from ALL overlapping "
+                        "reference reads (not just spanning ones) for a more "
+                        "precise per-position estimate. Query reads are still "
+                        "restricted to spanning. No effect without "
+                        "--cds_spanning.")
     p.add_argument("--cds_spanning", action="store_true",
                    help="Only include reads whose alignment spans the full "
                         "CDS of the gene.")
@@ -517,6 +620,12 @@ def main():
     print("=== Binomial Shadowing Analysis (parquet) ===", file=sys.stderr)
     if args.cds_spanning:
         print("  CDS spanning filter: ON", file=sys.stderr)
+    if args.require_his_codon:
+        print("  His codon filter: ON (genes need >=1 CAT/CAC)",
+              file=sys.stderr)
+    if args.cds_spanning and args.background_all_reads:
+        print("  Background estimate: ALL overlapping reference reads "
+              "(query restricted to spanning)", file=sys.stderr)
 
     print("\nParsing GTF...", file=sys.stderr)
     genes = parse_gtf(args.gtf)
@@ -547,15 +656,17 @@ def main():
     n_pass = 0
 
     gene_names = list(genes.keys())
-    print(f"\nProcessing {len(gene_names):,} genes...", file=sys.stderr)
+    print(f"\nPass 1: scanning {len(gene_names):,} genes "
+          f"(summary + ranking)...", file=sys.stderr)
 
     # Diagnostics for spanning filter
     max_spanning_ref = 0
     max_spanning_qry = 0
     genes_with_any_spanning = 0
 
-    # Stash plot data per gene; plot only the top-N after the loop
-    plot_data = {}
+    # Pass 1: compute summary for every passing gene, record spanning counts.
+    # Does NOT stash heavy per-read plot data — only lightweight scalars.
+    gene_span_counts = {}   # gname -> n_spanning_qry (ranking metric)
 
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
@@ -565,11 +676,23 @@ def main():
         gene     = genes[gname]
         gene_len = cds_length(gene)
 
-        # Fast vectorised pre-filter from the already-loaded DataFrame
+        # His codon filter — skip genes with no His codons if requested
+        his_positions = find_his_codon_tx_positions(ref_fasta, gene)
+        if args.require_his_codon and len(his_positions) == 0:
+            continue
+
         df_ref = get_gene_df(df_all_ref, gene, cds_spanning=args.cds_spanning)
         df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning)
 
-        # Track best-case spanning counts for diagnostics
+        # Background reference distribution: optionally use ALL overlapping
+        # reference reads (not just spanning) for a more precise per-position
+        # estimate. df_ref is still used for the coverage check so the gene
+        # passing criterion is unchanged.
+        if args.cds_spanning and args.background_all_reads:
+            df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
+        else:
+            df_ref_bg = df_ref
+
         if len(df_ref) > 0 and len(df_qry) > 0:
             genes_with_any_spanning += 1
         max_spanning_ref = max(max_spanning_ref, len(df_ref))
@@ -583,7 +706,7 @@ def main():
         if not gpos_to_tx:
             continue
 
-        ref_freq = build_reference_freq(df_ref, gpos_to_tx, gene)
+        ref_freq = build_reference_freq(df_ref_bg, gpos_to_tx, gene)
         if not ref_freq:
             continue
 
@@ -600,17 +723,14 @@ def main():
         if not binomial_scores:
             continue
 
-        meta          = get_meta_read(binomial_scores)
-        his_positions = find_his_codon_tx_positions(ref_fasta, gene)
-
         all_scores = [v for trace in binomial_scores.values()
                       for _, v in trace]
         sig_line   = -math.log10(0.05)
         frac_sig   = (sum(1 for v in all_scores if v >= sig_line)
                       / len(all_scores)) if all_scores else 0.0
 
-        # Number of query reads spanning the CDS — the ranking metric
         n_spanning_qry = len(df_qry)
+        gene_span_counts[gname] = n_spanning_qry
 
         summary_rows.append({
             "gene":              gname,
@@ -624,46 +744,76 @@ def main():
             "frac_sig_windows":  frac_sig,
         })
 
-        # Stash everything needed to draw this gene's plot later
-        plot_data[gname] = {
-            "n_spanning":       n_spanning_qry,
-            "meta":             meta,
-            "binomial_scores":  binomial_scores,
-            "his_positions":    his_positions,
-            "read_edits":       read_edits,
-            "gene_len":         gene_len,
-        }
+        # Free heavy objects immediately — not needed until pass 2
+        del binomial_scores, read_edits, ref_freq, gpos_to_tx
 
-    ref_fasta.close()
-
-    # ── Plot only the top-N genes by number of CDS-spanning query reads ───────
-    if plot_data:
-        top_genes = sorted(plot_data.keys(),
-                           key=lambda g: plot_data[g]["n_spanning"],
+    # ── Pass 2: recompute and plot only the top-N genes by spanning reads ─────
+    if gene_span_counts:
+        top_genes = sorted(gene_span_counts.keys(),
+                           key=lambda g: gene_span_counts[g],
                            reverse=True)[:args.top_n_plots]
-        print(f"\n  Plotting top {len(top_genes)} genes by spanning reads:",
-              file=sys.stderr)
+
+        print(f"\nPass 2: plotting top {len(top_genes)} genes "
+              f"by CDS-spanning reads...", file=sys.stderr)
+
         for gname in top_genes:
-            d = plot_data[gname]
-            print(f"    {gname}: {d['n_spanning']:,} spanning reads",
+            gene     = genes[gname]
+            gene_len = cds_length(gene)
+            print(f"    {gname}: {gene_span_counts[gname]:,} spanning reads",
                   file=sys.stderr)
-            safe_name = re.sub(r"[^\w\-]", "_", gname)
+
+            df_ref = get_gene_df(df_all_ref, gene,
+                                 cds_spanning=args.cds_spanning)
+            df_qry = get_gene_df(df_all_qry, gene,
+                                 cds_spanning=args.cds_spanning)
+
+            if args.cds_spanning and args.background_all_reads:
+                df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
+            else:
+                df_ref_bg = df_ref
+
+            gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+            ref_freq, ref_cov = build_reference_freq_and_coverage(
+                df_ref_bg, gpos_to_tx, gene)
+            read_edits = collect_read_edits(df_qry, gpos_to_tx, gene)
+
+            binomial_scores = compute_binomial_pvals_per_read(
+                read_edits, ref_freq,
+                nt_window=args.window,
+                min_sites=args.min_sites,
+                gene_len=gene_len,
+            )
+            if not binomial_scores:
+                continue
+
+            meta          = get_meta_read(binomial_scores)
+            his_positions = find_his_codon_tx_positions(ref_fasta, gene)
+            safe_name     = re.sub(r"[^\w\-]", "_", gname)
+
+            print(f"      {gname}: {len(his_positions)} His codon(s) "
+                  f"at tx positions {his_positions[:10]}"
+                  f"{'...' if len(his_positions) > 10 else ''}",
+                  file=sys.stderr)
+
             try:
                 plot_gene_pyx(
                     gene_name=gname,
-                    meta=d["meta"],
-                    binomial_scores=d["binomial_scores"],
-                    his_positions=d["his_positions"],
-                    read_edits=d["read_edits"],
+                    meta=meta,
+                    binomial_scores=binomial_scores,
+                    his_positions=his_positions,
+                    read_edits=read_edits,
                     label1=args.label1,
                     label2=args.label2,
-                    gene_len=d["gene_len"],
+                    gene_len=gene_len,
                     num_reads=args.num_reads,
                     pdf_path=str(pdf_dir / safe_name),
+                    ref_cov=ref_cov,
                 )
             except Exception as e:
                 print(f"  WARNING: pyx plot failed for {gname}: {e}",
                       file=sys.stderr)
+
+    ref_fasta.close()
 
     print(f"\n  {n_pass:,}/{len(gene_names):,} genes passed coverage filter.",
           file=sys.stderr)
