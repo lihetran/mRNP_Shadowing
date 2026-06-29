@@ -146,13 +146,19 @@ def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
 
 
 def get_gene_df(df_all: pd.DataFrame, gene: dict,
-                cds_spanning: bool = False) -> pd.DataFrame:
+                cds_spanning: bool = False,
+                min_edit_freq: float = 0.0) -> pd.DataFrame:
     """
     Fast vectorised pre-filter to reads overlapping this gene.
 
     If cds_spanning is True, only keep reads whose alignment spans the full
     CDS (read_start <= cds_genomic_start and read_end >= cds_genomic_end),
     so every read had the opportunity to be edited at every position.
+
+    If min_edit_freq > 0, only keep reads whose global_edit_freq column
+    (per-read A->G edit fraction) is >= min_edit_freq. Reads below this
+    threshold are likely unedited / poorly edited molecules that carry no
+    protection signal and only add noise.
     """
     mask = ((df_all["chrom"]       == gene["chrom"]) &
             (df_all["gene_strand"] == gene["strand"]))
@@ -165,6 +171,8 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
         else:
             mask &= ((df_all["read_start"] < gene["gene_end"]) &
                      (df_all["read_end"]   > gene["gene_start"]))
+    if min_edit_freq > 0.0 and "global_edit_freq" in df_all.columns:
+        mask &= (df_all["global_edit_freq"] >= min_edit_freq)
     return df_all[mask]
 
 
@@ -640,6 +648,12 @@ def parse_args():
                         "precise per-position estimate. Query reads are still "
                         "restricted to spanning. No effect without "
                         "--cds_spanning.")
+    p.add_argument("--min_edit_freq", type=float, default=0.0,
+                   help="Only consider query reads whose per-read "
+                        "global_edit_freq is >= this value. Filters out "
+                        "unedited/poorly-edited molecules that carry no "
+                        "protection signal. Applied to query reads only, "
+                        "not the background estimate. Default: 0.0 (off)")
     p.add_argument("--fdr_correction", action="store_true",
                    help="Apply Benjamini-Hochberg FDR correction across all "
                         "window p-values and add a frac_sig_windows_fdr "
@@ -667,6 +681,9 @@ def main():
     if args.cds_spanning and args.background_all_reads:
         print("  Background estimate: ALL overlapping reference reads "
               "(query restricted to spanning)", file=sys.stderr)
+    if args.min_edit_freq > 0.0:
+        print(f"  Query edit-freq filter: ON "
+              f"(global_edit_freq >= {args.min_edit_freq})", file=sys.stderr)
 
     print("\nParsing GTF...", file=sys.stderr)
     genes = parse_gtf(args.gtf)
@@ -727,12 +744,15 @@ def main():
             continue
 
         df_ref = get_gene_df(df_all_ref, gene, cds_spanning=args.cds_spanning)
-        df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning)
+        df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning,
+                             min_edit_freq=args.min_edit_freq)
 
         # Background reference distribution: optionally use ALL overlapping
         # reference reads (not just spanning) for a more precise per-position
         # estimate. df_ref is still used for the coverage check so the gene
         # passing criterion is unchanged.
+        # Note: the edit-freq filter is NOT applied to the background — the
+        # background should reflect the full reference population.
         if args.cds_spanning and args.background_all_reads:
             df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
         else:
@@ -819,7 +839,8 @@ def main():
             df_ref = get_gene_df(df_all_ref, gene,
                                  cds_spanning=args.cds_spanning)
             df_qry = get_gene_df(df_all_qry, gene,
-                                 cds_spanning=args.cds_spanning)
+                                 cds_spanning=args.cds_spanning,
+                                 min_edit_freq=args.min_edit_freq)
 
             if args.cds_spanning and args.background_all_reads:
                 df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
