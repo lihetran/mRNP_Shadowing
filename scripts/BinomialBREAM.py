@@ -432,6 +432,40 @@ def get_meta_read(binomial_scores: dict) -> list:
     ]
 
 
+def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
+    """
+    Benjamini-Hochberg FDR correction.
+
+    Given an array of raw p-values, returns an array of adjusted p-values
+    (q-values) of the same length and order. A window is significant at
+    FDR level q if its adjusted p-value <= q.
+
+    Method:
+      1. Rank p-values ascending: p_(1) <= p_(2) <= ... <= p_(m)
+      2. Adjusted p_(i) = p_(i) * m / i
+      3. Enforce monotonicity from the largest rank downward so adjusted
+         values never decrease as raw p increases.
+    """
+    p = np.asarray(pvals, dtype=float)
+    m = len(p)
+    if m == 0:
+        return p
+
+    order      = np.argsort(p)              # indices that sort p ascending
+    ranked     = p[order]
+    ranks      = np.arange(1, m + 1)
+    adj_ranked = ranked * m / ranks
+
+    # Enforce monotonicity: walk from largest to smallest, take running min
+    adj_ranked = np.minimum.accumulate(adj_ranked[::-1])[::-1]
+    adj_ranked = np.clip(adj_ranked, 0, 1)
+
+    # Scatter back to original order
+    adj = np.empty(m, dtype=float)
+    adj[order] = adj_ranked
+    return adj
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Plotting
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,6 +640,13 @@ def parse_args():
                         "precise per-position estimate. Query reads are still "
                         "restricted to spanning. No effect without "
                         "--cds_spanning.")
+    p.add_argument("--fdr_correction", action="store_true",
+                   help="Apply Benjamini-Hochberg FDR correction across all "
+                        "window p-values and add a frac_sig_windows_fdr "
+                        "column to the summary.")
+    p.add_argument("--fdr_level", type=float, default=0.05,
+                   help="FDR q-value threshold for --fdr_correction "
+                        "(default: 0.05)")
     p.add_argument("--cds_spanning", action="store_true",
                    help="Only include reads whose alignment spans the full "
                         "CDS of the gene.")
@@ -667,6 +708,10 @@ def main():
     # Pass 1: compute summary for every passing gene, record spanning counts.
     # Does NOT stash heavy per-read plot data — only lightweight scalars.
     gene_span_counts = {}   # gname -> n_spanning_qry (ranking metric)
+
+    # For optional global BH FDR correction
+    global_pvals     = []   # flat list of all window p-values
+    gene_pval_slices = {}   # gname -> (start_idx, end_idx) into global_pvals
 
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
@@ -731,6 +776,15 @@ def main():
 
         n_spanning_qry = len(df_qry)
         gene_span_counts[gname] = n_spanning_qry
+
+        # For optional global BH FDR: record this gene's window p-values and
+        # the index range they occupy in the global pool, so we can map
+        # adjusted p-values back per gene after correction.
+        if args.fdr_correction:
+            gene_pvals = [10 ** (-v) for v in all_scores]
+            start_idx  = len(global_pvals)
+            global_pvals.extend(gene_pvals)
+            gene_pval_slices[gname] = (start_idx, len(global_pvals))
 
         summary_rows.append({
             "gene":              gname,
@@ -834,8 +888,30 @@ def main():
         print("ERROR: No genes produced output.", file=sys.stderr)
         sys.exit(1)
 
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        "median_neg_log10p", ascending=False)
+    summary_df = pd.DataFrame(summary_rows)
+
+    # ── Optional global Benjamini-Hochberg FDR correction ─────────────────────
+    if args.fdr_correction and global_pvals:
+        print(f"\nApplying Benjamini-Hochberg FDR correction across "
+              f"{len(global_pvals):,} windows (q = {args.fdr_level})...",
+              file=sys.stderr)
+        adj = benjamini_hochberg(np.array(global_pvals))
+
+        # Per-gene fraction of windows significant at the FDR level
+        frac_fdr = {}
+        for gname, (s, e) in gene_pval_slices.items():
+            gene_adj = adj[s:e]
+            frac_fdr[gname] = (float((gene_adj <= args.fdr_level).mean())
+                               if len(gene_adj) else 0.0)
+
+        summary_df["frac_sig_windows_fdr"] = summary_df["gene"].map(
+            frac_fdr).fillna(0.0)
+
+        n_sig_total = int((adj <= args.fdr_level).sum())
+        print(f"  {n_sig_total:,}/{len(adj):,} windows significant at "
+              f"FDR q <= {args.fdr_level}.", file=sys.stderr)
+
+    summary_df = summary_df.sort_values("median_neg_log10p", ascending=False)
     summary_csv = f"{out}_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
     print(f"\n  Summary -> {summary_csv}", file=sys.stderr)
