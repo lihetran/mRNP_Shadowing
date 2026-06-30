@@ -241,10 +241,10 @@ def main():
     aligned_bam = dorado_aligner(mutated_bam, mutated_ref, read_dict, args.out_bam)
     print(f'Aligned bam file: {aligned_bam}')
     # # calculate editing efficiency
-    ref_dict = SeqIO.to_dict(SeqIO.parse(args.ref_fasta, 'fasta'))
-    e = get_editing_efficiency(aligned_bam, ref_dict)
-    print(f'Average editing efficiency: {np.mean(e)*100:.2f}%')
-    plot_editing_efficiency(e, args.out_bam.replace('.bam', '_editingEfficiencyPerRead.png'))
+    # ref_dict = SeqIO.to_dict(SeqIO.parse(args.ref_fasta, 'fasta'))
+    # e = get_editing_efficiency(aligned_bam, ref_dict)
+    # print(f'Average editing efficiency: {np.mean(e)*100:.2f}%')
+    # plot_editing_efficiency(e, args.out_bam.replace('.bam', '_editingEfficiencyPerRead.png'))
 
 if __name__ == '__main__':
     main()
