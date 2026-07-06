@@ -408,10 +408,10 @@ def compute_binomial_pvals_per_read(read_edits: dict, ref_freq: dict,
             if n < min_sites:
                 continue
 
-            k      = sum(ks)
+            k = sum(ks)
             p_mean = float(np.mean(ps))
-            p_val  = scipy.stats.binom.cdf(k, n, p_mean)
-            p_val  = max(p_val, 1e-300)
+            p_val = scipy.stats.binom.cdf(k, n, p_mean)
+            p_val = max(p_val, 1e-300)
 
             trace.append((start + nt_window / 2., -math.log10(p_val)))
 
@@ -422,34 +422,42 @@ def compute_binomial_pvals_per_read(read_edits: dict, ref_freq: dict,
 
 def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict, ref_cov: dict,
                                      nt_window: int, min_sites: int,
-                                     gene_len: int) -> dict:
+                                     gene_len: int, tx_to_gpos_map: dict) -> dict:
     """
     Same as compute_binomial_pvals_per_read but each trace point also carries
-    the summed background coverage of the sites in that window.
-    Trace points are (window_center, -log10(p), window_coverage).
+    the mean background coverage of the sites in that window, plus the
+    per-position edit info across the window (0 where a site is absent from
+    read_edits/ref_freq).
+    Trace points are (window_center, -log10(p), window_coverage, edits).
     """
     results = {}
 
     for read_id, pos_dict in read_edits.items():
         trace = []
         for start in range(0, gene_len):
-            ks, ps, cs = [], [], []
+            ks, ps, cs, es, gs = [], [], [], [], []
             for tx in range(start, start + nt_window):
                 if tx in pos_dict and tx in ref_freq:
                     ks.append(pos_dict[tx])
                     ps.append(ref_freq[tx])
                     cs.append(ref_cov.get(tx, 0))
+                    es.append(int(pos_dict[tx]))
+                    gpos_to_tx = tx_to_gpos_map.get(tx)
+                    gs.append(gpos_to_tx)
+                else:
+                    es.append(0)
+                    gs.append(None)
 
             n = len(ks)
             if n < min_sites:
                 continue
 
             k = sum(ks)
-            c = sum(cs)
+            c = float(np.mean(cs)) if cs else 0.0  # avg reference read coverage in this window
             p_mean = float(np.mean(ps))
             p_val = max(scipy.stats.binom.cdf(k, n, p_mean), 1e-300)
 
-            trace.append((start + nt_window / 2., -math.log10(p_val), c))
+            trace.append((start + nt_window / 2., -math.log10(p_val), c, es, gs))
 
         if trace:
             results[read_id] = trace
@@ -463,7 +471,7 @@ def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict, ref_cov: 
 def get_meta_read(binomial_scores: dict) -> list:
     by_pos = collections.defaultdict(list)
     for trace in binomial_scores.values():
-        for centre, v, _ in trace:
+        for centre, v, _cov, _es, _gs in trace:
             by_pos[centre].append(v)
 
     return [
@@ -494,9 +502,9 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     if m == 0:
         return p
 
-    order      = np.argsort(p)              # indices that sort p ascending
-    ranked     = p[order]
-    ranks      = np.arange(1, m + 1)
+    order = np.argsort(p)              # indices that sort p ascending
+    ranked = p[order]
+    ranks = np.arange(1, m + 1)
     adj_ranked = ranked * m / ranks
 
     # Enforce monotonicity: walk from largest to smallest, take running min
@@ -508,10 +516,11 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     adj[order] = adj_ranked
     return adj
 
-def write_binomial_scores_to_parquet(binomial_scores: dict, output_path: str, pval_threshold = 0.05):
+def write_binomial_scores_to_df(gene_name, binomial_scores: dict, pval_threshold = 0.05):
     """
-    Write binomial scores to a parquet file for later analysis.
+    Write binomial scores to a DataFrame for later analysis.
     Each row is a read, with columns:
+      - gene name
       - read_id
       - window_centre
       - p_value
@@ -519,18 +528,24 @@ def write_binomial_scores_to_parquet(binomial_scores: dict, output_path: str, pv
     """
     rows = []
     for read_id, trace in binomial_scores.items():
-        for centre, neg_log_p, cov in trace:
+        for centre, neg_log_p, cov, edit, gpos in trace:
             p_value = 10 ** (-neg_log_p)
             if p_value <= pval_threshold:
                 rows.append({
+                    "gene_name": gene_name,
                     "read_id": read_id,
                     "window_centre": centre,
                     "p_value": p_value,
                     "-log10(p)": neg_log_p,
                     "coverage": cov,
+                    "edit": edit,
+                    "abs_idx": gpos
                 })
     df = pd.DataFrame(rows)
-    df.to_parquet(output_path, index=False)
+    # df.to_parquet(output_path, index=False)
+    return df
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Plotting
 # ─────────────────────────────────────────────────────────────────────────────
@@ -607,13 +622,11 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
             y=graph.axis.linear(min=0, max=cov_y_max,
                                 title="Ref cov"),
         )
-        # His codon lines on the coverage panel too
         for hp in his_positions:
             g_cov.plot(
                 graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                 [graph.style.line([col_his, style.linewidth.thin,
                                    style.linestyle.solid])])
-        # Coverage as filled impulses / line
         if len(cov_items) > 0:
             g_cov.plot(
                 graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
@@ -629,8 +642,9 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
     read_ids = list(binomial_scores.keys())[:num_reads]
     for jj, read_id in enumerate(read_ids):
         trace = binomial_scores[read_id]
+        # Each trace point is (center, -log10(p), window_coverage).
         ypos  = (num_reads - 1 - jj) * (read_h + tick_h + gap)
-        y_max_read = max(max(v for _, v in trace) * 1.1, 2.0)
+        y_max_read = max(t[1] for t in trace)
 
         g_read = graph.graphxy(
             width=panel_w, height=read_h, xpos=0, ypos=ypos + tick_h,
@@ -648,8 +662,9 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
                                     min=x_min, max=x_max),
                 [graph.style.line([col_sig, style.linewidth.thin,
                                    style.linestyle.dashed])])
+        # Plot p-value trace (x = center, y = -log10(p)); drop coverage col
         g_read.plot(
-            graph.data.points(list(trace), x=1, y=2),
+            graph.data.points([(t[0], t[1]) for t in trace], x=1, y=2),
             [graph.style.line([col_qry, style.linewidth.thin,
                                style.linestyle.solid])])
         c.insert(g_read)
@@ -666,8 +681,14 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
                 [graph.style.line([col, style.linewidth.thin,
                                    style.linestyle.solid])])
         c.insert(g_ticks)
+
+        # Mean window coverage across this read's trace, shown in the label
+        covs = [t[2] for t in trace if t[2] is not None]
+        label_txt = read_id[:20]
+        if covs:
+            label_txt += f" (cov={np.mean(covs):.0f})"
         c.text(panel_w + 0.15, ypos + tick_h + read_h / 2.,
-               read_id[:20], [pyx_text.valign.middle, pyx_text.size.tiny])
+               label_txt, [pyx_text.valign.middle, pyx_text.size.tiny])
 
     c.writePDFfile(pdf_path)
 
@@ -726,8 +747,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    out  = args.output
+    out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
+
+    # pyarrow for incremental parquet writing (memory-flat)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     print("=== Binomial Shadowing Analysis (parquet) ===", file=sys.stderr)
     if args.cds_spanning:
@@ -772,24 +797,30 @@ def main():
 
     gene_names = list(genes.keys())
     print(f"\nPass 1: scanning {len(gene_names):,} genes "
-          f"(summary + ranking)...", file=sys.stderr)
+          f"(summary + ranking + results parquet)...", file=sys.stderr)
 
     # Diagnostics for spanning filter
     max_spanning_ref = 0
     max_spanning_qry = 0
     genes_with_any_spanning = 0
 
-    # Pass 1: compute summary for every passing gene, record spanning counts.
-    # Does NOT stash heavy per-read plot data — only lightweight scalars.
-    gene_span_counts = {}   # gname -> n_spanning_qry (ranking metric)
+    # Pass 1: compute summary for every passing gene, record spanning counts,
+    # and write per-window results incrementally. Keeps memory flat by writing
+    # each gene's rows straight to parquet and discarding heavy objects.
+    gene_span_counts = {}  # gname -> n_spanning_qry (ranking metric)
 
     # For optional global BH FDR correction
-    global_pvals = []   # flat list of all window p-values
-    gene_pval_slices = {}   # gname -> (start_idx, end_idx) into global_pvals
+    global_pvals = []  # flat list of all window p-values
+    gene_pval_slices = {}  # gname -> (start_idx, end_idx) into global_pvals
+
+    # Incremental results-parquet writer (created lazily on first non-empty
+    # gene DataFrame so the schema is fixed from real data).
+    results_parquet = f"{out}_results.parquet"
+    results_writer = None
 
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
-            print(f"  {i+1}/{len(gene_names)} scanned, "
+            print(f"  {i + 1}/{len(gene_names)} scanned, "
                   f"{n_pass} passing...", file=sys.stderr)
 
         gene = genes[gname]
@@ -807,9 +838,8 @@ def main():
         # Background reference distribution: optionally use ALL overlapping
         # reference reads (not just spanning) for a more precise per-position
         # estimate. df_ref is still used for the coverage check so the gene
-        # passing criterion is unchanged.
-        # Note: the edit-freq filter is NOT applied to the background — the
-        # background should reflect the full reference population.
+        # passing criterion is unchanged. The edit-freq filter is NOT applied
+        # to the background — it should reflect the full reference population.
         if args.cds_spanning and args.background_all_reads:
             df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
         else:
@@ -825,10 +855,12 @@ def main():
         n_pass += 1
 
         gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        tx_to_gpos_map = {tx: gpos for gpos, tx in gpos_to_tx.items()}
         if not gpos_to_tx:
             continue
 
-        ref_freq, ref_cov = build_reference_freq_and_coverage(df_ref_bg, gpos_to_tx, gene)
+        ref_freq, ref_cov = build_reference_freq_and_coverage(
+            df_ref_bg, gpos_to_tx, gene)
         if not ref_freq:
             continue
 
@@ -841,42 +873,59 @@ def main():
             nt_window=args.window,
             min_sites=args.min_sites,
             gene_len=gene_len,
+            tx_to_gpos_map=tx_to_gpos_map
         )
         if not binomial_scores:
             continue
 
         all_scores = [point[1] for trace in binomial_scores.values()
-                      for point in (trace if isinstance(trace[0], tuple) else trace[0])]
-        sig_line   = -math.log10(0.05)
-        frac_sig   = (sum(1 for v in all_scores if v >= sig_line)
-                      / len(all_scores)) if all_scores else 0.0
+                      for point in trace]
+        sig_line = -math.log10(0.05)
+        frac_sig = (sum(1 for v in all_scores if v >= sig_line)
+                    / len(all_scores)) if all_scores else 0.0
 
         n_spanning_qry = len(df_qry)
         gene_span_counts[gname] = n_spanning_qry
 
         # For optional global BH FDR: record this gene's window p-values and
-        # the index range they occupy in the global pool, so we can map
-        # adjusted p-values back per gene after correction.
+        # the index range they occupy in the global pool.
         if args.fdr_correction:
             gene_pvals = [10 ** (-v) for v in all_scores]
-            start_idx  = len(global_pvals)
+            start_idx = len(global_pvals)
             global_pvals.extend(gene_pvals)
             gene_pval_slices[gname] = (start_idx, len(global_pvals))
 
         summary_rows.append({
-            "gene":              gname,
-            "n_reads":           len(binomial_scores),
-            "n_his_codons":      len(his_positions),
-            "gene_len":          gene_len,
-            "n_ref_a_sites":     len(ref_freq),
-            "n_reads_ref":       len(df_ref),
-            "n_reads_qry":       n_spanning_qry,
+            "gene": gname,
+            "n_reads": len(binomial_scores),
+            "n_his_codons": len(his_positions),
+            "gene_len": gene_len,
+            "n_ref_a_sites": len(ref_freq),
+            "n_reads_ref": len(df_ref),
+            "n_reads_qry": n_spanning_qry,
             "median_neg_log10p": float(np.median(all_scores)),
-            "frac_sig_windows":  frac_sig,
+            "frac_sig_windows": frac_sig,
         })
 
+        # Write this gene's significant-window rows straight to parquet.
+        gene_df = write_binomial_scores_to_df(gname, binomial_scores)
+        if not gene_df.empty:
+            table = pa.Table.from_pandas(gene_df, preserve_index=False)
+            if results_writer is None:
+                results_writer = pq.ParquetWriter(results_parquet,
+                                                  table.schema)
+            results_writer.write_table(table)
+
         # Free heavy objects immediately — not needed until pass 2
-        del binomial_scores, read_edits, ref_freq, gpos_to_tx, ref_cov
+        del binomial_scores, read_edits, ref_freq, gpos_to_tx, ref_cov, gene_df
+
+    # Close the incremental results writer
+    if results_writer is not None:
+        results_writer.close()
+        print(f"\n  Results -> {results_parquet}", file=sys.stderr)
+    else:
+        print("\n  No significant windows written to results parquet.",
+              file=sys.stderr)
 
     # ── Pass 2: recompute and plot only the top-N genes by spanning reads ─────
     if gene_span_counts:
@@ -888,7 +937,7 @@ def main():
               f"by CDS-spanning reads...", file=sys.stderr)
 
         for gname in top_genes:
-            gene     = genes[gname]
+            gene = genes[gname]
             gene_len = cds_length(gene)
             print(f"    {gname}: {gene_span_counts[gname]:,} spanning reads",
                   file=sys.stderr)
@@ -905,6 +954,8 @@ def main():
                 df_ref_bg = df_ref
 
             gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+            tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
+
             ref_freq, ref_cov = build_reference_freq_and_coverage(
                 df_ref_bg, gpos_to_tx, gene)
             read_edits = collect_read_edits(df_qry, gpos_to_tx, gene)
@@ -914,6 +965,7 @@ def main():
                 nt_window=args.window,
                 min_sites=args.min_sites,
                 gene_len=gene_len,
+                tx_to_gpos_map=tx_to_gpos_map
             )
             if not binomial_scores:
                 continue
@@ -941,7 +993,6 @@ def main():
                     pdf_path=str(pdf_dir / safe_name),
                     ref_cov=ref_cov,
                 )
-                write_binomial_scores_to_parquet(binomial_scores, f"{out}_{safe_name}.parquet")
             except Exception as e:
                 print(f"WARNING: pyx plot failed for {gname}: {e}",
                       file=sys.stderr)
@@ -976,7 +1027,6 @@ def main():
               file=sys.stderr)
         adj = benjamini_hochberg(np.array(global_pvals))
 
-        # Per-gene fraction of windows significant at the FDR level
         frac_fdr = {}
         for gname, (s, e) in gene_pval_slices.items():
             gene_adj = adj[s:e]
