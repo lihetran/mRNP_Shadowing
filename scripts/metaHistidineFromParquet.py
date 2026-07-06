@@ -27,6 +27,7 @@ from pathlib import Path
 import pysam
 import pandas as pd
 import numpy as np
+from logJosh import Tee
 
 
 HIS_CODONS = {"CAT", "CAC"}
@@ -681,7 +682,7 @@ def plot_cdf_pyx(s1: dict, s2: dict,
 
     # Title
     c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.4,
-           "Per-read A->G editing efficiency",
+           "Per-read A{$\to$}G editing efficiency",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     # Legend to the right of the panel
@@ -1034,8 +1035,11 @@ def parse_args():
                    help="Parquet directory for library 1 (reference)")
     p.add_argument("--parquet2",     required=True,
                    help="Parquet directory for library 2 (query)")
+    # p.add_argument("--parquet3",     required=True,
+    #                help="Parquet directory for library 3")
     p.add_argument("--label1",       default="BAM1")
     p.add_argument("--label2",       default="BAM2")
+    # p.add_argument("--label3",       default="BAM3")
     p.add_argument("--ref",          required=True)
     p.add_argument("--gtf",          required=True)
     p.add_argument("--output",       default="his_meta")
@@ -1066,6 +1070,7 @@ def main():
     print("\nLoading parquet chunks...", file=sys.stderr)
     df_all1 = load_all_parquet_chunks(args.parquet1)
     df_all2 = load_all_parquet_chunks(args.parquet2)
+    # df_all3 = load_all_parquet_chunks(args.parquet3)
 
     for df, label in [(df_all1, args.label1), (df_all2, args.label2)]:
         n_total   = len(df)
@@ -1081,8 +1086,10 @@ def main():
     print("\nCollecting reads overlapping His sites...", file=sys.stderr)
     his_reads1 = collect_his_site_reads_from_dataframe(sites, df_all1)
     his_reads2 = collect_his_site_reads_from_dataframe(sites, df_all2)
+    # his_reads3 = collect_his_site_reads_from_dataframe(sites, df_all3)
     print(f"  {args.label1}: {len(his_reads1):,} reads", file=sys.stderr)
     print(f"  {args.label2}: {len(his_reads2):,} reads", file=sys.stderr)
+    # print(f"  {args.label3}: {len(his_reads3):,} reads", file=sys.stderr)
 
     # ── Aggregate sites ───────────────────────────────────────────────────────
     print("\nAggregating sites...", file=sys.stderr)
@@ -1090,17 +1097,22 @@ def main():
                                args.min_coverage, args.label1)
     agg_df2 = aggregate_sites(sites, df_all2, ref_fasta,
                                args.min_coverage, args.label2)
+    # agg_df3 = aggregate_sites(sites, df_all3, ref_fasta,
+    #                           args.min_coverage, args.label3)
 
     # ── Compute summaries ─────────────────────────────────────────────────────
     print("\nComputing summaries...", file=sys.stderr)
     s1 = compute_summaries(agg_df1, args.min_edit_frac)
     s2 = compute_summaries(agg_df2, args.min_edit_frac)
+    # s3 = compute_summaries(agg_df3, args.min_edit_frac)
 
     # Fill read efficiency distributions — global_edit_freq per read
     s1["read_eff_dist"] = df_all1["global_edit_freq"].dropna().values \
                           if "global_edit_freq" in df_all1.columns else np.array([])
     s2["read_eff_dist"] = df_all2["global_edit_freq"].dropna().values \
                           if "global_edit_freq" in df_all2.columns else np.array([])
+    # s3["read_eff_dist"] = df_all3["global_edit_freq"].dropna().values \
+    #     if "global_edit_freq" in df_all3.columns else np.array([])
 
     # Fill log2FC
     log2fc_agg, rank_log2fc_agg = compute_log2fc_agg(agg_df1, agg_df2)
@@ -1108,6 +1120,8 @@ def main():
     s1["rank_log2fc_agg"] = rank_log2fc_agg
     s2["log2fc_agg"]      = log2fc_agg   # same — it's between the two libraries
     s2["rank_log2fc_agg"] = rank_log2fc_agg
+    # s3["log2fc_agg"] = log2fc_agg
+    # s3["rank_log2fc_agg"] = rank_log2fc_agg
 
     # ── Save aggregated data ──────────────────────────────────────────────────
     agg_df1.to_csv(f"{out}_{args.label1}_agg.csv.gz", index=False,
@@ -1179,4 +1193,5 @@ def main():
 
 
 if __name__ == "__main__":
+    Tee()
     main()
