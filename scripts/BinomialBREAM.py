@@ -181,6 +181,32 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
 #    Uses absolute_indices + edit_string (sense-oriented, no aligned_pairs)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
+    """
+    Map tx_pos -> (gpos, ref_base_sense) for EVERY CDS position (all bases,
+    not just A). ref_base_sense is the transcript-sense reference base
+    (reverse-complemented for minus-strand genes), so 'A' marks editable sites.
+    Used to emit the full nucleotide context within a shadow span.
+    """
+    chrom     = gene["chrom"]
+    strand    = gene["strand"]
+    chrom_seq = ref_fasta.fetch(chrom).upper()
+
+    full = {}
+    tx_pos = 0
+    for (cs, ce) in gene["cds"]:
+        if strand == "+":
+            for gpos in range(cs, ce):
+                full[tx_pos] = (gpos, chrom_seq[gpos])
+                tx_pos += 1
+        else:
+            for gpos in range(ce - 1, cs - 1, -1):
+                base = complement_base(chrom_seq[gpos])
+                full[tx_pos] = (gpos, base)
+                tx_pos += 1
+    return full
+
+
 def _gpos_to_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
     """
     Map genomic position -> spliced CDS tx_pos for all ref=A positions.
@@ -386,83 +412,71 @@ def passes_coverage(df_ref: pd.DataFrame, df_qry: pd.DataFrame,
 # 6. Binomial p-values per read per window
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binomial_pvals_per_read(read_edits: dict, ref_freq: dict,
+def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict,
+                                     ref_cov: dict,
                                      nt_window: int, min_sites: int,
-                                     gene_len: int) -> dict:
+                                     gene_len: int,
+                                     tx_to_gpos: dict = None) -> tuple:
     """
-    Returns {read_id: [(window_centre, -log10(p_value)), ...]}
-    Lower-tail binomial: small p = fewer edits than expected = protection.
+    Sliding-window lower-tail binomial protection test per read.
+
+    Returns (results, per_site) where:
+
+      results  = {read_id: [(window_centre, -log10(p), window_coverage), ...]}
+                 window_coverage is the MEAN background reference coverage
+                 across the ref=A sites the read covers in that window.
+
+      per_site = {read_id: [ {tx_pos, gpos, edit, ref_freq, ref_cov}, ... ]}
+                 one entry per ref=A site the read covers (edit: 1 = edited G,
+                 0 = unedited A). gpos is the genomic reference position if
+                 tx_to_gpos is provided, else None.
+
+    The window trace and the per-site data are kept separate (option 2) so the
+    per-window aggregate isn't cluttered with variable-length site lists.
     """
-    results = {}
+    results  = {}
+    per_site = {}
 
     for read_id, pos_dict in read_edits.items():
         trace = []
         for start in range(0, gene_len):
-            ks, ps = [], []
-            for tx in range(start, start + nt_window):
-                if tx in pos_dict and tx in ref_freq:
-                    ks.append(pos_dict[tx])
-                    ps.append(ref_freq[tx])
-
-            n = len(ks)
-            if n < min_sites:
-                continue
-
-            k = sum(ks)
-            p_mean = float(np.mean(ps))
-            p_val = scipy.stats.binom.cdf(k, n, p_mean)
-            p_val = max(p_val, 1e-300)
-
-            trace.append((start + nt_window / 2., -math.log10(p_val)))
-
-        if trace:
-            results[read_id] = trace
-
-    return results
-
-def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict, ref_cov: dict,
-                                     nt_window: int, min_sites: int,
-                                     gene_len: int, tx_to_gpos_map: dict) -> dict:
-    """
-    Same as compute_binomial_pvals_per_read but each trace point also carries
-    the mean background coverage of the sites in that window, plus the
-    per-position edit info across the window (0 where a site is absent from
-    read_edits/ref_freq).
-    Trace points are (window_center, -log10(p), window_coverage, edits).
-    """
-    results = {}
-
-    for read_id, pos_dict in read_edits.items():
-        trace = []
-        for start in range(0, gene_len):
-            ks, ps, cs, es, gs = [], [], [], [], []
+            ks, ps, cs = [], [], []
             for tx in range(start, start + nt_window):
                 if tx in pos_dict and tx in ref_freq:
                     ks.append(pos_dict[tx])
                     ps.append(ref_freq[tx])
                     cs.append(ref_cov.get(tx, 0))
-                    es.append(int(pos_dict[tx]))
-                    gpos_to_tx = tx_to_gpos_map.get(tx)
-                    gs.append(gpos_to_tx)
-                else:
-                    es.append(0)
-                    gs.append(None)
 
             n = len(ks)
             if n < min_sites:
                 continue
 
-            k = sum(ks)
-            c = float(np.mean(cs)) if cs else 0.0  # avg reference read coverage in this window
+            k      = sum(ks)
+            c      = float(np.mean(cs)) if cs else 0.0
             p_mean = float(np.mean(ps))
-            p_val = max(scipy.stats.binom.cdf(k, n, p_mean), 1e-300)
+            p_val  = max(scipy.stats.binom.cdf(k, n, p_mean), 1e-300)
 
-            trace.append((start + nt_window / 2., -math.log10(p_val), c, es, gs))
+            trace.append((start + nt_window / 2., -math.log10(p_val), c))
 
         if trace:
             results[read_id] = trace
 
-    return results
+            # Per-site edit status and reference position for this read.
+            site_rows = []
+            for tx in sorted(pos_dict.keys()):
+                if tx not in ref_freq:
+                    continue
+                site_rows.append({
+                    "tx_pos":   tx,
+                    "gpos":     tx_to_gpos.get(tx) if tx_to_gpos else None,
+                    "edit":     pos_dict[tx],
+                    "ref_freq": ref_freq[tx],
+                    "ref_cov":  ref_cov.get(tx, 0),
+                })
+            per_site[read_id] = site_rows
+
+    return results, per_site
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Meta aggregation
@@ -471,7 +485,7 @@ def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict, ref_cov: 
 def get_meta_read(binomial_scores: dict) -> list:
     by_pos = collections.defaultdict(list)
     for trace in binomial_scores.values():
-        for centre, v, _cov, _es, _gs in trace:
+        for centre, v, _cov in trace:
             by_pos[centre].append(v)
 
     return [
@@ -502,9 +516,9 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     if m == 0:
         return p
 
-    order = np.argsort(p)              # indices that sort p ascending
-    ranked = p[order]
-    ranks = np.arange(1, m + 1)
+    order      = np.argsort(p)              # indices that sort p ascending
+    ranked     = p[order]
+    ranks      = np.arange(1, m + 1)
     adj_ranked = ranked * m / ranks
 
     # Enforce monotonicity: walk from largest to smallest, take running min
@@ -516,39 +530,132 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     adj[order] = adj_ranked
     return adj
 
-def write_binomial_scores_to_df(gene_name, binomial_scores: dict, pval_threshold = 0.05):
-    """
-    Write binomial scores to a DataFrame for later analysis.
-    Each row is a read, with columns:
-      - gene name
-      - read_id
-      - window_centre
-      - p_value
-      - coverage (sum of ref_cov in that window)
-    """
-    rows = []
-    for read_id, trace in binomial_scores.items():
-        for centre, neg_log_p, cov, edit, gpos in trace:
-            p_value = 10 ** (-neg_log_p)
-            if p_value <= pval_threshold:
-                rows.append({
-                    "gene_name": gene_name,
-                    "read_id": read_id,
-                    "window_centre": centre,
-                    "p_value": p_value,
-                    "-log10(p)": neg_log_p,
-                    "coverage": cov,
-                    "edit": edit,
-                    "abs_idx": gpos
-                })
-    df = pd.DataFrame(rows)
-    # df.to_parquet(output_path, index=False)
-    return df
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. Plotting
 # ─────────────────────────────────────────────────────────────────────────────
+
+def write_binomial_scores_to_df(gene_name, binomial_scores,
+                                pval_threshold=0.05):
+    """
+    Flatten a gene's significant windows to a DataFrame — one row per
+    significant (p <= threshold) window per read. Window-level (not per-site).
+    Index-based trace access so it tolerates 3+/-element trace points
+    (centre, -log10(p), coverage[, ...]).
+
+    Columns: gene_name, read_id, window_centre, p_value, neg_log10p, coverage
+    """
+    rows = []
+    for read_id, trace in binomial_scores.items():
+        for point in trace:
+            centre    = point[0]
+            neg_log_p = point[1]
+            cov       = point[2] if len(point) > 2 else None
+            p_value   = 10 ** (-neg_log_p)
+            if p_value > pval_threshold:
+                continue
+            rows.append({
+                "gene_name":     gene_name,
+                "read_id":       read_id,
+                "window_centre": centre,
+                "p_value":       p_value,
+                "neg_log10p":    neg_log_p,
+                "coverage":      cov,
+            })
+    return pd.DataFrame(rows)
+
+
+def write_shadow_calls_to_df(gene_name, strand, binomial_scores,
+                             read_edits, ref_cov, ref_freq, full_tx_map,
+                             nt_window, pval_threshold=0.05):
+    """
+    Full-read shadow-call table for spot-checking, in genomic coordinates.
+
+    For each read with at least one significant (p <= threshold) window, emits
+    ONE ROW PER TRANSCRIPT POSITION across the read's ENTIRE covered extent
+    (first to last covered ref=A site) — every base, not just ref=A sites, and
+    not just the shadow. The shadow region is flagged with in_shadow=True, so
+    scanning a read top-to-bottom shows: context -> shadow start -> shadow ->
+    shadow end -> context, making the shadow boundaries obvious.
+
+    Columns:
+      gene_name, strand, read_id, tx_pos, gpos, ref_base, is_editable,
+      covered, edit, ref_cov, ref_freq, in_shadow, best_p, best_neg_log10p
+
+    Notes:
+      - covered: True if the read observed this ref=A site (has an edit call).
+      - edit: 1/0 at covered ref=A sites, NA at non-A positions or A sites the
+        read didn't cover.
+      - ref_cov / ref_freq: only defined at ref=A sites (the background model
+        is A-only); NA elsewhere.
+      - in_shadow: True if the position falls inside any significant window.
+    """
+    rows = []
+
+    for read_id, trace in binomial_scores.items():
+        pos_dict = read_edits.get(read_id, {})
+        if not pos_dict:
+            continue
+
+        # best (smallest) sig p covering each transcript position
+        best_p = {}
+        has_sig = False
+        for point in trace:
+            centre    = point[0]
+            neg_log_p = point[1]
+            p_value   = 10 ** (-neg_log_p)
+            if p_value > pval_threshold:
+                continue
+            has_sig = True
+            lo = int(math.ceil(centre - nt_window / 2.0))
+            hi = int(math.floor(centre + nt_window / 2.0 - 1e-9))
+            for tx in range(lo, hi + 1):
+                if tx in full_tx_map:
+                    if tx not in best_p or p_value < best_p[tx]:
+                        best_p[tx] = p_value
+
+        # Only emit reads that actually have a shadow
+        if not has_sig:
+            continue
+
+        # Read extent = first to last covered ref=A site (transcript order)
+        covered_tx = sorted(pos_dict.keys())
+        span_lo = covered_tx[0]
+        span_hi = covered_tx[-1]
+
+        # Emit every transcript position across the read's covered extent
+        for tx in range(span_lo, span_hi + 1):
+            if tx not in full_tx_map:
+                continue
+            gpos, ref_base = full_tx_map[tx]
+            is_editable = (ref_base == "A")
+            covered     = is_editable and (tx in pos_dict)
+            p = best_p.get(tx)
+
+            edit_val = int(pos_dict[tx]) if covered else None
+
+            rows.append({
+                "gene_name":       gene_name,
+                "strand":          strand,
+                "read_id":         read_id,
+                "tx_pos":          tx,
+                "gpos":            gpos,
+                "ref_base":        ref_base,
+                "is_editable":     is_editable,
+                "covered":         covered,
+                "edit":            edit_val,
+                "ref_cov":         ref_cov.get(tx) if is_editable else None,
+                "ref_freq":        ref_freq.get(tx) if is_editable else None,
+                "in_shadow":       p is not None,
+                "best_p":          p,
+                "best_neg_log10p": (-math.log10(p) if p is not None else None),
+            })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["read_id", "gpos"]).reset_index(drop=True)
+    return df
+
 
 def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
                    read_edits, label1, label2, gene_len, num_reads, pdf_path,
@@ -622,11 +729,13 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
             y=graph.axis.linear(min=0, max=cov_y_max,
                                 title="Ref cov"),
         )
+        # His codon lines on the coverage panel too
         for hp in his_positions:
             g_cov.plot(
                 graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                 [graph.style.line([col_his, style.linewidth.thin,
                                    style.linestyle.solid])])
+        # Coverage as filled impulses / line
         if len(cov_items) > 0:
             g_cov.plot(
                 graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
@@ -644,7 +753,7 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
         trace = binomial_scores[read_id]
         # Each trace point is (center, -log10(p), window_coverage).
         ypos  = (num_reads - 1 - jj) * (read_h + tick_h + gap)
-        y_max_read = max(t[1] for t in trace)
+        y_max_read = max(max(v for _, v, _ in trace) * 1.1, 2.0)
 
         g_read = graph.graphxy(
             width=panel_w, height=read_h, xpos=0, ypos=ypos + tick_h,
@@ -710,6 +819,10 @@ def parse_args():
     p.add_argument("--output",       default="binomialShadow")
     p.add_argument("--window",       type=int,   default=30)
     p.add_argument("--min_coverage", type=float, default=50.0)
+    p.add_argument("--min_query_reads", type=int, default=10,
+                   help="Minimum number of query (spanning) reads a gene must "
+                        "have to be analyzed (default: 10). Separate from "
+                        "--min_coverage, which gates the reference background.")
     p.add_argument("--min_sites",    type=int,   default=5)
     p.add_argument("--num_reads",    type=int,   default=10)
     p.add_argument("--top_n_plots",  type=int,   default=10,
@@ -747,7 +860,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    out = args.output
+    out  = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
     # pyarrow for incremental parquet writing (memory-flat)
@@ -755,6 +868,8 @@ def main():
     import pyarrow.parquet as pq
 
     print("=== Binomial Shadowing Analysis (parquet) ===", file=sys.stderr)
+    print(f"  Coverage gate: background >= {int(args.min_coverage)} reads, "
+          f"query >= {args.min_query_reads} spanning reads", file=sys.stderr)
     if args.cds_spanning:
         print("  CDS spanning filter: ON", file=sys.stderr)
     if args.require_his_codon:
@@ -807,20 +922,20 @@ def main():
     # Pass 1: compute summary for every passing gene, record spanning counts,
     # and write per-window results incrementally. Keeps memory flat by writing
     # each gene's rows straight to parquet and discarding heavy objects.
-    gene_span_counts = {}  # gname -> n_spanning_qry (ranking metric)
+    gene_span_counts = {}   # gname -> n_spanning_qry (ranking metric)
 
     # For optional global BH FDR correction
-    global_pvals = []  # flat list of all window p-values
-    gene_pval_slices = {}  # gname -> (start_idx, end_idx) into global_pvals
+    global_pvals = []       # flat list of all window p-values
+    gene_pval_slices = {}   # gname -> (start_idx, end_idx) into global_pvals
 
     # Incremental results-parquet writer (created lazily on first non-empty
     # gene DataFrame so the schema is fixed from real data).
     results_parquet = f"{out}_results.parquet"
-    results_writer = None
+    results_writer  = None
 
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
-            print(f"  {i + 1}/{len(gene_names)} scanned, "
+            print(f"  {i+1}/{len(gene_names)} scanned, "
                   f"{n_pass} passing...", file=sys.stderr)
 
         gene = genes[gname]
@@ -831,33 +946,38 @@ def main():
         if args.require_his_codon and len(his_positions) == 0:
             continue
 
-        df_ref = get_gene_df(df_all_ref, gene, cds_spanning=args.cds_spanning)
+        # Reference background: ALWAYS all overlapping reads (never spanning),
+        # so the reference distribution has maximum per-position support.
+        # The edit-freq filter is NOT applied to the background.
+        df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
+
+        # Query: reads we make protection calls on — respect --cds_spanning
+        # and the edit-freq filter.
         df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning,
                              min_edit_freq=args.min_edit_freq)
 
-        # Background reference distribution: optionally use ALL overlapping
-        # reference reads (not just spanning) for a more precise per-position
-        # estimate. df_ref is still used for the coverage check so the gene
-        # passing criterion is unchanged. The edit-freq filter is NOT applied
-        # to the background — it should reflect the full reference population.
-        if args.cds_spanning and args.background_all_reads:
-            df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
-        else:
-            df_ref_bg = df_ref
+        # Also track spanning reference reads for diagnostics only.
+        df_ref = get_gene_df(df_all_ref, gene, cds_spanning=args.cds_spanning)
 
-        if len(df_ref) > 0 and len(df_qry) > 0:
+        if len(df_ref_bg) > 0 and len(df_qry) > 0:
             genes_with_any_spanning += 1
         max_spanning_ref = max(max_spanning_ref, len(df_ref))
         max_spanning_qry = max(max_spanning_qry, len(df_qry))
 
-        if not passes_coverage(df_ref, df_qry, args.min_coverage):
+        # Coverage gate (two independent thresholds):
+        #   - reference background must have >= min_coverage reads
+        #     (all overlapping reads; does NOT require CDS spanning)
+        #   - query must have >= min_query_reads spanning reads
+        if len(df_ref_bg) < args.min_coverage:
+            continue
+        if len(df_qry) < args.min_query_reads:
             continue
         n_pass += 1
 
         gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
-        tx_to_gpos_map = {tx: gpos for gpos, tx in gpos_to_tx.items()}
         if not gpos_to_tx:
             continue
+        tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
 
         ref_freq, ref_cov = build_reference_freq_and_coverage(
             df_ref_bg, gpos_to_tx, gene)
@@ -868,21 +988,21 @@ def main():
         if not read_edits:
             continue
 
-        binomial_scores = compute_binomial_pvals_per_read2(
+        binomial_scores, per_site = compute_binomial_pvals_per_read2(
             read_edits, ref_freq, ref_cov,
             nt_window=args.window,
             min_sites=args.min_sites,
             gene_len=gene_len,
-            tx_to_gpos_map=tx_to_gpos_map
+            tx_to_gpos=tx_to_gpos,
         )
         if not binomial_scores:
             continue
 
         all_scores = [point[1] for trace in binomial_scores.values()
                       for point in trace]
-        sig_line = -math.log10(0.05)
-        frac_sig = (sum(1 for v in all_scores if v >= sig_line)
-                    / len(all_scores)) if all_scores else 0.0
+        sig_line   = -math.log10(0.05)
+        frac_sig   = (sum(1 for v in all_scores if v >= sig_line)
+                      / len(all_scores)) if all_scores else 0.0
 
         n_spanning_qry = len(df_qry)
         gene_span_counts[gname] = n_spanning_qry
@@ -891,81 +1011,80 @@ def main():
         # the index range they occupy in the global pool.
         if args.fdr_correction:
             gene_pvals = [10 ** (-v) for v in all_scores]
-            start_idx = len(global_pvals)
+            start_idx  = len(global_pvals)
             global_pvals.extend(gene_pvals)
             gene_pval_slices[gname] = (start_idx, len(global_pvals))
 
         summary_rows.append({
-            "gene": gname,
-            "n_reads": len(binomial_scores),
-            "n_his_codons": len(his_positions),
-            "gene_len": gene_len,
-            "n_ref_a_sites": len(ref_freq),
-            "n_reads_ref": len(df_ref),
-            "n_reads_qry": n_spanning_qry,
+            "gene":              gname,
+            "n_reads":           len(binomial_scores),
+            "n_his_codons":      len(his_positions),
+            "gene_len":          gene_len,
+            "n_ref_a_sites":     len(ref_freq),
+            "n_reads_ref_bg":    len(df_ref_bg),
+            "n_reads_ref_span":  len(df_ref),
+            "n_reads_qry":       n_spanning_qry,
             "median_neg_log10p": float(np.median(all_scores)),
-            "frac_sig_windows": frac_sig,
+            "frac_sig_windows":  frac_sig,
         })
 
-        # Write this gene's significant-window rows straight to parquet.
-        gene_df = write_binomial_scores_to_df(gname, binomial_scores)
-        if not gene_df.empty:
-            table = pa.Table.from_pandas(gene_df, preserve_index=False)
-            if results_writer is None:
-                results_writer = pq.ParquetWriter(results_parquet,
-                                                  table.schema)
-            results_writer.write_table(table)
-
-        # Free heavy objects immediately — not needed until pass 2
-        del binomial_scores, read_edits, ref_freq, gpos_to_tx, ref_cov, gene_df
-
-    # Close the incremental results writer
-    if results_writer is not None:
-        results_writer.close()
-        print(f"\n  Results -> {results_parquet}", file=sys.stderr)
-    else:
-        print("\n  No significant windows written to results parquet.",
-              file=sys.stderr)
+    #     # Write this gene's significant-window rows straight to parquet.
+    #     gene_df = write_binomial_scores_to_df(gname, binomial_scores)
+    #     if not gene_df.empty:
+    #         table = pa.Table.from_pandas(gene_df, preserve_index=False)
+    #         if results_writer is None:
+    #             results_writer = pq.ParquetWriter(results_parquet,
+    #                                               table.schema)
+    #         results_writer.write_table(table)
+    #
+    #     # Free heavy objects immediately — not needed until pass 2
+    #     del binomial_scores, per_site, read_edits, ref_freq, gpos_to_tx, \
+    #         ref_cov, gene_df
+    #
+    # # Close the incremental results writer
+    # if results_writer is not None:
+    #     results_writer.close()
+    #     print(f"\n  Results -> {results_parquet}", file=sys.stderr)
+    # else:
+    #     print("\n  No significant windows written to results parquet.",
+    #           file=sys.stderr)
 
     # ── Pass 2: recompute and plot only the top-N genes by spanning reads ─────
+    shadow_call_frames = []   # per-gene shadow-call tables (spot-checking)
     if gene_span_counts:
         top_genes = sorted(gene_span_counts.keys(),
                            key=lambda g: gene_span_counts[g],
-                           reverse=True)[:args.top_n_plots]
+                           reverse=True)
 
         print(f"\nPass 2: plotting top {len(top_genes)} genes "
               f"by CDS-spanning reads...", file=sys.stderr)
 
         for gname in top_genes:
-            gene = genes[gname]
+            gene     = genes[gname]
             gene_len = cds_length(gene)
             print(f"    {gname}: {gene_span_counts[gname]:,} spanning reads",
                   file=sys.stderr)
 
-            df_ref = get_gene_df(df_all_ref, gene,
-                                 cds_spanning=args.cds_spanning)
+            # Reference background: always all overlapping reads (matches
+            # pass 1). Query: spanning + edit-freq filter.
+            df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
             df_qry = get_gene_df(df_all_qry, gene,
                                  cds_spanning=args.cds_spanning,
                                  min_edit_freq=args.min_edit_freq)
 
-            if args.cds_spanning and args.background_all_reads:
-                df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
-            else:
-                df_ref_bg = df_ref
-
             gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
-            tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
-
+            tx_to_gpos_map = {tx: gp for gp, tx in gpos_to_tx.items()}
+            full_tx_map = _full_tx_map(gene, ref_fasta)
             ref_freq, ref_cov = build_reference_freq_and_coverage(
                 df_ref_bg, gpos_to_tx, gene)
             read_edits = collect_read_edits(df_qry, gpos_to_tx, gene)
 
-            binomial_scores = compute_binomial_pvals_per_read2(
+            binomial_scores, _per_site = compute_binomial_pvals_per_read2(
                 read_edits, ref_freq, ref_cov,
                 nt_window=args.window,
                 min_sites=args.min_sites,
                 gene_len=gene_len,
-                tx_to_gpos_map=tx_to_gpos_map
+                tx_to_gpos=tx_to_gpos_map,
             )
             if not binomial_scores:
                 continue
@@ -997,7 +1116,24 @@ def main():
                 print(f"WARNING: pyx plot failed for {gname}: {e}",
                       file=sys.stderr)
 
+            # Full-nucleotide shadow-call table (spot-checking, genomic coords)
+            sc_df = write_shadow_calls_to_df(
+                gname, gene["strand"], binomial_scores,
+                read_edits, ref_cov, ref_freq, full_tx_map,
+                nt_window=args.window, pval_threshold=0.05,
+            )
+            if not sc_df.empty:
+                shadow_call_frames.append(sc_df)
+
     ref_fasta.close()
+
+    # Write the combined shadow-call table for the plotted genes
+    if shadow_call_frames:
+        shadow_calls_df = pd.concat(shadow_call_frames, ignore_index=True)
+        shadow_calls_path = f"{out}_shadow_calls.parquet"
+        shadow_calls_df.to_parquet(shadow_calls_path, index=False)
+        print(f"\n  Shadow calls -> {shadow_calls_path} "
+              f"({len(shadow_calls_df):,} site rows)", file=sys.stderr)
 
     print(f"\n  {n_pass:,}/{len(gene_names):,} genes passed coverage filter.",
           file=sys.stderr)
