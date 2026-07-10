@@ -55,11 +55,23 @@ def reverse_complement(seq: str) -> str:
     return seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
 
 def parse_gtf(gtf_path: str) -> dict:
-    '''
-    returns a dict of {gene_name: {chrom, strand, transcript, gene_name, cds, gene_start, gene_end, cds_genomic_start, cds_genomic_end}}
-    '''
+    """
+    Parse a GTF carrying only `exon` and `CDS` features (plus optional `gene`).
+
+    UTRs are derived as exon - CDS in genomic space, then assigned to 5'/3' by
+    strand. Each gene is pinned to a single transcript (the first encountered)
+    so isoforms are never blended into one coordinate space.
+
+    Returns {gene_name: {
+        chrom, strand, transcript, gene_name,
+        cds, exons, utr5, utr3,          # (start, end) lists, transcript order
+        gene_start, gene_end,
+        cds_genomic_start, cds_genomic_end,
+    }}
+    """
     genes = {}
     gene_extents = {}
+
     with open(gtf_path) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -67,39 +79,101 @@ def parse_gtf(gtf_path: str) -> dict:
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 9:
                 continue
+
             feature = fields[2]
             chrom   = fields[0]
             start   = int(fields[3]) - 1
             end     = int(fields[4])
             strand  = fields[6]
-            m_gn    = re.search(r'gene_name "([^"]+)"', fields[8])
-            m_tid   = re.search(r'transcript_id "([^"]+)"', fields[8])
-            gname   = m_gn.group(1)  if m_gn  else None
-            tid     = m_tid.group(1) if m_tid else "."
+
+            m_gn  = re.search(r'gene_name "([^"]+)"', fields[8])
+            m_tid = re.search(r'transcript_id "([^"]+)"', fields[8])
+            gname = m_gn.group(1)  if m_gn  else None
+            tid   = m_tid.group(1) if m_tid else "."
             if gname is None:
                 continue
+
             if feature == "gene":
                 gene_extents[gname] = (start, end)
-            if feature == "CDS":
-                if gname not in genes:
-                    genes[gname] = {
-                        "chrom": chrom, "strand": strand,
-                        "transcript": tid, "gene_name": gname, "cds": [],
-                    }
-                genes[gname]["cds"].append((start, end))
+                continue
+
+            if feature not in ("CDS", "exon"):
+                continue
+
+            if gname not in genes:
+                genes[gname] = {
+                    "chrom": chrom, "strand": strand,
+                    "transcript": tid, "gene_name": gname,
+                    "cds": [], "exons": [],
+                }
+            elif genes[gname]["transcript"] != tid:
+                continue                 # pin to first transcript only
+
+            key = "cds" if feature == "CDS" else "exons"
+            genes[gname][key].append((start, end))
+
+    drop = []
     for gname, g in genes.items():
+        if not g["cds"]:
+            drop.append(gname)           # non-coding: no CDS to anchor on
+            continue
+
         if gname in gene_extents:
             g["gene_start"], g["gene_end"] = gene_extents[gname]
         else:
-            g["gene_start"] = min(s for s, e in g["cds"])
-            g["gene_end"]   = max(e for s, e in g["cds"])
-        g["cds"].sort(key=lambda x: x[0], reverse=(g["strand"] == "-"))
+            spans = g["exons"] or g["cds"]
+            g["gene_start"] = min(s for s, e in spans)
+            g["gene_end"]   = max(e for s, e in spans)
+
         g["cds_genomic_start"] = min(s for s, e in g["cds"])
         g["cds_genomic_end"]   = max(e for s, e in g["cds"])
+
+        # UTRs = exon - CDS, split by genomic side, then assigned by strand
+        utr = _subtract_intervals(g["exons"], g["cds"])
+        left  = [iv for iv in utr if iv[1] <= g["cds_genomic_start"]]
+        right = [iv for iv in utr if iv[0] >= g["cds_genomic_end"]]
+
+        if g["strand"] == "+":
+            g["utr5"], g["utr3"] = left, right
+        else:
+            g["utr5"], g["utr3"] = right, left
+
+        # Sort every segment list into transcript order
+        rev = (g["strand"] == "-")
+        for key in ("cds", "exons", "utr5", "utr3"):
+            g[key].sort(key=lambda x: x[0], reverse=rev)
+
+    for gname in drop:
+        del genes[gname]
+
     return genes
 
 def cds_length(gene: dict) -> int:
     return sum(ce - cs for cs, ce in gene["cds"])
+
+def _subtract_intervals(exons, cds):
+    """
+    exons, cds: lists of (start, end) genomic half-open intervals, unsorted.
+    Returns the parts of exons not covered by any cds interval, sorted by start.
+    """
+    if not cds:
+        return sorted(exons)
+
+    cds = sorted(cds)
+    out = []
+    for (es, ee) in sorted(exons):
+        cur = es
+        for (cs, ce) in cds:
+            if ce <= cur or cs >= ee:
+                continue                  # no overlap with the remaining piece
+            if cs > cur:
+                out.append((cur, cs))     # piece before this CDS block
+            cur = max(cur, ce)
+            if cur >= ee:
+                break
+        if cur < ee:
+            out.append((cur, ee))         # trailing piece
+    return out
 
 
 def find_his_codon_tx_positions(ref_fasta, gene):
@@ -158,57 +232,86 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
         mask &= (df_all["global_edit_freq"] >= min_edit_freq)
     return df_all[mask]
 
-def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
+def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
+                 include_utrs: bool = True) -> dict:
     """
-    Map tx_pos -> (gpos, ref_base_sense) for EVERY CDS position (all bases,
-    not just A). ref_base_sense is the transcript-sense reference base
-    (reverse-complemented for minus-strand genes), so 'A' marks editable sites.
-    Used to emit the full nucleotide context within a shadow span.
+    Map tx_pos -> (gpos, ref_base_sense) for EVERY transcript position (all
+    bases, not just A). ref_base_sense is the transcript-sense reference base
+    (complemented for minus-strand genes), so 'A' marks editable sites.
+
+    Coordinates are CDS-relative: the first CDS base is tx_pos 0, 5'UTR
+    positions are negative, 3'UTR positions are >= cds_length(gene).
     """
-    chrom = gene["chrom"]
-    strand = gene["strand"]
-    chrom_seq = ref_fasta.fetch(chrom).upper()
+    chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
+    strand    = gene["strand"]
+
+    def _walk(segments, tx_start):
+        """Yield (tx_pos, gpos, sense_base) in transcript order."""
+        tx = tx_start
+        for (cs, ce) in segments:
+            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
+            for gpos in rng:
+                base = chrom_seq[gpos]
+                if strand == "-":
+                    base = complement_base(base)
+                yield tx, gpos, base
+                tx += 1
 
     full = {}
-    tx_pos = 0
-    for (cs, ce) in gene["cds"]:
-        if strand == "+":
-            for gpos in range(cs, ce):
-                full[tx_pos] = (gpos, chrom_seq[gpos])
-                tx_pos += 1
-        else:
-            for gpos in range(ce - 1, cs - 1, -1):
-                base = complement_base(chrom_seq[gpos])
-                full[tx_pos] = (gpos, base)
-                tx_pos += 1
+    for tx, gpos, base in _walk(gene["cds"], 0):
+        full[tx] = (gpos, base)
+
+    if include_utrs:
+        cds_len = cds_length(gene)
+        for tx, gpos, base in _walk(gene.get("utr3", []), cds_len):
+            full[tx] = (gpos, base)
+
+        # 5'UTR: walk from 0 in transcript order, then shift so it ends at -1
+        u5 = list(_walk(gene.get("utr5", []), 0))
+        n5 = len(u5)
+        for tx, gpos, base in u5:
+            full[tx - n5] = (gpos, base)
+
     return full
 
 
-def _gpos_to_tx_map(gene: dict, ref_fasta: pysam.FastaFile) -> dict:
-    """
-    Map genomic position -> spliced CDS tx_pos for all ref=A positions.
-    tx_pos is contiguous over CDS segments in transcript order.
-    Only ref=A (transcript-sense) positions are included.
-    """
-    chrom = gene["chrom"]
-    strand = gene["strand"]
-    chrom_seq = ref_fasta.fetch(chrom).upper()
+def _gpos_to_tx_map(gene, ref_fasta, include_utrs=True):
+    chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
+    strand    = gene["strand"]
+    want      = "A" if strand == "+" else "T"
 
-    gpos_to_tx = {}
-    tx_pos = 0
-    for (cs, ce) in gene["cds"]:
-        if strand == "+":
-            for gpos in range(cs, ce):
-                if chrom_seq[gpos] == "A":
-                    gpos_to_tx[gpos] = tx_pos
-                tx_pos += 1
-        else:
-            for gpos in range(ce - 1, cs - 1, -1):
-                if chrom_seq[gpos] == "T":
-                    gpos_to_tx[gpos] = tx_pos
-                tx_pos += 1
-    return gpos_to_tx
+    def _walk(segments, tx_start):
+        """Yield (gpos, tx_pos) in transcript order, starting at tx_start."""
+        tx = tx_start
+        for (cs, ce) in segments:
+            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
+            for gpos in rng:
+                yield gpos, tx
+                tx += 1
 
+    out = {}
+    for gpos, tx in _walk(gene["cds"], 0):
+        if chrom_seq[gpos] == want:
+            out[gpos] = tx
+
+    if include_utrs:
+        cds_len = cds_length(gene)
+        for gpos, tx in _walk(gene["utr3"], cds_len):
+            if chrom_seq[gpos] == want:
+                out[gpos] = tx
+        # 5'UTR: walk in transcript order, then offset so it ends at -1
+        u5 = list(_walk(gene["utr5"], 0))
+        n5 = len(u5)
+        for gpos, tx in u5:
+            if chrom_seq[gpos] == want:
+                out[gpos] = tx - n5
+
+    return out
+
+def classify_tx(tx_pos, cds_len):
+    if tx_pos < 0:            return "UTR5"
+    if tx_pos < cds_len:      return "CDS"
+    return "UTR3"
 
 def build_reference_freq(df: pd.DataFrame, gpos_to_tx: dict,
                           gene: dict) -> dict:
@@ -457,38 +560,59 @@ def write_shadow_calls_to_df(gene, df_qry, binomial_scores, read_edits,
     """
     Shadow calls in read-level format, mirroring the source parquet schema.
 
-    One row per read that has >= 1 significant site. All original read columns
-    are carried through; shadow information is added as parallel arrays and a
+    One row per read with >= 1 significant site. All original read columns are
+    carried through; shadow information is added as parallel arrays plus a
     shadow_string aligned index-for-index with edit_string.
 
     Site-anchored: each trace point IS a ref=A site, so a site is "in shadow"
     when its own window p-value <= pval_threshold.
+
+    Added columns:
+      shadow_gene        gene whose background model produced these calls
+      shadow_string      per aligned position: '1' in shadow, '0' not, '2' indel
+      shadow_tx_pos      CDS-relative positions of significant sites (5'UTR < 0)
+      shadow_gpos        genomic positions of those sites
+      shadow_region      UTR5 / CDS / UTR3 per site
+      shadow_pval        p-value at each site
+      shadow_neg_log10p  -log10 of the above
+      shadow_edit        1 = edited (G), 0 = unedited (A)
+      shadow_ref_cov     reference reads backing the background at each site
+      n_shadow_sites     total significant sites on the read
+      n_sites_utr5/cds/utr3   breakdown by region
+      min_pval           strongest p-value on the read
     """
-    # tx_pos -> p_value for every tested site, per read
     sig_by_read = {}
     for read_id, trace in binomial_scores.items():
-        sig = {point[0]: 10 ** (-point[1]) for point in trace
-               if 10 ** (-point[1]) <= pval_threshold}
+        sig = {}
+        for tx, nlp, _cov in trace:
+            p = 10 ** (-nlp)
+            if p <= pval_threshold:
+                sig[tx] = p
         if sig:
             sig_by_read[read_id] = sig
 
     if not sig_by_read:
         return pd.DataFrame()
 
-    sub = df_qry[df_qry["read_id"].isin(sig_by_read)].copy()
+    sub = (df_qry[df_qry["read_id"].isin(sig_by_read)]
+           .copy()
+           .reset_index(drop=True))
     if sub.empty:
         return pd.DataFrame()
 
-    shadow_strings, tx_list, gpos_list = [], [], []
+    cds_len = cds_length(gene)
+
+    shadow_strings, tx_list, gpos_list, region_list = [], [], [], []
     pval_list, nlp_list, edit_list, cov_list = [], [], [], []
     n_sites, min_pvals = [], []
+    n_utr5, n_cds, n_utr3 = [], [], []
 
     for read in sub.itertuples():
         sig      = sig_by_read[read.read_id]
         pos_dict = read_edits.get(read.read_id, {})
         edit_str = read.edit_string
 
-        # shadow_string, aligned index-for-index with edit_string
+        # shadow_string: index-for-index with edit_string
         chars = []
         for i, gpos in enumerate(read.absolute_indices):
             if i >= len(edit_str) or edit_str[i] == "2":
@@ -503,34 +627,46 @@ def write_shadow_calls_to_df(gene, df_qry, binomial_scores, read_edits,
             chars.append("1" if (tx is not None and tx in sig) else "0")
         shadow_strings.append("".join(chars))
 
-        sites = sorted(sig.keys())
-        pvals = [sig[t] for t in sites]
+        sites   = sorted(sig.keys())
+        pvals   = [sig[t] for t in sites]
+        regions = [classify_tx(t, cds_len) for t in sites]
+        counts  = collections.Counter(regions)
+
         tx_list.append(sites)
         gpos_list.append([tx_to_gpos.get(t) for t in sites])
+        region_list.append(regions)
         pval_list.append(pvals)
         nlp_list.append([-math.log10(p) for p in pvals])
         edit_list.append([int(pos_dict[t]) for t in sites])
         cov_list.append([ref_cov.get(t) for t in sites])
+
         n_sites.append(len(sites))
         min_pvals.append(min(pvals))
+        n_utr5.append(counts["UTR5"])
+        n_cds.append(counts["CDS"])
+        n_utr3.append(counts["UTR3"])
 
-    sub["gene_name"]         = gene["gene_name"]
+    sub["shadow_gene"]       = gene["gene_name"]
     sub["shadow_string"]     = shadow_strings
     sub["shadow_tx_pos"]     = tx_list
     sub["shadow_gpos"]       = gpos_list
+    sub["shadow_region"]     = region_list
     sub["shadow_pval"]       = pval_list
     sub["shadow_neg_log10p"] = nlp_list
     sub["shadow_edit"]       = edit_list
     sub["shadow_ref_cov"]    = cov_list
     sub["n_shadow_sites"]    = n_sites
+    sub["n_sites_utr5"]      = n_utr5
+    sub["n_sites_cds"]       = n_cds
+    sub["n_sites_utr3"]      = n_utr3
     sub["min_pval"]          = min_pvals
 
-    return sub.reset_index(drop=True)
+    return sub
 
 
 def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
-                   read_edits, label1, label2, gene_len, num_reads, pdf_path,
-                   ref_cov=None):
+                  read_edits, label1, label2, tx_lo, tx_hi, num_reads,
+                  pdf_path, ref_cov=None):
     from pyx import canvas, graph, color, style, text as pyx_text
 
     col_qry  = color.cmyk(1, 0.5, 0, 0)
@@ -540,7 +676,7 @@ def plot_gene_pyx(gene_name, meta, binomial_scores, his_positions,
     col_no   = color.cmyk(0, 0.8, 1, 0)
     col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)   # green — background coverage
 
-    x_min, x_max = 0, gene_len
+    x_min, x_max = tx_lo, tx_hi
     panel_w  = 12
     tick_h   = 0.25
     read_h   = 1.2
@@ -799,6 +935,8 @@ def main():
             continue
 
         gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        tx_lo = min(gpos_to_tx.values())
+        tx_hi = max(gpos_to_tx.values())
         if not gpos_to_tx:
             continue
 
@@ -822,26 +960,39 @@ def main():
 
         n_pass += 1
 
-        all_scores = [point[1] for trace in binomial_scores.values()
-                      for point in trace]
         sig_line = -math.log10(0.05)
+        by_region = {"UTR5": [], "CDS": [], "UTR3": []}
+        for trace in binomial_scores.values():
+            for point in trace:
+                by_region[classify_tx(point[0], gene_len)].append(point[1])
+
+        all_scores = [v for vals in by_region.values() for v in vals]
         frac_sig = (sum(1 for v in all_scores if v >= sig_line)
                     / len(all_scores)) if all_scores else 0.0
 
-        gene_span_counts[gname] = len(df_qry)
-        summary_rows.append({
-            "gene":              gname,
-            "n_reads":           len(binomial_scores),
-            "n_his_codons":      len(his_positions),
-            "gene_len":          gene_len,
-            "n_ref_a_sites":     len(ref_freq),
-            "n_reads_ref_bg":    len(df_ref_bg),
-            "n_reads_qry":       len(df_qry),
+        row = {
+            "gene": gname,
+            "n_reads": len(binomial_scores),
+            "n_his_codons": len(his_positions),
+            "gene_len": gene_len,
+            "n_ref_a_sites": len(ref_freq),
+            "n_reads_ref_bg": len(df_ref_bg),
+            "n_reads_qry": len(df_qry),
             "median_neg_log10p": float(np.median(all_scores)),
-            "frac_sig_windows":  frac_sig,
-        })
+            "frac_sig_windows": frac_sig,
+        }
+        for region in ("UTR5", "CDS", "UTR3"):
+            vals = by_region[region]
+            key = region.lower()
+            row[f"n_sites_{key}"] = len(vals)
+            row[f"frac_sig_{key}"] = (
+                sum(1 for v in vals if v >= sig_line) / len(vals)
+                if vals else float("nan"))
 
+        gene_span_counts[gname] = len(df_qry)
+        summary_rows.append(row)
         del binomial_scores, read_edits, ref_freq, ref_cov, gpos_to_tx
+
 
     # ── Pass 2: recompute, plot, and write shadow calls for passing genes ────
     shadow_calls_path = f"{out}_shadow_calls.parquet"
@@ -866,6 +1017,8 @@ def main():
                                  min_edit_freq=args.min_edit_freq)
 
             gpos_to_tx  = _gpos_to_tx_map(gene, ref_fasta)
+            tx_lo = min(gpos_to_tx.values())
+            tx_hi = max(gpos_to_tx.values())
             full_tx_map = _full_tx_map(gene, ref_fasta)
             ref_freq, ref_cov = build_reference_freq_and_coverage(
                 df_ref_bg, gpos_to_tx, gene)
@@ -886,14 +1039,11 @@ def main():
 
             try:
                 plot_gene_pyx(
-                    gene_name=gname,
-                    meta=meta,
+                    gene_name=gname, meta=meta,
                     binomial_scores=binomial_scores,
-                    his_positions=his_positions,
-                    read_edits=read_edits,
-                    label1=args.label1,
-                    label2=args.label2,
-                    gene_len=gene_len,
+                    his_positions=his_positions, read_edits=read_edits,
+                    label1=args.label1, label2=args.label2,
+                    tx_lo=tx_lo, tx_hi=tx_hi,
                     num_reads=args.num_reads,
                     pdf_path=str(pdf_dir / safe_name),
                     ref_cov=ref_cov,

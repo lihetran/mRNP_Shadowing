@@ -37,7 +37,9 @@ def update_substitution_profile(profile, ref_base, alt_base):
     if (ref_base, alt_base) in profile:
         profile[(ref_base, alt_base)] += 1
     else:
-        print(f"Warning: Invalid substitution {ref_base} -> {alt_base}", file=sys.stderr)
+        # If the substitution is not in the profile, we can choose to ignore it or raise an error.
+        # For now, we'll ignore it.
+        pass
 
 def generate_substitution_profile(df):
     """
@@ -47,6 +49,18 @@ def generate_substitution_profile(df):
     profile = init_substitution_profile()
     for _, row in df.iterrows():
         for r,q in zip(row['ref_sequence_aligned'].upper(), row['read_sequence_aligned'].upper()):
-            update_substitution_profile(profile, r, q)
+            if r != q:
+                update_substitution_profile(profile, r, q)
     return profile
+
+def plot_substitution_profile(profile):
+    pass
+
+
+def main(args):
+    output_prefix = args[1]
+    parquet_libs = args[2:]
+    df = load_all_parquet_chunks(parquet_dir)
+    profile = generate_substitution_profile(df)
+    # Output the substitution profile
 
