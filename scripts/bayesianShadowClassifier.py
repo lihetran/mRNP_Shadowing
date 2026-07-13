@@ -202,6 +202,7 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
                 min_edit_freq: float = 0.0) -> pd.DataFrame:
     """
+    Built with Claude
     Fast vectorised pre-filter to reads overlapping this gene.
 
     If cds_spanning is True, only keep reads whose alignment spans the full
@@ -228,6 +229,7 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
 def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
                  include_utrs: bool = True) -> dict:
     """
+    Built with Claude
     Map tx_pos -> (gpos, ref_base_sense) for EVERY transcript position (all
     bases, not just A). ref_base_sense is the transcript-sense reference base
     (complemented for minus-strand genes), so 'A' marks editable sites.
@@ -302,74 +304,15 @@ def _gpos_to_tx_map(gene, ref_fasta, include_utrs=True):
     return out
 
 def classify_tx(tx_pos, cds_len):
-    if tx_pos < 0:            return "UTR5"
-    if tx_pos < cds_len:      return "CDS"
+    if tx_pos < 0: return "UTR5"
+    if tx_pos < cds_len: return "CDS"
     return "UTR3"
 
-def build_reference_freq(df: pd.DataFrame, gpos_to_tx: dict,
-                          gene: dict) -> dict:
-    """
-    {tx_pos: p_edit} from parquet1 using absolute_indices + edit_string.
 
-    absolute_indices and edit_string are both sense-oriented by the parquet
-    generator, so index i in edit_string matches index i in absolute_indices.
-    edit_string '1' = A->G edit, '0' = no edit at ref=A, '2' = indel/skip.
-    Ref=A verification is implicit: gpos_to_tx only contains ref=A positions.
-    """
-    if df.empty:
-        return {}
-
-    gene_start = gene["gene_start"]
-    gene_end = gene["gene_end"]
-    min_gp = min(gpos_to_tx.keys(), default=None)
-    max_gp = max(gpos_to_tx.keys(), default=None)
-    if min_gp is None:
-        return {}
-
-    # Pre-filter to reads spanning ref=A positions
-    if "read_start" in df.columns and "read_end" in df.columns:
-        sub = df[(df["read_start"] <= max_gp) & (df["read_end"] >= min_gp)]
-    else:
-        sub = df
-
-    edit_counts = collections.defaultdict(lambda: [0, 0])
-
-    for read in sub.itertuples():
-        edit_str = read.edit_string
-        abs_indices = read.absolute_indices
-        n_edit = len(edit_str)
-
-        for i, ref_pos in enumerate(abs_indices):
-            if ref_pos is None:
-                continue
-            if isinstance(ref_pos, float) and ref_pos != ref_pos:
-                continue
-            ref_pos = int(ref_pos)
-            if ref_pos < min_gp or ref_pos > max_gp:
-                continue
-            if ref_pos not in gpos_to_tx:
-                continue
-            if i >= n_edit:
-                continue
-            ev = edit_str[i]
-            if ev == "2":
-                continue
-            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
-
-    ref_freq = {}
-    for tx, (n0, n1) in edit_counts.items():
-        total = n0 + n1
-        if total > 0:
-            ref_freq[tx] = max(1e-6, min(1 - 1e-6, n1 / total))
-    return ref_freq
 
 def build_reference_freq_and_coverage(df: pd.DataFrame, gpos_to_tx: dict,
                                        gene: dict) -> tuple:
     """
-    Like build_reference_freq but also returns per-tx-position coverage:
-    the number of reference reads contributing an A or G call at each
-    tx position (= the denominator of the background estimate).
-
     Returns (ref_freq, ref_cov) where:
       ref_freq = {tx_pos: p_edit}
       ref_cov  = {tx_pos: n_reads_with_AG_call}
@@ -473,8 +416,258 @@ def passes_coverage(df_ref: pd.DataFrame, df_qry: pd.DataFrame,
     """
     return len(df_ref) >= min_coverage and len(df_qry) >= min_coverage
 
-def train():
-    pass
+def build_frequency_df(df: pd.DataFrame, gpos_to_tx: dict, alpha=1, beta=1):
+    '''
+    Very similar to build reference freq and coverage but going to apply Laplace smoothing
+    '''
+    if df.empty:
+        return {}, {}
 
-def classify():
-    pass
+    min_gp = min(gpos_to_tx.keys(), default=None)
+    max_gp = max(gpos_to_tx.keys(), default=None)
+    if min_gp is None:
+        return {}, {}
+
+    if "read_start" in df.columns and "read_end" in df.columns:
+        sub = df[(df["read_start"] <= max_gp) & (df["read_end"] >= min_gp)]
+    else:
+        sub = df
+
+    edit_counts = collections.defaultdict(lambda: [0, 0])
+
+    for read in sub.itertuples():
+        edit_str = read.edit_string
+        abs_indices = read.absolute_indices
+        n_edit = len(edit_str)
+
+        for i, ref_pos in enumerate(abs_indices):
+            if ref_pos is None:
+                continue
+            if isinstance(ref_pos, float) and ref_pos != ref_pos:
+                continue
+            ref_pos = int(ref_pos)
+            if ref_pos < min_gp or ref_pos > max_gp:
+                continue
+            if ref_pos not in gpos_to_tx:
+                continue
+            if i >= n_edit:
+                continue
+            ev = edit_str[i]
+            if ev == "2":
+                continue
+            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
+
+    ref_freq = {}
+    ref_cov = {}
+    for tx, (n0, n1) in edit_counts.items():
+        total = n0 + n1
+        if total > 0:
+            # Laplace / Beta(alpha, beta) smoothing:
+            #   alpha = pseudocount of 1s, beta = pseudocount of 0s
+            ref_freq[tx] = (n1 + alpha) / (total + alpha + beta)
+            ref_cov[tx] = total  # coverage stays the RAW count
+    return ref_freq, ref_cov
+
+def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx: dict):
+    pA, covA = build_frequency_df(A_df, gpos_to_tx, alpha, beta)
+    pB, covB = build_frequency_df(B_df, gpos_to_tx, alpha, beta)
+
+    w1, w0 = {}, {}
+    for tx in pA.keys() & pB.keys():  # positions BOTH populations saw
+        a, b = pA[tx], pB[tx]
+        w1[tx] = math.log(a) - math.log(b)  # weight when the bit is 1
+        w0[tx] = math.log(1 - a) - math.log(1 - b)  # weight when the bit is 0
+
+    nA, nB = len(A_df), len(B_df)
+    prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
+
+    return {"w1": w1, "w0": w0, "prior_log_odds": prior_log_odds, "pA": pA, "pB": pB, "covA": covA, "covB": covB}
+
+
+def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
+    '''
+    Returns a list of contribution events. Scores each position
+    '''
+    events = []
+    n_edit = len(edit_string)
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["w1"]:
+            continue
+        contrib = model["w1"][tx] if ev == "1" else model["w0"][tx]
+        events.append({"i": i, "ref_pos": ref_pos, "tx": tx, "contrib": contrib})
+    return events
+
+def sliding_classify(model, edit_string, absolute_indices, gpos_to_tx,
+                     window, step=1, coord="ref_pos",
+                     min_positions=1, use_prior=False):
+    '''
+    Classify events in read by window. Manually annotates events in a window
+    '''
+    import bisect, math
+    events = read_contributions(model, edit_string, absolute_indices, gpos_to_tx)
+    if not events:
+        return []
+    events.sort(key=lambda e: e[coord])
+    coords = [e[coord] for e in events]
+    prefix = [0.0]
+    for e in events:
+        prefix.append(prefix[-1] + e["contrib"])
+    lo_c, hi_c = coords[0], coords[-1]
+    base = model["prior_log_odds"] if use_prior else 0.0
+
+    results = []
+    start = lo_c
+    while start <= hi_c:
+        end = start + window
+        l = bisect.bisect_left(coords, start)
+        r = bisect.bisect_left(coords, end)
+        n = r - l
+        if n >= min_positions:
+            log_odds = base + (prefix[r] - prefix[l])
+            p_A = 1.0 / (1.0 + math.exp(-log_odds))
+            results.append({"start": start, "end": end, "center": start + window/2,
+                            "P_A": p_A, "P_B": 1 - p_A,
+                            "label": "A" if p_A >= 0.5 else "B", "n": n})
+        start += step
+    return results
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Bernoulli Naive Bayes Shadow Classifier."
+    )
+    p.add_argument("--parquet1", required=True)
+    p.add_argument("--parquet2", required=True)
+    p.add_argument("--parquet3", required=True)
+    p.add_argument("--label1", default="ribosome-less")
+    p.add_argument("--label2", default="mock TadA")
+    p.add_argument("--label3", default="query library")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--gtf", required=True)
+    p.add_argument("--output", default="bernoulliShadow")
+    p.add_argument("--window", type=int,   default=30)
+    p.add_argument("--min_coverage", type=float, default=50.0)
+    p.add_argument("--min_query_reads", type=int, default=10,
+                   help="Minimum number of query (spanning) reads a gene must "
+                        "have to be analyzed (default: 10). Separate from "
+                        "--min_coverage, which gates the reference background.")
+    p.add_argument("--min_sites",    type=int,   default=5)
+    p.add_argument("--num_reads",    type=int,   default=10)
+    p.add_argument("--top_n_plots",  type=int,   default=10,
+                   help="Number of genes to plot, ranked by number of "
+                        "CDS-spanning query reads (default: 10)")
+    p.add_argument("--require_his_codon", action="store_true",
+                   help="Only process genes that contain at least one His "
+                        "codon (CAT/CAC).")
+    p.add_argument("--background_all_reads", action="store_true",
+                   help="When --cds_spanning is set, build the reference "
+                        "background frequencies from ALL overlapping "
+                        "reference reads (not just spanning ones) for a more "
+                        "precise per-position estimate. Query reads are still "
+                        "restricted to spanning. No effect without "
+                        "--cds_spanning.")
+    p.add_argument("--min_edit_freq", type=float, default=0.0,
+                   help="Only consider query reads whose per-read "
+                        "global_edit_freq is >= this value. Filters out "
+                        "unedited/poorly-edited molecules that carry no "
+                        "protection signal. Applied to query reads only, "
+                        "not the background estimate. Default: 0.0 (off)")
+
+    p.add_argument("--cds_spanning", action="store_true",
+                   help="Only include reads whose alignment spans the full "
+                        "CDS of the gene.")
+    return p.parse_args()
+
+def main(args):
+    args = parse_args()
+    out = args.output
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    df1 = load_all_parquet_chunks(args.parquet1)
+    df2 = load_all_parquet_chunks(args.parquet2)
+    df3 = load_all_parquet_chunks(args.parquet3)
+
+    print(f"Loaded {len(df1):,} reads from {args.label1}.", file=sys.stderr)
+    print(f"Loaded {len(df2):,} reads from {args.label2}.", file=sys.stderr)
+    print(f"Loaded {len(df3):,} reads from {args.label3}.", file=sys.stderr)
+
+    if args.cds_spanning:
+        print("  CDS spanning filter: ON (query only)", file=sys.stderr)
+    if args.require_his_codon:
+        print("  His codon filter: ON (genes need >=1 CAT/CAC)",
+              file=sys.stderr)
+    if args.min_edit_freq > 0.0:
+        print(f"  Query edit-freq filter: ON "
+              f"(global_edit_freq >= {args.min_edit_freq})", file=sys.stderr)
+
+    print("\nParsing GTF...", file=sys.stderr)
+    genes = parse_gtf(args.gtf)
+    print(f"{len(genes):,} genes.", file=sys.stderr)
+
+    ref_fasta = pysam.FastaFile(args.ref)
+
+    pdf_dir = Path(f"{out}_gene_pdfs")
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    summary_rows = []
+    n_pass = 0
+
+    gene_names = list(genes.keys())
+    print(f"\nPass 1: scanning {len(gene_names):,} genes "
+          f"(summary + ranking)...", file=sys.stderr)
+
+    # Diagnostics
+    max_bg = 0
+    max_qry = 0
+
+    gene_span_counts = {}  # gname -> n_query_reads (ranking metric)
+    model_dict = {} # dictionary to hold model information per passing gene
+    for i, gname in enumerate(gene_names):
+        if (i + 1) % 50 == 0:
+            print(f"  {i + 1}/{len(gene_names)} scanned, "
+                  f"{n_pass} passing...", file=sys.stderr)
+
+        gene = genes[gname]
+        gene_len = cds_length(gene)
+
+        his_positions = find_his_codon_tx_positions(ref_fasta, gene)
+        if args.require_his_codon and len(his_positions) == 0:
+            continue
+
+        # Background: ALWAYS all overlapping reference reads (never spanning),
+        # never edit-freq filtered — maximum per-position support.
+        df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
+
+        # Query: the reads we make protection calls on.
+        df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning,
+                             min_edit_freq=args.min_edit_freq)
+
+        max_bg = max(max_bg, len(df_ref_bg))
+        max_qry = max(max_qry, len(df_qry))
+
+        # Two independent coverage thresholds
+        if len(df_ref_bg) < args.min_coverage:
+            continue
+        if len(df_qry) < args.min_query_reads:
+            continue
+
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        tx_lo = min(gpos_to_tx.values())
+        tx_hi = max(gpos_to_tx.values())
+
+        # Train the model on the first two libraries, then classify the third library
+        model_dict[gname] = train(df1, df2, gpos_to_tx=gpos_to_tx)
+        print("Trained gene model: ", gname, file=sys.stderr)
+
+    if __name__ == "__main__":
+        main(args)
+
+
+
+
