@@ -586,22 +586,22 @@ def parse_args():
                         "CDS of the gene.")
     return p.parse_args()
 
-def main(args):
+def main():
     args = parse_args()
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    df1 = load_all_parquet_chunks(args.parquet1)
-    df2 = load_all_parquet_chunks(args.parquet2)
-    df3 = load_all_parquet_chunks(args.parquet3)
+    train_df1 = load_all_parquet_chunks(args.parquet1)
+    train_df2 = load_all_parquet_chunks(args.parquet2)
+    query_df = load_all_parquet_chunks(args.parquet3)
 
-    print(f"Loaded {len(df1):,} reads from {args.label1}.", file=sys.stderr)
-    print(f"Loaded {len(df2):,} reads from {args.label2}.", file=sys.stderr)
-    print(f"Loaded {len(df3):,} reads from {args.label3}.", file=sys.stderr)
+    print(f"Loaded {len(train_df1):,} reads from {args.label1}.", file=sys.stderr)
+    print(f"Loaded {len(train_df2):,} reads from {args.label2}.", file=sys.stderr)
+    print(f"Loaded {len(query_df):,} reads from {args.label3}.", file=sys.stderr)
 
     if args.cds_spanning:
-        print("  CDS spanning filter: ON (query only)", file=sys.stderr)
+        print("CDS spanning filter: ON (query only)", file=sys.stderr)
     if args.require_his_codon:
-        print("  His codon filter: ON (genes need >=1 CAT/CAC)",
+        print("His codon filter: ON (genes need >=1 CAT/CAC)",
               file=sys.stderr)
     if args.min_edit_freq > 0.0:
         print(f"  Query edit-freq filter: ON "
@@ -642,17 +642,18 @@ def main(args):
 
         # Background: ALWAYS all overlapping reference reads (never spanning),
         # never edit-freq filtered — maximum per-position support.
-        df_ref_bg = get_gene_df(df_all_ref, gene, cds_spanning=False)
+        t1 = get_gene_df(train_df1, gene, cds_spanning=False)
+        t2 = get_gene_df(train_df2, gene, cds_spanning=False)
 
         # Query: the reads we make protection calls on.
-        df_qry = get_gene_df(df_all_qry, gene, cds_spanning=args.cds_spanning,
+        df_qry = get_gene_df(df3, gene, cds_spanning=args.cds_spanning,
                              min_edit_freq=args.min_edit_freq)
 
-        max_bg = max(max_bg, len(df_ref_bg))
+        max_bg = max(max_bg, len(t1))
         max_qry = max(max_qry, len(df_qry))
 
         # Two independent coverage thresholds
-        if len(df_ref_bg) < args.min_coverage:
+        if len(t1) < args.min_coverage:
             continue
         if len(df_qry) < args.min_query_reads:
             continue
@@ -662,11 +663,12 @@ def main(args):
         tx_hi = max(gpos_to_tx.values())
 
         # Train the model on the first two libraries, then classify the third library
-        model_dict[gname] = train(df1, df2, gpos_to_tx=gpos_to_tx)
+        model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx)
         print("Trained gene model: ", gname, file=sys.stderr)
 
-    if __name__ == "__main__":
-        main(args)
+if __name__ == "__main__":
+    Tee()
+    main()
 
 
 
