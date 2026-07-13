@@ -517,8 +517,65 @@ def compute_binomial_pvals_per_read2(read_edits: dict, ref_freq: dict,
 
             k = sum(ks)
             c = float(np.mean(cs)) if cs else 0.0
-            p_mean = float(np.mean(ps))
+            p_mean = float(np.mean(ps)) # approximating binomial distribution, this could be better bc it takes out sequence context info
             p_val = max(scipy.stats.binom.cdf(k, n, p_mean), 1e-300)
+
+            trace.append((site, -math.log10(p_val), c))
+
+        if trace:
+            results[read_id] = trace
+
+            site_rows = []
+            for tx in sites:
+                if tx not in ref_freq:
+                    continue
+                site_rows.append({
+                    "tx_pos": tx,
+                    "gpos": tx_to_gpos.get(tx) if tx_to_gpos else None,
+                    "edit": pos_dict[tx],
+                    "ref_freq": ref_freq[tx],
+                    "ref_cov": ref_cov.get(tx, 0),
+                })
+            per_site[read_id] = site_rows
+
+    return results, per_site
+
+def compute_binomial_pvals_per_read3(read_edits: dict, ref_freq: dict,
+                                     ref_cov: dict,
+                                     nt_window: int, min_sites: int,
+                                     gene_len: int,
+                                     tx_to_gpos: dict = None) -> tuple:
+    """
+    Site-anchored lower-tail binomial protection test per read. I didn't build a true binomial distribution in compute_binomial_pvals_per_read2, just approximated it with the mean of the reference frequencies.
+    This is a bit of a hack and I think it dampens local TadA editing biases. Going with a true binomial distribution might help get better footprint calls.
+    """
+    from scipy.stats import poisson_binom
+    results = {}
+    per_site = {}
+    half = nt_window // 2
+
+    for read_id, pos_dict in read_edits.items():
+        sites = sorted(pos_dict.keys())
+        trace = []
+
+        for site in sites:
+            ks, ps, cs = [], [], []
+            for tx in range(site - half, site + half):
+                if tx in pos_dict and tx in ref_freq:
+                    ks.append(pos_dict[tx])
+                    ps.append(ref_freq[tx])
+                    cs.append(ref_cov.get(tx, 0))
+
+            # position of edits matters
+            n = len(ks)
+            if n < min_sites:
+                continue
+
+            k = sum(ks)
+            c = float(np.mean(cs)) if cs else 0.0
+            # Build a poisson binomial distribution for the window, using the reference frequencies at each site as the per-site probabilities.
+            # This is a bit more computationally expensive than just taking the mean, but it should give a more accurate p-value.
+            p_val = max(poisson_binom.cdf(k, ps), 1e-300) #
 
             trace.append((site, -math.log10(p_val), c))
 
@@ -949,7 +1006,7 @@ def main():
         if not read_edits:
             continue
 
-        binomial_scores, _ = compute_binomial_pvals_per_read2(
+        binomial_scores, _ = compute_binomial_pvals_per_read3(
             read_edits, ref_freq, ref_cov,
             nt_window=args.window,
             min_sites=args.min_sites,
@@ -1024,7 +1081,7 @@ def main():
                 df_ref_bg, gpos_to_tx, gene)
             read_edits = collect_read_edits(df_qry, gpos_to_tx, gene)
 
-            binomial_scores, _ = compute_binomial_pvals_per_read2(
+            binomial_scores, _ = compute_binomial_pvals_per_read3(
                 read_edits, ref_freq, ref_cov,
                 nt_window=args.window,
                 min_sites=args.min_sites,
