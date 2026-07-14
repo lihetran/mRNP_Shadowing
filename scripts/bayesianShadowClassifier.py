@@ -197,6 +197,23 @@ def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
           file=sys.stderr)
     return df
 
+def find_his_codon_tx_positions(ref_fasta, gene):
+    chrom, strand = gene["chrom"], gene["strand"]
+    tx_seq = ""
+    for (cs, ce) in gene["cds"]:
+        seg = ref_fasta.fetch(chrom, cs, ce).upper()
+        if strand == "-":
+            seg = reverse_complement(seg)
+        tx_seq += seg
+    his_pos, seen = [], set()
+    for i in range(0, len(tx_seq) - 2, 3):
+        if tx_seq[i:i+3] in HIS_CODONS:
+            p = i + 1
+            if p not in seen:
+                seen.add(p)
+                his_pos.append(p)
+    return his_pos
+
 
 def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
@@ -307,7 +324,6 @@ def classify_tx(tx_pos, cds_len):
     if tx_pos < 0: return "UTR5"
     if tx_pos < cds_len: return "CDS"
     return "UTR3"
-
 
 
 def build_reference_freq_and_coverage(df: pd.DataFrame, gpos_to_tx: dict,
@@ -468,7 +484,7 @@ def build_frequency_df(df: pd.DataFrame, gpos_to_tx: dict, alpha=1, beta=1):
             ref_cov[tx] = total  # coverage stays the RAW count
     return ref_freq, ref_cov
 
-def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx: dict):
+def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
     pA, covA = build_frequency_df(A_df, gpos_to_tx, alpha, beta)
     pB, covB = build_frequency_df(B_df, gpos_to_tx, alpha, beta)
 
@@ -483,13 +499,68 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx: dict):
 
     return {"w1": w1, "w0": w0, "prior_log_odds": prior_log_odds, "pA": pA, "pB": pB, "covA": covA, "covB": covB}
 
-
-def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
-    '''
-    Returns a list of contribution events. Scores each position
-    '''
-    events = []
+def classify_read(model, edit_string, absolute_indices, gpos_to_tx, use_prior=True):
+    log_odds = model["prior_log_odds"] if use_prior else 0.0
     n_edit = len(edit_string)
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":                               # no-info base, skip
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["w1"]:                   # position unseen in training
+            continue
+        log_odds += model["w1"][tx] if ev == "1" else model["w0"][tx]
+    p_A = 1.0 / (1.0 + math.exp(-log_odds))
+    return {"P_A": p_A, "P_B": 1 - p_A, "label": "A" if p_A >= 0.5 else "B"}
+
+def classify_positions(model, read_id, chrom, edit_string, absolute_indices,
+                       gpos_to_tx, use_prior=True):
+    base = model["prior_log_odds"] if use_prior else 0.0
+    n_edit = len(edit_string)
+    positions, txs, labels, A, B = [], [], [], [], []
+
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["w1"]:
+            continue
+
+        log_odds = base + (model["w1"][tx] if ev == "1" else model["w0"][tx])
+        p_A = 1.0 / (1.0 + math.exp(-log_odds))
+
+        positions.append(ref_pos)
+        txs.append(tx)
+        A.append(p_A)
+        B.append(1.0 - p_A)
+        labels.append("A" if p_A >= 0.5 else "B")
+
+    yield {"read_id": read_id, "chrom": chrom,
+           "absolute_indices": positions, "tx": txs,
+           "labels": labels, "P_A": A, "P_B": B}
+    # return events
+
+import math, bisect
+
+def classify_positions_windowed(model, read_id, chrom, edit_string, absolute_indices,
+                                gpos_to_tx, window=30, coord="tx",
+                                use_prior=True):
+    base = model["prior_log_odds"] if use_prior else 0.0
+    n_edit = len(edit_string)
+
+    # pass 1: collect scored sites (read order) with per-site contribution
+    sites = []                                        # (tx, ref_pos, contrib)
     for i, ref_pos in enumerate(absolute_indices):
         if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
             continue
@@ -503,42 +574,244 @@ def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
         if tx not in model["w1"]:
             continue
         contrib = model["w1"][tx] if ev == "1" else model["w0"][tx]
-        events.append({"i": i, "ref_pos": ref_pos, "tx": tx, "contrib": contrib})
-    return events
+        sites.append((tx, ref_pos, contrib))
 
-def sliding_classify(model, edit_string, absolute_indices, gpos_to_tx,
-                     window, step=1, coord="ref_pos",
-                     min_positions=1, use_prior=False):
-    '''
-    Classify events in read by window. Manually annotates events in a window
-    '''
-    import bisect, math
-    events = read_contributions(model, edit_string, absolute_indices, gpos_to_tx)
-    if not events:
-        return []
-    events.sort(key=lambda e: e[coord])
-    coords = [e[coord] for e in events]
-    prefix = [0.0]
-    for e in events:
-        prefix.append(prefix[-1] + e["contrib"])
-    lo_c, hi_c = coords[0], coords[-1]
-    base = model["prior_log_odds"] if use_prior else 0.0
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [],
+               "tx": [], "labels": [], "P_A": [], "P_B": [], "win_n": []}
+        return
 
-    results = []
-    start = lo_c
-    while start <= hi_c:
-        end = start + window
-        l = bisect.bisect_left(coords, start)
-        r = bisect.bisect_left(coords, end)
-        n = r - l
-        if n >= min_positions:
-            log_odds = base + (prefix[r] - prefix[l])
-            p_A = 1.0 / (1.0 + math.exp(-log_odds))
-            results.append({"start": start, "end": end, "center": start + window/2,
-                            "P_A": p_A, "P_B": 1 - p_A,
-                            "label": "A" if p_A >= 0.5 else "B", "n": n})
-        start += step
-    return results
+    # sorted-by-coordinate copy for prefix sums + window lookup
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+    ordered = sorted(sites, key=key)
+    scoords = [key(s) for s in ordered]
+    prefix  = [0.0]
+    for s in ordered:
+        prefix.append(prefix[-1] + s[2])
+
+    half = window / 2.0
+    positions, txs, labels, A, B, win_n = [], [], [], [], [], []
+    for tx, ref_pos, _ in sites:                      # emit in read order
+        center = tx if coord == "tx" else ref_pos
+        l = bisect.bisect_left(scoords,  center - half)
+        r = bisect.bisect_right(scoords, center + half)
+        log_odds = base + (prefix[r] - prefix[l])
+        p_A = 1.0 / (1.0 + math.exp(-log_odds))
+        positions.append(ref_pos); txs.append(tx)
+        A.append(p_A); B.append(1.0 - p_A)
+        labels.append("A" if p_A >= 0.5 else "B")
+        win_n.append(r - l)
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B, "win_n": win_n}
+
+# def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
+#     '''
+#     Returns a list of contribution events. Scores each position
+#     '''
+#     events = []
+#     n_edit = len(edit_string)
+#     for i, ref_pos in enumerate(absolute_indices):
+#         if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+#             continue
+#         ref_pos = int(ref_pos)
+#         if ref_pos not in gpos_to_tx or i >= n_edit:
+#             continue
+#         ev = edit_string[i]
+#         if ev == "2":
+#             continue
+#         tx = gpos_to_tx[ref_pos]
+#         if tx not in model["w1"]:
+#             continue
+#         contrib = model["w1"][tx] if ev == "1" else model["w0"][tx]
+#         events.append({"i": i, "ref_pos": ref_pos, "tx": tx, "contrib": contrib})
+#     return events
+#
+# def sliding_classify(model, edit_string, absolute_indices, gpos_to_tx,
+#                      window, step=1, coord="ref_pos",
+#                      min_positions=1, use_prior=False):
+#     '''
+#     Classify events in read by window. Manually annotates events in a window
+#     '''
+#     import bisect, math
+#     events = read_contributions(model, edit_string, absolute_indices, gpos_to_tx)
+#     if not events:
+#         return []
+#     events.sort(key=lambda e: e[coord])
+#     coords = [e[coord] for e in events]
+#     prefix = [0.0]
+#     for e in events:
+#         prefix.append(prefix[-1] + e["contrib"])
+#     lo_c, hi_c = coords[0], coords[-1]
+#     base = model["prior_log_odds"] if use_prior else 0.0
+#
+#     results = []
+#     start = lo_c
+#     while start <= hi_c:
+#         end = start + window
+#         l = bisect.bisect_left(coords, start)
+#         r = bisect.bisect_left(coords, end)
+#         n = r - l
+#         if n >= min_positions:
+#             log_odds = base + (prefix[r] - prefix[l])
+#             p_A = 1.0 / (1.0 + math.exp(-log_odds))
+#             results.append({"start": start, "end": end, "center": start + window/2,
+#                             "P_A": p_A, "P_B": 1 - p_A,
+#                             "label": "A" if p_A >= 0.5 else "B", "n": n})
+#         start += step
+#     return results
+
+def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
+                      label1="A", label2="B", ref_cov=None,
+                      tx_col="tx", pb_col="P_B", edit_col="edits",
+                      pct=(5, 95), num_reads=10):
+    from pyx import canvas, graph, color, style, text as pyx_text
+    from collections import defaultdict
+    import numpy as np
+
+    col_qry  = color.cmyk(1, 0.5, 0, 0)
+    col_his  = color.cmyk(0, 1, 1, 0)
+    col_sig  = color.cmyk(0, 0, 0, 0.4)
+    col_edit = color.cmyk(0, 0, 0, 1)
+    col_no   = color.cmyk(0, 0.8, 1, 0)
+    col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)   # green — background coverage
+
+    pdf_path = str(pdf_path)
+
+    x_min, x_max = tx_lo, tx_hi
+    panel_w  = 12
+    tick_h   = 0.25
+    read_h   = 1.2
+    gap      = 0.6
+    cov_h    = 1.5
+
+    # aggregate per-tx distribution of P_B across all reads (meta)
+    pb_by_tx = defaultdict(list)
+    for tx_list, pb_list in zip(df[tx_col], df[pb_col]):
+        for t, pb in zip(tx_list, pb_list):
+            pb_by_tx[int(t)].append(pb)
+    items    = sorted(pb_by_tx.items())
+    xs       = [t for t, _ in items]
+    mean_pb  = [float(np.mean(v))               for _, v in items]
+    lo_pb    = [float(np.percentile(v, pct[0])) for _, v in items]
+    hi_pb    = [float(np.percentile(v, pct[1])) for _, v in items]
+    cov_self = {t: len(v) for t, v in items}
+
+    c         = canvas.canvas()
+    meta_ypos = num_reads * (read_h + tick_h + gap) + gap * 2
+
+    g_meta = graph.graphxy(
+        width=panel_w, height=3, xpos=0, ypos=meta_ypos,
+        x=graph.axis.linear(min=x_min, max=x_max,
+                            title="Position Along Transcript (nt)"),
+        y=graph.axis.linear(min=0, max=1, title="P(Shadow)"),
+    )
+    for hp in his_positions:
+        g_meta.plot(
+            graph.data.function(f"x(y)={hp}", min=0, max=1),
+            [graph.style.line([col_his, style.linewidth.thin,
+                               style.linestyle.solid])])
+    g_meta.plot(
+        graph.data.function("y(x)=0.5", min=x_min, max=x_max),
+        [graph.style.line([col_sig, style.linewidth.thin,
+                           style.linestyle.dashed])])
+    for yb in (lo_pb, hi_pb):
+        if xs:
+            g_meta.plot(graph.data.points(list(zip(xs, yb)), x=1, y=2),
+                        [graph.style.line([col_qry, style.linewidth.thin,
+                                           style.linestyle.dotted])])
+    if xs:
+        g_meta.plot(graph.data.points(list(zip(xs, mean_pb)), x=1, y=2),
+                    [graph.style.line([col_qry, style.linewidth.normal,
+                                       style.linestyle.solid])])
+    c.insert(g_meta)
+
+    # ── Background coverage panel above the meta plot ─────────────────────────
+    cov_ypos = meta_ypos + 3 + gap
+    title_y  = cov_ypos + 3 + 0.4   # default if no coverage panel drawn
+
+    cov_source = ref_cov if ref_cov else cov_self
+    if cov_source:
+        cov_items = sorted(cov_source.items())
+        cov_x     = [tx for tx, _ in cov_items]
+        cov_y     = [n  for _, n  in cov_items]
+        cov_y_max = max(cov_y) * 1.1 if cov_y else 1.0
+
+        g_cov = graph.graphxy(
+            width=panel_w, height=cov_h,
+            xpos=0, ypos=cov_ypos,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=cov_y_max,
+                                title="Ref cov"),
+        )
+        for hp in his_positions:
+            g_cov.plot(
+                graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
+                [graph.style.line([col_his, style.linewidth.thin,
+                                   style.linestyle.solid])])
+        if len(cov_items) > 0:
+            g_cov.plot(
+                graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
+                [graph.style.line([col_cov, style.linewidth.normal,
+                                   style.linestyle.solid])])
+        c.insert(g_cov)
+        title_y = g_cov.ypos + g_cov.height + 0.4
+
+    c.text(g_meta.xpos + g_meta.width / 2., title_y,
+           f"{gene_name} - {label2}",
+           [pyx_text.halign.center, pyx_text.size.normalsize])
+
+    n_show = min(num_reads, len(df))
+    for jj in range(n_show):
+        row = df.iloc[jj]
+        tx_r = list(row[tx_col]); pb_r = list(row[pb_col])
+        if not tx_r:
+            continue
+        order = np.argsort(tx_r)
+        tx_s = [tx_r[k] for k in order]; pb_s = [pb_r[k] for k in order]
+
+        ypos = (num_reads - 1 - jj) * (read_h + tick_h + gap)
+
+        g_read = graph.graphxy(
+            width=panel_w, height=read_h, xpos=0, ypos=ypos + tick_h,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=1, title=""),
+        )
+        for hp in his_positions:
+            g_read.plot(
+                graph.data.function(f"x(y)={hp}", min=0, max=1),
+                [graph.style.line([col_his, style.linewidth.thin,
+                                   style.linestyle.solid])])
+        g_read.plot(
+            graph.data.function("y(x)=0.5", min=x_min, max=x_max),
+            [graph.style.line([col_sig, style.linewidth.thin,
+                               style.linestyle.dashed])])
+        g_read.plot(
+            graph.data.points(list(zip(tx_s, pb_s)), x=1, y=2),
+            [graph.style.line([col_qry, style.linewidth.thin,
+                               style.linestyle.solid])])
+        c.insert(g_read)
+
+        g_ticks = graph.graphxy(
+            width=panel_w, height=tick_h, xpos=0, ypos=ypos,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=1),
+        )
+        edit_r = list(row[edit_col]) if edit_col in df.columns else None
+        for k in order:
+            v = int(edit_r[k]) if edit_r is not None else (0 if pb_r[k] >= 0.5 else 1)
+            col = col_edit if v == 1 else col_no
+            g_ticks.plot(
+                graph.data.function(f"x(y)={tx_r[k]}", min=0, max=1),
+                [graph.style.line([col, style.linewidth.thin,
+                                   style.linestyle.solid])])
+        c.insert(g_ticks)
+
+        label_txt = str(row["read_id"])[:20] if "read_id" in df.columns else f"read {jj}"
+        c.text(panel_w + 0.15, ypos + tick_h + read_h / 2.,
+               label_txt, [pyx_text.valign.middle, pyx_text.size.tiny])
+
+    c.writePDFfile(pdf_path)
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -590,9 +863,12 @@ def main():
     args = parse_args()
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    train_df1 = load_all_parquet_chunks(args.parquet1)
-    train_df2 = load_all_parquet_chunks(args.parquet2)
-    query_df = load_all_parquet_chunks(args.parquet3)
+    # train_df1 = load_all_parquet_chunks(args.parquet1)
+    # train_df2 = load_all_parquet_chunks(args.parquet2)
+    # query_df = load_all_parquet_chunks(args.parquet3)
+    train_df1 = pd.read_parquet(args.parquet1)
+    train_df2 = pd.read_parquet(args.parquet2)
+    query_df = pd.read_parquet(args.parquet3)
 
     print(f"Loaded {len(train_df1):,} reads from {args.label1}.", file=sys.stderr)
     print(f"Loaded {len(train_df2):,} reads from {args.label2}.", file=sys.stderr)
@@ -646,7 +922,7 @@ def main():
         t2 = get_gene_df(train_df2, gene, cds_spanning=False)
 
         # Query: the reads we make protection calls on.
-        df_qry = get_gene_df(df3, gene, cds_spanning=args.cds_spanning,
+        df_qry = get_gene_df(query_df, gene, cds_spanning=args.cds_spanning,
                              min_edit_freq=args.min_edit_freq)
 
         max_bg = max(max_bg, len(t1))
@@ -662,10 +938,31 @@ def main():
         tx_lo = min(gpos_to_tx.values())
         tx_hi = max(gpos_to_tx.values())
 
-        # Train the model on the first two libraries, then classify the third library
+        # Train the model on the first two libraries
         model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx)
         print("Trained gene model: ", gname, file=sys.stderr)
-
+        # Classify
+        rows = []
+        for _, row in df_qry.iterrows():
+            # rows.extend(classify_positions(
+            #     model_dict[gname], row['read_id'], row['chrom'],
+            #     row['edit_string'], row['absolute_indices'], gpos_to_tx, use_prior=True
+            # ))
+            rows.extend(classify_positions_windowed(
+                model_dict[gname], row['read_id'], row['chrom'],
+                row['edit_string'], row['absolute_indices'], gpos_to_tx,
+                window=args.window, coord="tx", use_prior=True
+            ))
+        df = pd.DataFrame(rows)
+        df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
+        plot_pb_by_tx_pyx(
+            gname, df, his_positions, tx_lo, tx_hi,
+            pdf_path=pdf_dir / f"{gname}.pdf",
+            label1="P(Shadow)", label2=args.label3,
+            ref_cov=model_dict[gname]["covA"]
+        )
+        # print(calls_dict)
+        # convert to
 if __name__ == "__main__":
     Tee()
     main()
