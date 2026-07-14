@@ -813,6 +813,141 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
     c.writePDFfile(pdf_path)
 
+def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
+                        label1="A", label2="B", ref_cov=None,
+                        tx_col="tx", pa_col="P_A", pb_col="P_B", edit_col="edits",
+                        pct=(5, 95), num_reads=10, eps=1e-6):
+    from pyx import canvas, graph, color, style, text as pyx_text
+    from collections import defaultdict
+    import numpy as np, math
+
+    col_qry  = color.cmyk(1, 0.5, 0, 0)       # blue  — P_A trace (flipped, +)
+    col_pb   = color.cmyk(0.4, 1, 0, 0)       # purple — P_B trace (unflipped, -)
+    col_his  = color.cmyk(0, 1, 1, 0)
+    col_sig  = color.cmyk(0, 0, 0, 0.4)
+    col_edit = color.cmyk(0, 0, 0, 1)
+    col_no   = color.cmyk(0, 0.8, 1, 0)
+    col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)
+
+    pdf_path = str(pdf_path)
+    x_min, x_max = tx_lo, tx_hi
+    panel_w, tick_h, read_h, gap, cov_h = 12, 0.25, 1.2, 0.6, 1.5
+
+    def yA(pa): return -math.log10(max(pa, eps))
+    def yB(pb): return  math.log10(max(pb, eps))
+
+    ya_by, yb_by = defaultdict(list), defaultdict(list)
+    for tx_l, pa_l, pb_l in zip(df[tx_col], df[pa_col], df[pb_col]):
+        for t, pa, pb in zip(tx_l, pa_l, pb_l):
+            ya_by[int(t)].append(yA(pa)); yb_by[int(t)].append(yB(pb))
+    items   = sorted(ya_by); xs = list(items)
+    ya_mean = [float(np.mean(ya_by[t]))               for t in items]
+    ya_lo   = [float(np.percentile(ya_by[t], pct[0])) for t in items]
+    ya_hi   = [float(np.percentile(ya_by[t], pct[1])) for t in items]
+    yb_mean = [float(np.mean(yb_by[t]))               for t in items]
+    yb_lo   = [float(np.percentile(yb_by[t], pct[0])) for t in items]
+    yb_hi   = [float(np.percentile(yb_by[t], pct[1])) for t in items]
+    cov_self = {t: len(ya_by[t]) for t in items}
+
+    allv  = [abs(v) for v in ya_hi + yb_lo + ya_mean + yb_mean] or [1.0]
+    y_lim = max(max(allv) * 1.1, 1.0)
+
+    def draw_his(g):
+        for hp in his_positions:
+            g.plot(graph.data.function(f"x(y)={hp}", min=-y_lim, max=y_lim),
+                   [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+    def draw_zero(g):
+        g.plot(graph.data.function("y(x)=0", min=x_min, max=x_max),
+               [graph.style.line([col_sig, style.linewidth.thin, style.linestyle.dashed])])
+
+    c = canvas.canvas()
+    meta_ypos = num_reads * (read_h + tick_h + gap) + gap * 2
+
+    g_meta = graph.graphxy(
+        width=panel_w, height=3, xpos=0, ypos=meta_ypos,
+        x=graph.axis.linear(min=x_min, max=x_max, title="Position Along Transcript (nt)"),
+        y=graph.axis.linear(min=-y_lim, max=y_lim, title="log10 P"))
+    draw_his(g_meta); draw_zero(g_meta)
+    if xs:
+        for yb in (ya_lo, ya_hi):
+            g_meta.plot(graph.data.points(list(zip(xs, yb)), x=1, y=2),
+                        [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.dotted])])
+        for yb in (yb_lo, yb_hi):
+            g_meta.plot(graph.data.points(list(zip(xs, yb)), x=1, y=2),
+                        [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.dotted])])
+        g_meta.plot(graph.data.points(list(zip(xs, ya_mean)), x=1, y=2),
+                    [graph.style.line([col_qry, style.linewidth.normal, style.linestyle.solid])])
+        g_meta.plot(graph.data.points(list(zip(xs, yb_mean)), x=1, y=2),
+                    [graph.style.line([col_pb, style.linewidth.normal, style.linestyle.solid])])
+    c.insert(g_meta)
+    # directional labels, horizontal, inside the top-left / bottom-left corners
+    lab_x = g_meta.xpos + 0.2
+    c.text(lab_x, meta_ypos + 3 - 0.25, "log P(protected)",
+           [pyx_text.halign.left, pyx_text.valign.top, pyx_text.size.small])
+    c.text(lab_x, meta_ypos + 0.25, "log P(unprotected)",
+           [pyx_text.halign.left, pyx_text.valign.bottom, pyx_text.size.small])
+
+    cov_ypos = meta_ypos + 3 + gap
+    title_y  = cov_ypos + 3 + 0.4
+    cov_source = ref_cov if ref_cov else cov_self
+    if cov_source:
+        cov_items = sorted(cov_source.items())
+        cov_x = [tx for tx, _ in cov_items]; cov_y = [n for _, n in cov_items]
+        cov_y_max = max(cov_y) * 1.1 if cov_y else 1.0
+        g_cov = graph.graphxy(width=panel_w, height=cov_h, xpos=0, ypos=cov_ypos,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=cov_y_max, title="Ref cov"))
+        for hp in his_positions:
+            g_cov.plot(graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
+                       [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        if cov_items:
+            g_cov.plot(graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
+                       [graph.style.line([col_cov, style.linewidth.normal, style.linestyle.solid])])
+        c.insert(g_cov)
+        title_y = g_cov.ypos + g_cov.height + 0.4
+
+    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name}: {label2}",
+           [pyx_text.halign.center, pyx_text.size.normalsize])
+
+    n_show = min(num_reads, len(df))
+    for jj in range(n_show):
+        row = df.iloc[jj]
+        tx_r = list(row[tx_col]); pa_r = list(row[pa_col]); pb_r = list(row[pb_col])
+        if not tx_r:
+            continue
+        order = np.argsort(tx_r)
+        tx_s = [tx_r[k] for k in order]
+        yaS  = [yA(pa_r[k]) for k in order]
+        ybS  = [yB(pb_r[k]) for k in order]
+
+        ypos = (num_reads - 1 - jj) * (read_h + tick_h + gap)
+        g_read = graph.graphxy(width=panel_w, height=read_h, xpos=0, ypos=ypos + tick_h,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=-y_lim, max=y_lim, title=""))
+        draw_his(g_read); draw_zero(g_read)
+        g_read.plot(graph.data.points(list(zip(tx_s, yaS)), x=1, y=2),
+                    [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.solid])])
+        g_read.plot(graph.data.points(list(zip(tx_s, ybS)), x=1, y=2),
+                    [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.solid])])
+        c.insert(g_read)
+
+        g_ticks = graph.graphxy(width=panel_w, height=tick_h, xpos=0, ypos=ypos,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=1))
+        edit_r = list(row[edit_col]) if edit_col in df.columns else None
+        for k in order:
+            v = int(edit_r[k]) if edit_r is not None else (0 if pa_r[k] < 0.5 else 1)
+            col = col_edit if v == 1 else col_no
+            g_ticks.plot(graph.data.function(f"x(y)={tx_r[k]}", min=0, max=1),
+                         [graph.style.line([col, style.linewidth.thin, style.linestyle.solid])])
+        c.insert(g_ticks)
+
+        label_txt = str(row["read_id"])[:20] if "read_id" in df.columns else f"read {jj}"
+        c.text(panel_w + 0.15, ypos + tick_h + read_h / 2., label_txt,
+               [pyx_text.valign.middle, pyx_text.size.tiny])
+
+    c.writePDFfile(pdf_path)
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Bernoulli Naive Bayes Shadow Classifier."
@@ -861,6 +996,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    print(f"label3={args.label3!r}  output={args.output!r}")
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     # train_df1 = load_all_parquet_chunks(args.parquet1)
@@ -955,10 +1091,16 @@ def main():
             ))
         df = pd.DataFrame(rows)
         df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
-        plot_pb_by_tx_pyx(
+        # plot_pb_by_tx_pyx(
+        #     gname, df, his_positions, tx_lo, tx_hi,
+        #     pdf_path=pdf_dir / f"{gname}.pdf",
+        #     label1="P(Shadow)", label2=args.label3,
+        #     ref_cov=model_dict[gname]["covA"]
+        # )
+        plot_signed_log_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}.pdf",
-            label1="P(Shadow)", label2=args.label3,
+            label1="P(Protection)", label2=args.label3,
             ref_cov=model_dict[gname]["covA"]
         )
         # print(calls_dict)
