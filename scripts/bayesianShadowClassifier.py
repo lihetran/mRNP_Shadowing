@@ -605,6 +605,71 @@ def classify_positions_windowed(model, read_id, chrom, edit_string, absolute_ind
     yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
            "tx": txs, "labels": labels, "P_A": A, "P_B": B, "win_n": win_n}
 
+
+
+def classify_positions_windowed2(model, read_id, chrom, edit_string,
+                                absolute_indices, gpos_to_tx,
+                                window=40, coord="tx", use_prior=True):
+    import math, bisect
+    n_edit = len(edit_string)
+
+    # pass 1: collect the scored sites, keeping the RATES (not the weights)
+    sites = []                       # (tx, ref_pos, bit, pA_i, pB_i)
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["pA"]:
+            continue
+        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
+
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [],
+               "tx": [], "labels": [], "P_A": [], "P_B": [], "win_n": []}
+        return
+
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+    ordered = sorted(sites, key=key)
+    scoords = [key(s) for s in ordered]
+    half = window / 2.0
+
+    prior_A = model["prior_A"] if use_prior else 0.5
+    prior_B = 1.0 - prior_A
+
+    positions, txs, labels, A, B, win_n = [], [], [], [], [], []
+    for s in sites:                                  # emit in read order
+        center = key(s)
+        l = bisect.bisect_left(scoords,  center - half)
+        r = bisect.bisect_right(scoords, center + half)
+        win = ordered[l:r]                           # the sites in this window
+
+        # ---- the whole idea, right here ----------------------------------
+        # P(this window's binary string | A)  and  | B
+        logPA = math.log(prior_A)
+        logPB = math.log(prior_B)
+        for (_tx, _rp, bit, pA_i, pB_i) in win:
+            logPA += math.log(pA_i if bit == 1 else 1 - pA_i)
+            logPB += math.log(pB_i if bit == 1 else 1 - pB_i)
+
+        # normalize: P(A|string) = P(A)P(s|A) / [P(A)P(s|A) + P(B)P(s|B)]
+        m = max(logPA, logPB)                        # log-sum-exp for stability
+        pA_post = math.exp(logPA - m) / (math.exp(logPA - m) + math.exp(logPB - m))
+        # ------------------------------------------------------------------
+
+        positions.append(s[1]); txs.append(s[0])
+        A.append(pA_post); B.append(1.0 - pA_post)
+        labels.append("A" if pA_post >= 0.5 else "B")
+        win_n.append(len(win))
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B, "win_n": win_n}
+
 # def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
 #     '''
 #     Returns a list of contribution events. Scores each position
@@ -814,7 +879,7 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     c.writePDFfile(pdf_path)
 
 def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
-                        label1="A", label2="B", ref_cov=None,
+                        label1="A", label2="B", ref_cov_A=None, ref_cov_B=None,
                         tx_col="tx", pa_col="P_A", pb_col="P_B", edit_col="edits",
                         pct=(5, 95), num_reads=10, eps=1e-6):
     from pyx import canvas, graph, color, style, text as pyx_text
@@ -827,20 +892,24 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     col_sig  = color.cmyk(0, 0, 0, 0.4)
     col_edit = color.cmyk(0, 0, 0, 1)
     col_no   = color.cmyk(0, 0.8, 1, 0)
-    col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)
+    col_covA = color.cmyk(0.7, 0, 0.7, 0.1)   # green — ref A coverage
+    col_covB = color.cmyk(0, 0.5, 1, 0.1)     # orange — ref B coverage
 
     pdf_path = str(pdf_path)
     x_min, x_max = tx_lo, tx_hi
     panel_w, tick_h, read_h, gap, cov_h = 12, 0.25, 1.2, 0.6, 1.5
 
-    def yA(pa): return -math.log10(max(pa, eps))
-    def yB(pb): return  math.log10(max(pb, eps))
+    # the transform: log-scale the less-likely probability, sign per the rule
+    def yA(pa): return -math.log10(max(pa, eps))     # P_A less likely -> flip -> positive
+    def yB(pb): return  math.log10(max(pb, eps))     # P_B less likely -> keep -> negative
 
+    # aggregate per-tx distributions of both transformed traces across reads
     ya_by, yb_by = defaultdict(list), defaultdict(list)
     for tx_l, pa_l, pb_l in zip(df[tx_col], df[pa_col], df[pb_col]):
         for t, pa, pb in zip(tx_l, pa_l, pb_l):
             ya_by[int(t)].append(yA(pa)); yb_by[int(t)].append(yB(pb))
-    items   = sorted(ya_by); xs = list(items)
+    items   = sorted(ya_by)
+    xs      = list(items)
     ya_mean = [float(np.mean(ya_by[t]))               for t in items]
     ya_lo   = [float(np.percentile(ya_by[t], pct[0])) for t in items]
     ya_hi   = [float(np.percentile(ya_by[t], pct[1])) for t in items]
@@ -849,6 +918,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     yb_hi   = [float(np.percentile(yb_by[t], pct[1])) for t in items]
     cov_self = {t: len(ya_by[t]) for t in items}
 
+    # shared symmetric y-range from all transformed values
     allv  = [abs(v) for v in ya_hi + yb_lo + ya_mean + yb_mean] or [1.0]
     y_lim = max(max(allv) * 1.1, 1.0)
 
@@ -863,10 +933,12 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     c = canvas.canvas()
     meta_ypos = num_reads * (read_h + tick_h + gap) + gap * 2
 
+    # ── meta panel: both traces, mean + percentile bounds ────────────────────
     g_meta = graph.graphxy(
         width=panel_w, height=3, xpos=0, ypos=meta_ypos,
         x=graph.axis.linear(min=x_min, max=x_max, title="Position Along Transcript (nt)"),
-        y=graph.axis.linear(min=-y_lim, max=y_lim, title="log10 P"))
+        y=graph.axis.linear(min=-y_lim, max=y_lim, title="signed log10 P"),
+    )
     draw_his(g_meta); draw_zero(g_meta)
     if xs:
         for yb in (ya_lo, ya_hi):
@@ -880,6 +952,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         g_meta.plot(graph.data.points(list(zip(xs, yb_mean)), x=1, y=2),
                     [graph.style.line([col_pb, style.linewidth.normal, style.linestyle.solid])])
     c.insert(g_meta)
+
     # directional labels, horizontal, inside the top-left / bottom-left corners
     lab_x = g_meta.xpos + 0.2
     c.text(lab_x, meta_ypos + 3 - 0.25, "log P(protected)",
@@ -887,28 +960,43 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     c.text(lab_x, meta_ypos + 0.25, "log P(unprotected)",
            [pyx_text.halign.left, pyx_text.valign.bottom, pyx_text.size.small])
 
+    # ── coverage panel: both reference tracks ────────────────────────────────
     cov_ypos = meta_ypos + 3 + gap
     title_y  = cov_ypos + 3 + 0.4
-    cov_source = ref_cov if ref_cov else cov_self
-    if cov_source:
-        cov_items = sorted(cov_source.items())
-        cov_x = [tx for tx, _ in cov_items]; cov_y = [n for _, n in cov_items]
-        cov_y_max = max(cov_y) * 1.1 if cov_y else 1.0
+
+    cov_tracks = []
+    if ref_cov_A:
+        cov_tracks.append((ref_cov_A, col_covA, label1))
+    if ref_cov_B:
+        cov_tracks.append((ref_cov_B, col_covB, label2))
+    if not cov_tracks and cov_self:
+        cov_tracks.append((cov_self, col_covA, "query"))
+
+    if cov_tracks:
+        cov_y_max = max(max(d.values()) for d, _, _ in cov_tracks) * 1.1
         g_cov = graph.graphxy(width=panel_w, height=cov_h, xpos=0, ypos=cov_ypos,
             x=graph.axis.linkedaxis(g_meta.axes["x"]),
             y=graph.axis.linear(min=0, max=cov_y_max, title="Ref cov"))
         for hp in his_positions:
             g_cov.plot(graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                        [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
-        if cov_items:
-            g_cov.plot(graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
-                       [graph.style.line([col_cov, style.linewidth.normal, style.linestyle.solid])])
+        for d, col, _lab in cov_tracks:
+            items_c = sorted(d.items())
+            g_cov.plot(graph.data.points([(t, n) for t, n in items_c], x=1, y=2),
+                       [graph.style.line([col, style.linewidth.normal, style.linestyle.solid])])
         c.insert(g_cov)
+
+        # inline legend, top-left inside the coverage panel
+        for kk, (_d, col, lab) in enumerate(cov_tracks):
+            c.text(g_cov.xpos + 0.2, g_cov.ypos + cov_h - 0.18 - kk * 0.28,
+                   lab, [pyx_text.halign.left, pyx_text.valign.top,
+                         pyx_text.size.tiny, col])
         title_y = g_cov.ypos + g_cov.height + 0.4
 
-    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name}: {label2}",
+    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name} - {label2}",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
+    # ── individual read panels: upper trace / edit ticks / lower trace ───────
     n_show = min(num_reads, len(df))
     for jj in range(n_show):
         row = df.iloc[jj]
@@ -916,24 +1004,40 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         if not tx_r:
             continue
         order = np.argsort(tx_r)
-        tx_s = [tx_r[k] for k in order]
-        yaS  = [yA(pa_r[k]) for k in order]
-        ybS  = [yB(pb_r[k]) for k in order]
+        tx_s  = [tx_r[k] for k in order]
+        yaS   = [yA(pa_r[k]) for k in order]
+        ybS   = [yB(pb_r[k]) for k in order]
 
-        ypos = (num_reads - 1 - jj) * (read_h + tick_h + gap)
-        g_read = graph.graphxy(width=panel_w, height=read_h, xpos=0, ypos=ypos + tick_h,
-            x=graph.axis.linkedaxis(g_meta.axes["x"]),
-            y=graph.axis.linear(min=-y_lim, max=y_lim, title=""))
-        draw_his(g_read); draw_zero(g_read)
-        g_read.plot(graph.data.points(list(zip(tx_s, yaS)), x=1, y=2),
-                    [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.solid])])
-        g_read.plot(graph.data.points(list(zip(tx_s, ybS)), x=1, y=2),
-                    [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.solid])])
-        c.insert(g_read)
+        ypos   = (num_reads - 1 - jj) * (read_h + tick_h + gap)
+        half_h = read_h / 2.0
 
-        g_ticks = graph.graphxy(width=panel_w, height=tick_h, xpos=0, ypos=ypos,
+        # lower half: unprotected trace (negative), below the ticks
+        g_lo = graph.graphxy(width=panel_w, height=half_h, xpos=0, ypos=ypos,
             x=graph.axis.linkedaxis(g_meta.axes["x"]),
-            y=graph.axis.linear(min=0, max=1))
+            y=graph.axis.linear(min=-y_lim, max=0, title=""))
+        for hp in his_positions:
+            g_lo.plot(graph.data.function(f"x(y)={hp}", min=-y_lim, max=0),
+                      [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        g_lo.plot(graph.data.points(list(zip(tx_s, ybS)), x=1, y=2),
+                  [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.solid])])
+        c.insert(g_lo)
+
+        # upper half: protected trace (positive), above the ticks
+        g_hi = graph.graphxy(width=panel_w, height=half_h, xpos=0,
+            ypos=ypos + half_h + tick_h,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=y_lim, title=""))
+        for hp in his_positions:
+            g_hi.plot(graph.data.function(f"x(y)={hp}", min=0, max=y_lim),
+                      [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        g_hi.plot(graph.data.points(list(zip(tx_s, yaS)), x=1, y=2),
+                  [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.solid])])
+        c.insert(g_hi)
+
+        # centre strip: edit ticks, no y-axis labels
+        g_ticks = graph.graphxy(width=panel_w, height=tick_h, xpos=0, ypos=ypos + half_h,
+            x=graph.axis.linkedaxis(g_meta.axes["x"]),
+            y=graph.axis.linear(min=0, max=1, parter=None, painter=None))
         edit_r = list(row[edit_col]) if edit_col in df.columns else None
         for k in order:
             v = int(edit_r[k]) if edit_r is not None else (0 if pa_r[k] < 0.5 else 1)
@@ -943,7 +1047,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         c.insert(g_ticks)
 
         label_txt = str(row["read_id"])[:20] if "read_id" in df.columns else f"read {jj}"
-        c.text(panel_w + 0.15, ypos + tick_h + read_h / 2., label_txt,
+        c.text(panel_w + 0.15, ypos + half_h + tick_h / 2., label_txt,
                [pyx_text.valign.middle, pyx_text.size.tiny])
 
     c.writePDFfile(pdf_path)
@@ -999,12 +1103,12 @@ def main():
     print(f"label3={args.label3!r}  output={args.output!r}")
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    # train_df1 = load_all_parquet_chunks(args.parquet1)
-    # train_df2 = load_all_parquet_chunks(args.parquet2)
-    # query_df = load_all_parquet_chunks(args.parquet3)
-    train_df1 = pd.read_parquet(args.parquet1)
-    train_df2 = pd.read_parquet(args.parquet2)
-    query_df = pd.read_parquet(args.parquet3)
+    train_df1 = load_all_parquet_chunks(args.parquet1)
+    train_df2 = load_all_parquet_chunks(args.parquet2)
+    query_df = load_all_parquet_chunks(args.parquet3)
+    # train_df1 = pd.read_parquet(args.parquet1)
+    # train_df2 = pd.read_parquet(args.parquet2)
+    # query_df = pd.read_parquet(args.parquet3)
 
     print(f"Loaded {len(train_df1):,} reads from {args.label1}.", file=sys.stderr)
     print(f"Loaded {len(train_df2):,} reads from {args.label2}.", file=sys.stderr)
@@ -1084,24 +1188,25 @@ def main():
             #     model_dict[gname], row['read_id'], row['chrom'],
             #     row['edit_string'], row['absolute_indices'], gpos_to_tx, use_prior=True
             # ))
-            rows.extend(classify_positions_windowed(
+            rows.extend(classify_positions_windowed2(
                 model_dict[gname], row['read_id'], row['chrom'],
                 row['edit_string'], row['absolute_indices'], gpos_to_tx,
                 window=args.window, coord="tx", use_prior=True
             ))
         df = pd.DataFrame(rows)
         df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
-        # plot_pb_by_tx_pyx(
-        #     gname, df, his_positions, tx_lo, tx_hi,
-        #     pdf_path=pdf_dir / f"{gname}.pdf",
-        #     label1="P(Shadow)", label2=args.label3,
-        #     ref_cov=model_dict[gname]["covA"]
-        # )
-        plot_signed_log_pyx(
+        plot_pb_by_tx_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}.pdf",
-            label1="P(Protection)", label2=args.label3,
+            label1="P(Shadow)", label2=args.label3,
             ref_cov=model_dict[gname]["covA"]
+        )
+        plot_signed_log_pyx(
+            gname, df, his_positions, tx_lo, tx_hi,
+            pdf_path=pdf_dir / f"{gname}_log.pdf",
+            label1="P(Protection)", label2=args.label3,
+            ref_cov_A=model_dict[gname]["covA"],
+            ref_cov_B=model_dict[gname]["covB"]
         )
         # print(calls_dict)
         # convert to
