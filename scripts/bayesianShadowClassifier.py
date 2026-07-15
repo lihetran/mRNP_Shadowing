@@ -495,9 +495,11 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
         w0[tx] = math.log(1 - a) - math.log(1 - b)  # weight when the bit is 0
 
     nA, nB = len(A_df), len(B_df)
-    prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
+    # prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
+    prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
+    prior_B = 0.2
 
-    return {"w1": w1, "w0": w0, "prior_log_odds": prior_log_odds, "pA": pA, "pB": pB, "covA": covA, "covB": covB}
+    return {"w1": w1, "w0": w0, "prior_A": prior_A, "prior_B": prior_B, "pA": pA, "pB": pB, "covA": covA, "covB": covB}
 
 def classify_read(model, edit_string, absolute_indices, gpos_to_tx, use_prior=True):
     log_odds = model["prior_log_odds"] if use_prior else 0.0
@@ -879,7 +881,7 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     c.writePDFfile(pdf_path)
 
 def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
-                        label1="A", label2="B", ref_cov_A=None, ref_cov_B=None,
+                        label1="A", label2="B", label3="sample", ref_cov_A=None, ref_cov_B=None,
                         tx_col="tx", pa_col="P_A", pb_col="P_B", edit_col="edits",
                         pct=(5, 95), num_reads=10, eps=1e-6):
     from pyx import canvas, graph, color, style, text as pyx_text
@@ -937,7 +939,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     g_meta = graph.graphxy(
         width=panel_w, height=3, xpos=0, ypos=meta_ypos,
         x=graph.axis.linear(min=x_min, max=x_max, title="Position Along Transcript (nt)"),
-        y=graph.axis.linear(min=-y_lim, max=y_lim, title="signed log10 P"),
+        y=graph.axis.linear(min=-y_lim, max=y_lim, title="log10 P(Protection)"),
     )
     draw_his(g_meta); draw_zero(g_meta)
     if xs:
@@ -993,7 +995,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                          pyx_text.size.tiny, col])
         title_y = g_cov.ypos + g_cov.height + 0.4
 
-    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name} - {label2}",
+    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name} - {label3}",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     # ── individual read panels: upper trace / edit ticks / lower trace ───────
@@ -1169,7 +1171,7 @@ def main():
         max_qry = max(max_qry, len(df_qry))
 
         # Two independent coverage thresholds
-        if len(t1) < args.min_coverage:
+        if len(t1) < args.min_coverage or len(t2) < args.min_coverage: # both need to pass
             continue
         if len(df_qry) < args.min_query_reads:
             continue
@@ -1204,7 +1206,8 @@ def main():
         plot_signed_log_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}_log.pdf",
-            label1="P(Protection)", label2=args.label3,
+            label1="P(Protection)", label2=args.label2,
+            label3=args.label3,
             ref_cov_A=model_dict[gname]["covA"],
             ref_cov_B=model_dict[gname]["covB"]
         )
