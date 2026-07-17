@@ -494,12 +494,14 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
         w1[tx] = math.log(a) - math.log(b)  # weight when the bit is 1
         w0[tx] = math.log(1 - a) - math.log(1 - b)  # weight when the bit is 0
 
-    nA, nB = len(A_df), len(B_df)
+    # nA, nB = len(A_df), len(B_df)
     # prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
-    prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
-    prior_B = 0.2
+    prior_A = 0.67 # based off of 50 nt RPF and 150 nt spacing
 
-    return {"w1": w1, "w0": w0, "prior_A": prior_A, "prior_B": prior_B, "pA": pA, "pB": pB, "covA": covA, "covB": covB}
+    return {"pA": pA, "pB": pB, "covA": covA, "covB": covB,
+            "w1": w1, "w0": w0,
+            "prior_A": prior_A,
+            "prior_log_odds": math.log(prior_A / (1 - prior_A))}
 
 def classify_read(model, edit_string, absolute_indices, gpos_to_tx, use_prior=True):
     log_odds = model["prior_log_odds"] if use_prior else 0.0
@@ -611,12 +613,11 @@ def classify_positions_windowed(model, read_id, chrom, edit_string, absolute_ind
 
 def classify_positions_windowed2(model, read_id, chrom, edit_string,
                                 absolute_indices, gpos_to_tx,
-                                window=40, coord="tx", use_prior=True):
-    import math, bisect
+                                window=30, coord="tx", use_prior=True):
     n_edit = len(edit_string)
 
-    # pass 1: collect the scored sites, keeping the RATES (not the weights)
-    sites = []                       # (tx, ref_pos, bit, pA_i, pB_i)
+    # pass 1: collect the scored sites, keeping the RATES
+    sites = []  # (tx, ref_pos, bit, pA_i, pB_i)
     for i, ref_pos in enumerate(absolute_indices):
         if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
             continue
@@ -632,8 +633,9 @@ def classify_positions_windowed2(model, read_id, chrom, edit_string,
         sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
 
     if not sites:
-        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [],
-               "tx": [], "labels": [], "P_A": [], "P_B": [], "win_n": []}
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
+               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
+               "edits": [], "win_n": []}
         return
 
     key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
@@ -643,90 +645,238 @@ def classify_positions_windowed2(model, read_id, chrom, edit_string,
 
     prior_A = model["prior_A"] if use_prior else 0.5
     prior_B = 1.0 - prior_A
+    LN10 = math.log(10.0)
 
-    positions, txs, labels, A, B, win_n = [], [], [], [], [], []
-    for s in sites:                                  # emit in read order
+    positions, txs, labels = [], [], []
+    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
+
+    # pass 2: one centered window per scored site
+    for s in sites:  # emit in read order
         center = key(s)
-        l = bisect.bisect_left(scoords,  center - half)
+        l = bisect.bisect_left(scoords, center - half)
         r = bisect.bisect_right(scoords, center + half)
-        win = ordered[l:r]                           # the sites in this window
+        win = ordered[l:r]  # the sites in this window
+        n = len(win)
 
-        # ---- the whole idea, right here ----------------------------------
-        # P(this window's binary string | A)  and  | B
-        logPA = math.log(prior_A)
-        logPB = math.log(prior_B)
+        # ---- likelihoods of THIS window's string under each population -----
+        # natural-log accumulation (no prior here: pure P(region | pop))
+        lnA = 0.0
+        lnB = 0.0
         for (_tx, _rp, bit, pA_i, pB_i) in win:
-            logPA += math.log(pA_i if bit == 1 else 1 - pA_i)
-            logPB += math.log(pB_i if bit == 1 else 1 - pB_i)
+            lnA += math.log(pA_i if bit == 1 else 1 - pA_i)
+            lnB += math.log(pB_i if bit == 1 else 1 - pB_i)
 
-        # normalize: P(A|string) = P(A)P(s|A) / [P(A)P(s|A) + P(B)P(s|B)]
-        m = max(logPA, logPB)                        # log-sum-exp for stability
-        pA_post = math.exp(logPA - m) / (math.exp(logPA - m) + math.exp(logPB - m))
-        # ------------------------------------------------------------------
+        # per-site mean log10 likelihood -> comparable across window sizes
+        logL_A = (lnA / LN10) / n  # negative
+        logL_B = (lnB / LN10) / n  # negative
 
-        positions.append(s[1]); txs.append(s[0])
-        A.append(pA_post); B.append(1.0 - pA_post)
+        # ---- posterior: P(A | window string), prior applies here -----------
+        pa_num = math.log(prior_A) + lnA
+        pb_num = math.log(prior_B) + lnB
+        m = max(pa_num, pb_num)  # log-sum-exp for stability
+        pA_post = math.exp(pa_num - m) / (math.exp(pa_num - m) + math.exp(pb_num - m))
+
+        positions.append(s[1]);
+        txs.append(s[0])
+        A.append(pA_post);
+        B.append(1.0 - pA_post)
+        lA.append(logL_A);
+        lB.append(logL_B)
         labels.append("A" if pA_post >= 0.5 else "B")
-        win_n.append(len(win))
+        eds.append(s[2]);
+        win_n.append(n)
 
     yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
-           "tx": txs, "labels": labels, "P_A": A, "P_B": B, "win_n": win_n}
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
+           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
 
-# def read_contributions(model, edit_string, absolute_indices, gpos_to_tx):
-#     '''
-#     Returns a list of contribution events. Scores each position
-#     '''
-#     events = []
-#     n_edit = len(edit_string)
-#     for i, ref_pos in enumerate(absolute_indices):
-#         if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-#             continue
-#         ref_pos = int(ref_pos)
-#         if ref_pos not in gpos_to_tx or i >= n_edit:
-#             continue
-#         ev = edit_string[i]
-#         if ev == "2":
-#             continue
-#         tx = gpos_to_tx[ref_pos]
-#         if tx not in model["w1"]:
-#             continue
-#         contrib = model["w1"][tx] if ev == "1" else model["w0"][tx]
-#         events.append({"i": i, "ref_pos": ref_pos, "tx": tx, "contrib": contrib})
-#     return events
-#
-# def sliding_classify(model, edit_string, absolute_indices, gpos_to_tx,
-#                      window, step=1, coord="ref_pos",
-#                      min_positions=1, use_prior=False):
-#     '''
-#     Classify events in read by window. Manually annotates events in a window
-#     '''
-#     import bisect, math
-#     events = read_contributions(model, edit_string, absolute_indices, gpos_to_tx)
-#     if not events:
-#         return []
-#     events.sort(key=lambda e: e[coord])
-#     coords = [e[coord] for e in events]
-#     prefix = [0.0]
-#     for e in events:
-#         prefix.append(prefix[-1] + e["contrib"])
-#     lo_c, hi_c = coords[0], coords[-1]
-#     base = model["prior_log_odds"] if use_prior else 0.0
-#
-#     results = []
-#     start = lo_c
-#     while start <= hi_c:
-#         end = start + window
-#         l = bisect.bisect_left(coords, start)
-#         r = bisect.bisect_left(coords, end)
-#         n = r - l
-#         if n >= min_positions:
-#             log_odds = base + (prefix[r] - prefix[l])
-#             p_A = 1.0 / (1.0 + math.exp(-log_odds))
-#             results.append({"start": start, "end": end, "center": start + window/2,
-#                             "P_A": p_A, "P_B": 1 - p_A,
-#                             "label": "A" if p_A >= 0.5 else "B", "n": n})
-#         start += step
-#     return results
+import math, numpy as np
+
+def classify_positions_hmm(model, read_id, chrom, edit_string,
+                           absolute_indices, gpos_to_tx,
+                           mean_block_nt=30, coord="tx", use_prior=True):
+    '''built with claude'''
+    n_edit = len(edit_string)
+
+    # ---- pass 1: IDENTICAL to the window version -------------------------
+    sites = []                       # (tx, ref_pos, bit, pA_i, pB_i)
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["pA"] or tx not in model["pB"]:
+            continue
+        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
+
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
+               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
+               "edits": [], "win_n": []}
+        return
+
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+    ordered = sorted(sites, key=key)
+    coords  = [key(s) for s in ordered]
+    n = len(ordered)
+
+    # ---- pass 2: HMM instead of windows ----------------------------------
+    occupancy = (1.0 - model["prior_A"]) if use_prior else 0.5   # P(protected)
+    a_BA = 1.0 / mean_block_nt                       # leave protected, per nt
+    a_AB = a_BA * occupancy / (1.0 - occupancy)      # enter protected, per nt
+    T  = np.array([[1 - a_AB, a_AB],
+                   [a_BA,     1 - a_BA]])
+    pi = np.array([1 - occupancy, occupancy])        # [A=unprotected, B=protected]
+
+    # irregular Ref=A spacing: step matrix over the gap between sites
+    Tstep = [np.linalg.matrix_power(T, max(1, int(coords[k] - coords[k-1])))
+             for k in range(1, n)]
+
+    def emis(k):
+        _tx, _rp, bit, pA_i, pB_i = ordered[k]
+        return np.array([pA_i if bit else 1 - pA_i,
+                         pB_i if bit else 1 - pB_i])
+
+    alpha = np.zeros((n, 2)); c = np.zeros(n)
+    v = pi * emis(0); c[0] = v.sum(); alpha[0] = v / c[0]
+    for k in range(1, n):
+        v = (alpha[k-1] @ Tstep[k-1]) * emis(k)
+        c[k] = v.sum(); alpha[k] = v / c[k]
+    beta = np.zeros((n, 2)); beta[-1] = 1.0
+    for k in range(n-2, -1, -1):
+        beta[k] = (Tstep[k] @ (emis(k+1) * beta[k+1])) / c[k+1]
+    post = alpha * beta
+    post /= post.sum(1, keepdims=True)
+
+    # map back to READ order
+    by_coord = {key(s): j for j, s in enumerate(ordered)}
+    positions, txs, labels = [], [], []
+    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
+    for s in sites:
+        j = by_coord[key(s)]
+        pB_post = float(post[j, 1])
+        _tx, _rp, bit, pA_i, pB_i = s
+        positions.append(s[1]); txs.append(s[0])
+        A.append(1.0 - pB_post); B.append(pB_post)
+        lA.append(math.log10(pA_i if bit else 1 - pA_i))   # per-site emission
+        lB.append(math.log10(pB_i if bit else 1 - pB_i))
+        labels.append("B" if pB_post >= 0.5 else "A")
+        eds.append(bit); win_n.append(n)
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
+           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
+
+def classify_positions_hmm2(model, read_id, chrom, edit_string,
+                           absolute_indices, gpos_to_tx,
+                           mean_block_nt=None, coord="tx", use_prior=True):
+    """
+    Two-state HMM over the scored (Ref=A) sites of one read.
+      state A = unprotected (ribosome absent, TadA edits at pA[tx])
+      state B = protected   (ribosome bound, TadA blocked, pB[tx] ~ 0)
+    Emissions are the trained rates, unchanged. Transitions encode
+    'protection comes in contiguous ~mean_block_nt runs at ~occupancy'.
+    """
+    n_edit = len(edit_string)
+
+    # ---- pass 1: collect scored sites (read order) -----------------------
+    sites = []                       # (tx, ref_pos, bit, pA_i, pB_i)
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["pA"] or tx not in model["pB"]:     # need BOTH
+            continue
+        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
+
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
+               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
+               "surprise": [], "edits": [], "win_n": []}
+        return
+
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+
+    # keep an explicit READ-ORDER INDEX alongside each site, so duplicate
+    # coordinates can never collapse into one another
+    indexed = list(enumerate(sites))                     # (read_idx, site)
+    ordered = sorted(indexed, key=lambda p: key(p[1]))   # sorted by coordinate
+    coords  = [key(s) for _ri, s in ordered]
+    n = len(ordered)
+
+    # ---- transitions from biology ---------------------------------------
+    if mean_block_nt is None:
+        mean_block_nt = model.get("rpf_len_nt", 30)
+    occupancy = (1.0 - model["prior_A"]) if use_prior else 0.5
+    a_BA = 1.0 / mean_block_nt                     # exit protected, per nt
+    a_AB = a_BA * occupancy / (1.0 - occupancy)    # enter protected, per nt
+    T  = np.array([[1 - a_AB, a_AB],
+                   [a_BA,     1 - a_BA]])
+    pi = np.array([1 - occupancy, occupancy])
+
+    # gap correction: transition across d nt = T^d
+    Tstep = [np.linalg.matrix_power(T, max(1, int(coords[k] - coords[k-1])))
+             for k in range(1, n)]
+
+    def emis(k):
+        _tx, _rp, bit, pA_i, pB_i = ordered[k][1]
+        return np.array([pA_i if bit else 1 - pA_i,
+                         pB_i if bit else 1 - pB_i])
+
+    # ---- forward-backward, scaled ---------------------------------------
+    alpha = np.zeros((n, 2)); c = np.zeros(n)
+    v = pi * emis(0); c[0] = v.sum(); alpha[0] = v / c[0]
+    for k in range(1, n):
+        v = (alpha[k-1] @ Tstep[k-1]) * emis(k)
+        c[k] = v.sum(); alpha[k] = v / c[k]
+    beta = np.zeros((n, 2)); beta[-1] = 1.0
+    for k in range(n-2, -1, -1):
+        beta[k] = (Tstep[k] @ (emis(k+1) * beta[k+1])) / c[k+1]
+    post = alpha * beta
+    post /= post.sum(1, keepdims=True)
+
+    # ---- map back to READ ORDER by index, not by coordinate --------------
+    pB_by_readidx  = {ri: float(post[j, 1]) for j, (ri, _s) in enumerate(ordered)}
+    sur_by_readidx = {ri: -math.log10(max(float(c[j]), 1e-300))
+                      for j, (ri, _s) in enumerate(ordered)}
+
+    positions, txs, labels = [], [], []
+    A, B, lA, lB, sur, eds, win_n = [], [], [], [], [], [], []
+    for ri, s in enumerate(sites):                  # read order
+        tx, ref_pos, bit, pA_i, pB_i = s
+        pB_post = pB_by_readidx[ri]
+        positions.append(ref_pos); txs.append(tx)
+        A.append(1.0 - pB_post);  B.append(pB_post)
+        lA.append(math.log10(pA_i if bit else 1 - pA_i))   # per-site emission
+        lB.append(math.log10(pB_i if bit else 1 - pB_i))
+        sur.append(sur_by_readidx[ri])                     # -log10 P(bit | past)
+        labels.append("B" if pB_post >= 0.5 else "A")
+        eds.append(bit); win_n.append(n)
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
+           "logL_A": lA, "logL_B": lB, "surprise": sur,
+           "edits": eds, "win_n": win_n}
+
+def maximize_priors(prior_A, prior_B):
+    '''
+    This will find the best priors to maximize the probability of protection. For each, I will iterate through combinations of 0.0 to 1.0 and plug them into my model and choose the
+    prior_A and prior_B that maximize the probability of protection. Step size will be 0.05.
+    '''
+    # best_prior_A = prior_A
+    # best_prior_B = prior_B
+    pass
 
 def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                       label1="A", label2="B", ref_cov=None,
@@ -880,13 +1030,41 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
     c.writePDFfile(pdf_path)
 
+
+
+
 def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
-                        label1="A", label2="B", label3="sample", ref_cov_A=None, ref_cov_B=None,
+                        label1="A", label2="B", label3="sample",
+                        ref_cov_A=None, ref_cov_B=None,
                         tx_col="tx", pa_col="P_A", pb_col="P_B", edit_col="edits",
                         pct=(5, 95), num_reads=10, eps=1e-6):
     from pyx import canvas, graph, color, style, text as pyx_text
     from collections import defaultdict
     import numpy as np, math
+
+    def nice_parter(lim):
+        """explicit tick spacing so PyX never has to SEARCH for a partition"""
+        import math
+        from pyx import graph
+        if not (lim > 0) or math.isinf(lim) or math.isnan(lim):
+            return None
+        raw = lim / 2.0
+        mag = 10.0 ** math.floor(math.log10(raw))
+        for m in (1, 2, 2.5, 5, 10):
+            if raw <= m * mag:
+                return graph.axis.parter.linear(tickdists=[m * mag])
+        return None
+
+    def safe_lim(v, floor=0.2):
+        """guard against nan / inf / zero collapsing the axis"""
+        import math
+        try:
+            v = float(v)
+        except Exception:
+            return floor
+        if math.isnan(v) or math.isinf(v) or v <= 0:
+            return floor
+        return max(v, floor)
 
     col_qry  = color.cmyk(1, 0.5, 0, 0)       # blue  — P_A trace (flipped, +)
     col_pb   = color.cmyk(0.4, 1, 0, 0)       # purple — P_B trace (unflipped, -)
@@ -901,7 +1079,8 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     x_min, x_max = tx_lo, tx_hi
     panel_w, tick_h, read_h, gap, cov_h = 12, 0.25, 1.2, 0.6, 1.5
 
-    # the transform: log-scale the less-likely probability, sign per the rule
+    # the transform: log-scale the less-likely probability, sign per the rule.
+    # NO branching needed -- the likely class collapses to ~0 on its own.
     def yA(pa): return -math.log10(max(pa, eps))     # P_A less likely -> flip -> positive
     def yB(pb): return  math.log10(max(pb, eps))     # P_B less likely -> keep -> negative
 
@@ -910,6 +1089,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     for tx_l, pa_l, pb_l in zip(df[tx_col], df[pa_col], df[pb_col]):
         for t, pa, pb in zip(tx_l, pa_l, pb_l):
             ya_by[int(t)].append(yA(pa)); yb_by[int(t)].append(yB(pb))
+
     items   = sorted(ya_by)
     xs      = list(items)
     ya_mean = [float(np.mean(ya_by[t]))               for t in items]
@@ -920,13 +1100,15 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     yb_hi   = [float(np.percentile(yb_by[t], pct[1])) for t in items]
     cov_self = {t: len(ya_by[t]) for t in items}
 
-    # shared symmetric y-range from all transformed values
-    allv  = [abs(v) for v in ya_hi + yb_lo + ya_mean + yb_mean] or [1.0]
-    y_lim = max(max(allv) * 1.1, 1.0)
+    # INDEPENDENT limits: blue caps ~+3 (evidence asymmetry), purple floors at -6 (eps)
+    hi_vals  = [abs(v) for v in ya_hi + ya_mean] or [1.0]
+    lo_vals  = [abs(v) for v in yb_lo + yb_mean] or [1.0]
+    y_lim_hi = safe_lim(max(hi_vals) * 1.1)
+    y_lim_lo = safe_lim(max(lo_vals) * 1.1)
 
     def draw_his(g):
         for hp in his_positions:
-            g.plot(graph.data.function(f"x(y)={hp}", min=-y_lim, max=y_lim),
+            g.plot(graph.data.function(f"x(y)={hp}", min=-y_lim_lo, max=y_lim_hi),
                    [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
     def draw_zero(g):
         g.plot(graph.data.function("y(x)=0", min=x_min, max=x_max),
@@ -939,7 +1121,8 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     g_meta = graph.graphxy(
         width=panel_w, height=3, xpos=0, ypos=meta_ypos,
         x=graph.axis.linear(min=x_min, max=x_max, title="Position Along Transcript (nt)"),
-        y=graph.axis.linear(min=-y_lim, max=y_lim, title="log10 P(Protection)"),
+        y=graph.axis.linear(min=-y_lim_lo, max=y_lim_hi, title="log10 P(Protection)",
+                            parter=nice_parter(y_lim_lo + y_lim_hi)),
     )
     draw_his(g_meta); draw_zero(g_meta)
     if xs:
@@ -975,24 +1158,24 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         cov_tracks.append((cov_self, col_covA, "query"))
 
     if cov_tracks:
-        cov_y_max = max(max(d.values()) for d, _, _ in cov_tracks) * 1.1
+        cov_y_max = safe_lim(max(max(d.values()) for d, _, _ in cov_tracks) * 1.1, floor=1.0)
         g_cov = graph.graphxy(width=panel_w, height=cov_h, xpos=0, ypos=cov_ypos,
-            x=graph.axis.linkedaxis(g_meta.axes["x"]),
-            y=graph.axis.linear(min=0, max=cov_y_max, title="Ref cov"))
+                              x=graph.axis.linkedaxis(g_meta.axes["x"]),
+                              y=graph.axis.linear(min=0, max=cov_y_max, title="Ref cov",
+                                                  parter=nice_parter(cov_y_max)))
+
         for hp in his_positions:
             g_cov.plot(graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                        [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
         for d, col, _lab in cov_tracks:
-            items_c = sorted(d.items())
-            g_cov.plot(graph.data.points([(t, n) for t, n in items_c], x=1, y=2),
+            g_cov.plot(graph.data.points(sorted(d.items()), x=1, y=2),
                        [graph.style.line([col, style.linewidth.normal, style.linestyle.solid])])
         c.insert(g_cov)
 
         # inline legend, top-left inside the coverage panel
         for kk, (_d, col, lab) in enumerate(cov_tracks):
-            c.text(g_cov.xpos + 0.2, g_cov.ypos + cov_h - 0.18 - kk * 0.28,
-                   lab, [pyx_text.halign.left, pyx_text.valign.top,
-                         pyx_text.size.tiny, col])
+            c.text(g_cov.xpos + 0.2, g_cov.ypos + cov_h - 0.18 - kk * 0.28, lab,
+                   [pyx_text.halign.left, pyx_text.valign.top, pyx_text.size.tiny, col])
         title_y = g_cov.ypos + g_cov.height + 0.4
 
     c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name} - {label3}",
@@ -1015,10 +1198,11 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
         # lower half: unprotected trace (negative), below the ticks
         g_lo = graph.graphxy(width=panel_w, height=half_h, xpos=0, ypos=ypos,
-            x=graph.axis.linkedaxis(g_meta.axes["x"]),
-            y=graph.axis.linear(min=-y_lim, max=0, title=""))
+                             x=graph.axis.linkedaxis(g_meta.axes["x"]),
+                             y=graph.axis.linear(min=-y_lim_lo, max=0, title="",
+                                                 parter=nice_parter(y_lim_lo)))
         for hp in his_positions:
-            g_lo.plot(graph.data.function(f"x(y)={hp}", min=-y_lim, max=0),
+            g_lo.plot(graph.data.function(f"x(y)={hp}", min=-y_lim_lo, max=0),
                       [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
         g_lo.plot(graph.data.points(list(zip(tx_s, ybS)), x=1, y=2),
                   [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.solid])])
@@ -1026,11 +1210,12 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
         # upper half: protected trace (positive), above the ticks
         g_hi = graph.graphxy(width=panel_w, height=half_h, xpos=0,
-            ypos=ypos + half_h + tick_h,
-            x=graph.axis.linkedaxis(g_meta.axes["x"]),
-            y=graph.axis.linear(min=0, max=y_lim, title=""))
+                             ypos=ypos + half_h + tick_h,
+                             x=graph.axis.linkedaxis(g_meta.axes["x"]),
+                             y=graph.axis.linear(min=0, max=y_lim_hi, title="",
+                                                 parter=nice_parter(y_lim_hi)))
         for hp in his_positions:
-            g_hi.plot(graph.data.function(f"x(y)={hp}", min=0, max=y_lim),
+            g_hi.plot(graph.data.function(f"x(y)={hp}", min=0, max=y_lim_hi),
                       [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
         g_hi.plot(graph.data.points(list(zip(tx_s, yaS)), x=1, y=2),
                   [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.solid])])
@@ -1052,6 +1237,9 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         c.text(panel_w + 0.15, ypos + half_h + tick_h / 2., label_txt,
                [pyx_text.valign.middle, pyx_text.size.tiny])
 
+    # print(f"y_lim_hi={y_lim_hi!r}  y_lim_lo={y_lim_lo!r}  "
+    #       f"cov_y_max={cov_y_max if cov_tracks else None!r}")
+    # c.writePDFfile(pdf_path)
     c.writePDFfile(pdf_path)
 
 def parse_args():
@@ -1068,7 +1256,7 @@ def parse_args():
     p.add_argument("--gtf", required=True)
     p.add_argument("--output", default="bernoulliShadow")
     p.add_argument("--window", type=int,   default=30)
-    p.add_argument("--min_coverage", type=float, default=50.0)
+    p.add_argument("--min_coverage", type=float, default=100.0)
     p.add_argument("--min_query_reads", type=int, default=10,
                    help="Minimum number of query (spanning) reads a gene must "
                         "have to be analyzed (default: 10). Separate from "
@@ -1122,7 +1310,7 @@ def main():
         print("His codon filter: ON (genes need >=1 CAT/CAC)",
               file=sys.stderr)
     if args.min_edit_freq > 0.0:
-        print(f"  Query edit-freq filter: ON "
+        print(f"Query edit-freq filter: ON "
               f"(global_edit_freq >= {args.min_edit_freq})", file=sys.stderr)
 
     print("\nParsing GTF...", file=sys.stderr)
@@ -1190,11 +1378,16 @@ def main():
             #     model_dict[gname], row['read_id'], row['chrom'],
             #     row['edit_string'], row['absolute_indices'], gpos_to_tx, use_prior=True
             # ))
-            rows.extend(classify_positions_windowed2(
+            # rows.extend(classify_positions_windowed2(
+            #     model_dict[gname], row['read_id'], row['chrom'],
+            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
+            #     window=args.window, coord="tx", use_prior=False
+            # ))
+            rows.extend(classify_positions_hmm(
                 model_dict[gname], row['read_id'], row['chrom'],
                 row['edit_string'], row['absolute_indices'], gpos_to_tx,
-                window=args.window, coord="tx", use_prior=True
-            ))
+            mean_block_nt=50, coord="tx", use_prior=True)
+            )
         df = pd.DataFrame(rows)
         df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
         plot_pb_by_tx_pyx(
@@ -1206,7 +1399,7 @@ def main():
         plot_signed_log_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}_log.pdf",
-            label1="P(Protection)", label2=args.label2,
+            label1=args.label1, label2=args.label2,
             label3=args.label3,
             ref_cov_A=model_dict[gname]["covA"],
             ref_cov_B=model_dict[gname]["covB"]
