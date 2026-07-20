@@ -1551,6 +1551,7 @@ def main():
         # Train the model on the first two libraries
         model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx)
         print("Trained gene model: ", gname, file=sys.stderr)
+        n_pass += 1
         # Classify
         rows = []
         for _, row in df_qry.iterrows():
@@ -1602,16 +1603,8 @@ def main():
         # print(calls_dict)
         # convert to
 
-
     if shadow_call_frames:
         shadow_df = pd.concat(shadow_call_frames, ignore_index=True)
-        LIST_COLS = ["absolute_indices", "shadow_tx_pos", "shadow_gpos", "shadow_region",
-                     "shadow_P_B", "shadow_P_A",
-                     "shadow_edit", "shadow_ref_cov"]
-        for col in LIST_COLS:
-            if col in shadow_df.columns:
-                shadow_df[col] = shadow_df[col].apply(
-                    lambda v: v if isinstance(v, str) else json.dumps(list(v)))
         shadow_df.to_parquet(shadow_calls_path, index=False)
         print(f"wrote {len(shadow_df)} shadow-call reads across "
               f"{shadow_df['shadow_gene'].nunique()} genes -> {shadow_calls_path}",

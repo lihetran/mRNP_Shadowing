@@ -495,8 +495,6 @@ def parse_args():
     p.add_argument("--label2", default="mock TadA")
     p.add_argument("--ref", required=True)
     p.add_argument("--gtf", required=True)
-    p.add_argument("--output", default="bernoulliShadow")
-    p.add_argument("--window", type=int,   default=30)
     p.add_argument("--min_coverage", type=float, default=100.0)
     p.add_argument("--output", default="gene_models")
 
@@ -553,7 +551,7 @@ def main():
     # write to pickle
     with open(args.output, "wb") as f:
         pickle.dump(model_dict, f)
-
+    print(f"stored model in {args.output}")
 if __name__ == "__main__":
     Tee()
     main()
