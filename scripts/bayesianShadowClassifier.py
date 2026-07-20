@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats
 from logJosh import Tee
+import json
 
 
 HIS_CODONS = {"CAT", "CAC"}
@@ -496,12 +497,16 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
 
     # nA, nB = len(A_df), len(B_df)
     # prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
-    prior_A = 0.67 # based off of 50 nt RPF and 150 nt spacing
+    prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
+
+    transA = train_transitions(A_df, gpos_to_tx, alpha, beta)
+    transB = train_transitions(B_df, gpos_to_tx, alpha, beta)
+
 
     return {"pA": pA, "pB": pB, "covA": covA, "covB": covB,
             "w1": w1, "w0": w0,
             "prior_A": prior_A,
-            "prior_log_odds": math.log(prior_A / (1 - prior_A))}
+            "prior_log_odds": math.log(prior_A / (1 - prior_A)), "transA": transA, "transB": transB}
 
 def classify_read(model, edit_string, absolute_indices, gpos_to_tx, use_prior=True):
     log_odds = model["prior_log_odds"] if use_prior else 0.0
@@ -690,12 +695,115 @@ def classify_positions_windowed2(model, read_id, chrom, edit_string,
            "tx": txs, "labels": labels, "P_A": A, "P_B": B,
            "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
 
-import math, numpy as np
+def train_transitions(ref_df, gpos_to_tx, alpha=1.0, beta=1.0,
+                      edit_col="edit_string", ai_col="absolute_indices"):
+    c = {0: [0, 0], 1: [0, 0]}          # c[prev][cur]
+    first = [0, 0]
+    for row in ref_df.itertuples():
+        es = getattr(row, edit_col); ai = getattr(row, ai_col)
+        seq = []
+        for i, ref_pos in enumerate(ai):
+            if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+                continue
+            ref_pos = int(ref_pos)
+            if ref_pos not in gpos_to_tx or i >= len(es):
+                continue
+            ev = es[i]
+            if ev == "2":
+                continue
+            seq.append((gpos_to_tx[ref_pos], int(ev)))
+        if not seq:
+            continue
+        seq.sort(key=lambda p: p[0])
+        bits = [b for _t, b in seq]
+        first[bits[0]] += 1
+        for prev, cur in zip(bits, bits[1:]):
+            c[prev][cur] += 1
+    def smooth(n1, n0):
+        return (n1 + alpha) / (n0 + n1 + alpha + beta)
+    return {"p1_given0": smooth(c[0][1], c[0][0]),
+            "p1_given1": smooth(c[1][1], c[1][0]),
+            "pi1":       smooth(first[1], first[0])}
+
+def classify_positions_markov(model, read_id, chrom, edit_string,
+                              absolute_indices, gpos_to_tx,
+                              window=30, coord="tx", use_prior=True):
+    n_edit = len(edit_string)
+    sites = []
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["pA"] or tx not in model["pB"]:
+            continue
+        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
+
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
+               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
+               "edits": [], "win_n": []}
+        return
+
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+    ordered = sorted(sites, key=key)
+    scoords = [key(s) for s in ordered]
+    half = window / 2.0
+
+    tA, tB = model["transA"], model["transB"]
+    prior_A = model["prior_A"] if use_prior else 0.5
+    prior_B = 1.0 - prior_A
+    LN10 = math.log(10.0)
+
+    def factor(pop_first, pop_t, bit, prev):
+        if prev is None:
+            return pop_first if bit else 1 - pop_first
+        p1 = pop_t["p1_given1"] if prev else pop_t["p1_given0"]
+        return p1 if bit else 1 - p1
+
+    positions, txs, labels = [], [], []
+    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
+    for s in sites:
+        center = key(s)
+        l = bisect.bisect_left(scoords, center - half)
+        r = bisect.bisect_right(scoords, center + half)
+        win = ordered[l:r]
+        n = len(win)
+
+        lnA = lnB = 0.0
+        prev = None
+        for (_tx, _rp, bit, _pa, _pb) in win:
+            lnA += math.log(factor(tA["pi1"], tA, bit, prev))
+            lnB += math.log(factor(tB["pi1"], tB, bit, prev))
+            prev = bit
+
+        logL_A = (lnA / LN10) / n
+        logL_B = (lnB / LN10) / n
+        pa_num = math.log(prior_A) + lnA
+        pb_num = math.log(prior_B) + lnB
+        m = max(pa_num, pb_num)
+        pA_post = math.exp(pa_num - m) / (math.exp(pa_num - m) + math.exp(pb_num - m))
+
+        positions.append(s[1]); txs.append(s[0])
+        A.append(pA_post); B.append(1.0 - pA_post)
+        lA.append(logL_A);  lB.append(logL_B)
+        labels.append("A" if pA_post >= 0.5 else "B")
+        eds.append(s[2]);   win_n.append(n)
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
+           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
 
 def classify_positions_hmm(model, read_id, chrom, edit_string,
                            absolute_indices, gpos_to_tx,
                            mean_block_nt=30, coord="tx", use_prior=True):
     '''built with claude'''
+    import math, numpy as np
     n_edit = len(edit_string)
 
     # ---- pass 1: IDENTICAL to the window version -------------------------
@@ -869,14 +977,86 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
            "logL_A": lA, "logL_B": lB, "surprise": sur,
            "edits": eds, "win_n": win_n}
 
-def maximize_priors(prior_A, prior_B):
-    '''
-    This will find the best priors to maximize the probability of protection. For each, I will iterate through combinations of 0.0 to 1.0 and plug them into my model and choose the
-    prior_A and prior_B that maximize the probability of protection. Step size will be 0.05.
-    '''
-    # best_prior_A = prior_A
-    # best_prior_B = prior_B
-    pass
+import math
+import numpy as np
+import pandas as pd
+
+def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
+                             ref_cov, gpos_to_tx, tx_to_gpos,
+                             prob_threshold=0.5, min_win_n=1,
+                             cds_start_tx=0, cds_end_tx=None):
+    """
+    Shadow calls in read-level format, mirroring the source parquet schema.
+    Site-anchored: a site is "in shadow" when its posterior P_B >= prob_threshold.
+    Serves all three models (window / Markov / HMM) via the shared P_B schema.
+    """
+    qry_by_id = {row.read_id: row for row in df_qry.itertuples()}
+
+    def region_of(txp):
+        if txp < cds_start_tx:
+            return "UTR5"
+        if cds_end_tx is not None and txp >= cds_end_tx:
+            return "UTR3"
+        return "CDS"
+
+    out_rows = []
+    for rec in records:
+        rid = rec["read_id"]
+
+        prot_idx = [k for k in range(len(rec["tx"]))
+                    if rec["P_B"][k] >= prob_threshold
+                    and rec["win_n"][k] >= min_win_n]
+        if not prot_idx:
+            continue
+
+        src = qry_by_id.get(rid)
+        if src is None:
+            continue
+        src = src._asdict()
+
+        edit_string = src["edit_string"]
+        abs_idx     = src["absolute_indices"]
+        protected_tx = {rec["tx"][k] for k in prot_idx}
+        shadow_chars = []
+        for i, ref_pos in enumerate(abs_idx):
+            if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+                shadow_chars.append("2"); continue
+            ref_pos = int(ref_pos)
+            if i >= len(edit_string) or edit_string[i] == "2":
+                shadow_chars.append("2"); continue
+            tx = gpos_to_tx.get(ref_pos)
+            shadow_chars.append("1" if tx in protected_tx else "0")
+        shadow_string = "".join(shadow_chars)
+
+        tx_pos  = [rec["tx"][k]                   for k in prot_idx]
+        gpos    = [tx_to_gpos.get(rec["tx"][k])   for k in prot_idx]
+        regions = [region_of(t)                   for t in tx_pos]
+        P_B     = [rec["P_B"][k]                  for k in prot_idx]
+        P_A     = [rec["P_A"][k]                  for k in prot_idx]
+        edit    = [rec["edits"][k]                for k in prot_idx]
+        rcov    = [ref_cov.get(rec["tx"][k])      for k in prot_idx]
+
+        row = dict(src)
+        row.pop("Index", None)
+        row.update({
+            "shadow_gene":    gene,
+            "shadow_string":  shadow_string,
+            "shadow_tx_pos":  tx_pos,
+            "shadow_gpos":    gpos,
+            "shadow_region":  regions,
+            "shadow_P_B":     P_B,
+            "shadow_P_A":     P_A,
+            "shadow_edit":    edit,
+            "shadow_ref_cov": rcov,
+            "n_shadow_sites": len(prot_idx),
+            "n_sites_utr5":   regions.count("UTR5"),
+            "n_sites_cds":    regions.count("CDS"),
+            "n_sites_utr3":   regions.count("UTR3"),
+            "max_P_B":        max(P_B),
+        })
+        out_rows.append(row)
+
+    return pd.DataFrame(out_rows)
 
 def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                       label1="A", label2="B", ref_cov=None,
@@ -1334,6 +1514,8 @@ def main():
 
     gene_span_counts = {}  # gname -> n_query_reads (ranking metric)
     model_dict = {} # dictionary to hold model information per passing gene
+    shadow_call_frames = []
+    shadow_calls_path = f"{out}_shadow_calls.parquet"
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{len(gene_names)} scanned, "
@@ -1365,6 +1547,7 @@ def main():
             continue
 
         gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
         tx_lo = min(gpos_to_tx.values())
         tx_hi = max(gpos_to_tx.values())
 
@@ -1383,13 +1566,18 @@ def main():
             #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
             #     window=args.window, coord="tx", use_prior=False
             # ))
-            rows.extend(classify_positions_hmm(
+            # rows.extend(classify_positions_hmm2(
+            #     model_dict[gname], row['read_id'], row['chrom'],
+            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
+            # mean_block_nt=30, coord="tx", use_prior=True)
+            # )
+            rows.extend(classify_positions_markov(
                 model_dict[gname], row['read_id'], row['chrom'],
                 row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            mean_block_nt=50, coord="tx", use_prior=True)
+                window=args.window, coord="tx", use_prior=True)
             )
         df = pd.DataFrame(rows)
-        df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
+        # df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
         plot_pb_by_tx_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}.pdf",
@@ -1404,8 +1592,33 @@ def main():
             ref_cov_A=model_dict[gname]["covA"],
             ref_cov_B=model_dict[gname]["covB"]
         )
+        gene_calls = write_shadow_calls_to_df(
+            gname, df_qry, rows,  # `rows` = the classify records
+            read_edits=None,
+            ref_cov=model_dict[gname]["covA"],
+            gpos_to_tx=gpos_to_tx, tx_to_gpos=tx_to_gpos,
+            prob_threshold=0.5,  # tune per model (HMM wants lower)
+            cds_start_tx=0, cds_end_tx=gene_len,  # your CDS bounds in tx coords
+        )
+        if not gene_calls.empty:
+            shadow_call_frames.append(gene_calls)
         # print(calls_dict)
         # convert to
+
+
+    if shadow_call_frames:
+        shadow_df = pd.concat(shadow_call_frames, ignore_index=True)
+        LIST_COLS = ["absolute_indices", "shadow_tx_pos", "shadow_gpos", "shadow_region",
+                     "shadow_P_B", "shadow_P_A",
+                     "shadow_edit", "shadow_ref_cov"]
+        for col in LIST_COLS:
+            if col in shadow_df.columns:
+                shadow_df[col] = shadow_df[col].apply(
+                    lambda v: v if isinstance(v, str) else json.dumps(list(v)))
+        shadow_df.to_parquet(shadow_calls_path, index=False)
+        print(f"wrote {len(shadow_df)} shadow-call reads across "
+              f"{shadow_df['shadow_gene'].nunique()} genes -> {shadow_calls_path}",
+              file=sys.stderr)
 if __name__ == "__main__":
     Tee()
     main()
