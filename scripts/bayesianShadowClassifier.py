@@ -977,9 +977,6 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
            "logL_A": lA, "logL_B": lB, "surprise": sur,
            "edits": eds, "win_n": win_n}
 
-import math
-import numpy as np
-import pandas as pd
 
 def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
                              ref_cov, gpos_to_tx, tx_to_gpos,
@@ -1564,18 +1561,18 @@ def main():
             # rows.extend(classify_positions_windowed2(
             #     model_dict[gname], row['read_id'], row['chrom'],
             #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            #     window=args.window, coord="tx", use_prior=False
+            #     window=args.window, coord="tx", use_prior=True
             # ))
-            # rows.extend(classify_positions_hmm2(
-            #     model_dict[gname], row['read_id'], row['chrom'],
-            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            # mean_block_nt=30, coord="tx", use_prior=True)
-            # )
-            rows.extend(classify_positions_markov(
+            rows.extend(classify_positions_hmm2(
                 model_dict[gname], row['read_id'], row['chrom'],
                 row['edit_string'], row['absolute_indices'], gpos_to_tx,
-                window=args.window, coord="tx", use_prior=True)
+            mean_block_nt=30, coord="tx", use_prior=True)
             )
+            # rows.extend(classify_positions_markov(
+            #     model_dict[gname], row['read_id'], row['chrom'],
+            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
+            #     window=args.window, coord="tx", use_prior=True)
+            # )
         df = pd.DataFrame(rows)
         # df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
         plot_pb_by_tx_pyx(
