@@ -496,7 +496,7 @@ def parse_args():
     p.add_argument("--ref", required=True)
     p.add_argument("--gtf", required=True)
     p.add_argument("--min_coverage", type=float, default=100.0)
-    p.add_argument("--output", default="gene_models")
+    p.add_argument("--output", default="gene_models.pickle")
 
     return p.parse_args()
 

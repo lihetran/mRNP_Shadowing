@@ -1,406 +1,386 @@
 """
-Liam Tran, July 20, 2026
+shadowSizeQC.py — Liam Tran, July 2026
 
-Script to analyze HMM calls from PS data. Based off of JA's polysomeShadowBinomialBreamQC.py
+Assess protected-region ("shadow") sizes from HMM shadow-call parquets produced
+by bayesianShadowClassifier.py (posterior P_B schema, native list columns).
 
-Input: inFile.gtf - gtf-formatted file containing genome annotations.
-        Will use this to build a dict of format:
-            {strand:{chr:[absIndx:(txtName,relStart,relStop)]}}
-            where relStart is the index relative to the start codon,
-            and relStop is the index relative to the stop codon.
-            Will also use this to derive cds lengths.
-    inFilesParquet.txt - a line-delimited text file of format:
-        fileNamei repi parquetFile
-        for some number (i) of files, where fileNamei is an identifier for the file,
-        and parquetFile is the actual parquetFile. Will compare all fileNamei with
-        the same identifier and different repi during reproducibility analyses.
-        These parquetFiles are from HMM calls from bayesianShadowClassifier.py. They probably contain all
-        the same information from his prior parquetFiles, and also contain shadowcall info.
+Two complementary views:
+  VIEW 1  footprint SIZE at a fixed P_B cutoff (runs merged across small gaps,
+          true genomic-nt size) -> "how big are footprints?"
+  VIEW 2  stringency SWEEP across P_B cutoffs (runs unmerged, padded length)
+          -> "how does calling stringency reshape what I detect?"
 
-Output: graphs of the following:
-     - relationship between probability cutoff and length, number, and location of shadow calls
+Input parquet columns used per read:
+  read_id, gene_strand, absolute_indices, shadow_gpos, shadow_P_B
+  (shadow_P_B is UNFILTERED: one posterior per Ref=A site, gaps visible.)
 
-
-run as python3 metaStartStop.py inFile.gtf inFilesParquet.txt outPrefix
+Run:
+  python3 shadowSizeQC.py inFilesParquet.txt outPrefix
+where inFilesParquet.txt is line-delimited:  fileName  rep  parquetFile
 """
 
-import sys, common, polysomeShadowQC, collections
-from logJosh import Tee
+import sys, math, collections
+import numpy as np
 import pandas as pd
-from pyx import *
 
-def lookupRelPositions(gtfDict,strand,chrom,absIdx):
-    """
-    Given gtfDict of format {strand:{chr:{absIndx:[(txtName,relStart,relStop)]}}},
-    returns (relStart,relStop) for absIdx if exactly one transcript is annotated at
-    that position. If zero or multiple (overlapping) transcripts are annotated there,
-    the site is ambiguous and (None,None) is returned.
-    """
-    entries=gtfDict.get(strand,{}).get(chrom,{}).get(absIdx,[])
-    if len(entries)!=1:
-        return None,None
-    _,relStart,relStop=entries[0]
-    return relStart,relStop
+try:
+    from pyx import canvas, graph, color, style, text as pyx_text
+except ImportError:
+    canvas = None   # plotting optional; extraction still works without pyx
 
-def extractShadows(df,gtfDict,probCutOff,N):
+
+# ─────────────────────────────────────────────────────────────────────────
+# Config (edit to your biology)
+# ─────────────────────────────────────────────────────────────────────────
+PROB_CUTOFFS   = [0.5, 0.6, 0.7, 0.8, 0.9]   # sweep for View 2
+FIXED_CUTOFF   = 0.7                          # single cutoff for View 1
+N_PAD          = 50                           # padding window (aligned-length def)
+MAX_GAP_NT     = 20                           # bridge gaps <= this when merging (View 1)
+SIZE_MEASURE   = "genomic_nt"                 # 'genomic_nt' | 'n_sites' | 'aligned_len'
+SIZE_BIN       = 5                            # bp per bin, View 1
+SIZE_RANGE     = (0, 120)                     # View 1 size axis
+SWEEP_BIN      = 10                           # bp per bin, View 2
+SWEEP_RANGE    = (30, 100)                    # View 2 length axis
+PALETTE        = None                         # list of pyx colors, set after import
+
+def _libcolor(i):
+    return PALETTE[i % len(PALETTE)]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Core extraction
+# ─────────────────────────────────────────────────────────────────────────
+def _read_arrays(row):
+    """Native parquet gives numpy arrays; coerce to clean python scalars."""
+    pb   = [float(x) for x in row.shadow_P_B]
+    gpos = [int(g)   for g in row.shadow_gpos]
+    ai   = row.absolute_indices
+    return pb, gpos, ai
+
+
+def extract_shadow_runs(df, probCutOff, N=N_PAD):
     """
-    This function will execute the bulk of Part 2, per the instructions in the header of
-    plotPvalVersusLengthNumberAndLocation
+    Unmerged protected runs (P_B > cutoff), one break per sub-cutoff site.
+    Each run: read_id, aligned_len (padded), genomic_nt (unpadded), n_sites.
+    Strand-safe; drops NaN positions.
     """
-    shadowDict=collections.defaultdict(list)
-    ##
-    halfN=N//2
+    halfN = N // 2
+    runs = []
     for row in df.itertuples(index=False):
-        shadowGpos=row.shadow_gpos
-        shadowCutOff=row.shadow_P_B
-        numShadowSites=len(shadowGpos)
-        if numShadowSites==0:
-            continue##no candidate shadow sites on this read at any cutoff
-        ##
-        absIndices=row.absolute_indices
-        refSeq=row.ref_sequence_aligned
-        numPos=len(absIndices)
-        ##
-        ##map each genomic position in the read to its index within absIndices/refSeq,
-        ##so that shadow_gpos entries (a subset of absolute_indices) can be located
-        ##within the full aligned read for sequence extraction and N/2 padding.
-        gposToReadIdx={gpos:idx for idx,gpos in enumerate(absIndices)}
-        ##
-        ##scan the (sparse) shadow sites for consecutive runs above the cutoff
-        i=0
-        while i<numShadowSites:
-            if float(shadowCutOff[i])>probCutOff:
-                j=i
-                while j<numShadowSites and float(shadowCutOff[j])>probCutOff:
-                    j+=1
-                ##[i,j) is the contiguous run of significant shadow sites
-                firstReadIdx=gposToReadIdx.get(shadowGpos[i])
-                lastReadIdx=gposToReadIdx.get(shadowGpos[j-1])
-                ##
-                if firstReadIdx is None or lastReadIdx is None:
-                    i=j
-                    continue##couldn't locate this shadow site within the read, skip it
-                ##
-                startI=max(0,firstReadIdx-halfN)
-                endI=min(numPos,lastReadIdx+halfN+1)
-                ##
-                shadowSeq=''.join(refSeq[startI:endI])
-                startIdx=absIndices[startI]
-                endIdx=absIndices[endI-1]
-                ##
-                startRelStart,startRelStop=lookupRelPositions(gtfDict,row.gene_strand,
-                    row.chrom,startIdx)
-                endRelStart,endRelStop=lookupRelPositions(gtfDict,row.gene_strand,
-                    row.chrom,endIdx)
-                ##
-                shadowDict[row.read_id].append({
-                    'shadowSeq':shadowSeq,
-                    'startIdx':startIdx,
-                    'endIdx':endIdx,
-                    'startIdxRelStartOfCDS':startRelStart,
-                    'startIdxRelStopOfCDS':startRelStop,
-                    'endIdxRelStartOfCDS':endRelStart,
-                    'endIdxRelStopOfCDS':endRelStop})
-                ##
-                i=j
+        pb, gpos, ai = _read_arrays(row)
+        n_sh = len(pb)
+        if n_sh == 0:
+            continue
+        absIndices = list(ai)
+        numPos = len(absIndices)
+        g2r = {int(g): idx for idx, g in enumerate(absIndices)
+               if g is not None and g == g}          # drop NaN, int keys
+
+        i = 0
+        while i < n_sh:
+            if pb[i] > probCutOff:
+                j = i
+                while j < n_sh and pb[j] > probCutOff:
+                    j += 1
+                fr, lr = g2r.get(gpos[i]), g2r.get(gpos[j-1])
+                if fr is not None and lr is not None:
+                    lo, hi = sorted((fr, lr))          # minus-strand safe
+                    startI = max(0, lo - halfN)
+                    endI   = min(numPos, hi + halfN + 1)
+                    runs.append({
+                        "read_id":     row.read_id,
+                        "aligned_len": endI - startI,               # padded
+                        "genomic_nt":  abs(gpos[j-1] - gpos[i]) + 1, # unpadded
+                        "n_sites":     j - i,
+                    })
+                i = j
             else:
-                i+=1
-    ##
-    return dict(shadowDict)
+                i += 1
+    return runs
 
 
-def gatherLengthAndCts(tempDict):
+def extract_merged_runs(df, probCutOff, N=N_PAD, max_gap_nt=MAX_GAP_NT):
     """
-    This function will execute the tabulation of shadow sizes and counts, per Part 3
+    Protected runs merged across genomic gaps <= max_gap_nt, so a footprint with
+    a noisy interior site stays one footprint. Each run: read_id, genomic_nt,
+    n_sites. Use for the footprint-SIZE view.
     """
-    lengthAndCts = collections.defaultdict(int)
-    ##
-    for shadowList in tempDict.values():
-        for shadow in shadowList:
-            length = len(shadow['shadowSeq'])
-            lengthAndCts[length] += 1
-    ##
-    return dict(lengthAndCts)
+    runs = []
+    for row in df.itertuples(index=False):
+        pb, gpos, ai = _read_arrays(row)
+        if len(pb) == 0:
+            continue
+        prot = [k for k in range(len(pb)) if pb[k] > probCutOff]
+        if not prot:
+            continue
+        groups = [[prot[0]]]
+        for k in prot[1:]:
+            if abs(gpos[k] - gpos[groups[-1][-1]]) <= max_gap_nt:
+                groups[-1].append(k)
+            else:
+                groups.append([k])
+        for grp in groups:
+            g_first, g_last = gpos[grp[0]], gpos[grp[-1]]
+            runs.append({
+                "read_id":    row.read_id,
+                "genomic_nt": abs(g_last - g_first) + 1,
+                "n_sites":    len(grp),
+            })
+    return runs
 
 
-def gatherPositionCts(tempDict):
-    """
-    This function will execute the tabulation of shadows as they occur in
-    TL/CDS/UTR, per Part 3
-    """
-    positionCts = {'TL': 0, 'CDS': 0, 'UTR3': 0}
-    ##
-    for shadowList in tempDict.values():
-        for shadow in shadowList:
-            startRelStart = shadow['startIdxRelStartOfCDS']
-            endRelStart = shadow['endIdxRelStartOfCDS']
-            startRelStop = shadow['startIdxRelStopOfCDS']
-            endRelStop = shadow['endIdxRelStopOfCDS']
-            ##
-            if None in (startRelStart, endRelStart, startRelStop, endRelStop):
-                continue  ##couldn't place this shadow in the gtfDict, skip it
-            ##
-            if endRelStart <= -25:
-                positionCts['TL'] += 1
-            elif startRelStart >= 25 and endRelStop <= -25:
-                positionCts['CDS'] += 1
-            elif startRelStop >= 25:
-                positionCts['UTR3'] += 1
-    ##
-    return positionCts
+# ─────────────────────────────────────────────────────────────────────────
+# Histogramming
+# ─────────────────────────────────────────────────────────────────────────
+def _bin(sizes, lo, hi, bin_width):
+    edges = list(range(lo, hi + bin_width, bin_width))
+    counts = collections.defaultdict(int)
+    for s in sizes:
+        if lo <= s <= hi:
+            counts[lo + ((s - lo) // bin_width) * bin_width] += 1
+    return dict(counts), edges
 
 
-def mkLengthAndCountPlot(shadowDict, outPrefix):
+def footprint_size_hist(df, probCutOff, N=N_PAD, max_gap_nt=MAX_GAP_NT,
+                        measure=SIZE_MEASURE, bin_width=SIZE_BIN, size_range=SIZE_RANGE):
+    runs  = extract_merged_runs(df, probCutOff, N, max_gap_nt)
+    sizes = [r[measure] for r in runs]
+    counts, edges = _bin(sizes, size_range[0], size_range[1], bin_width)
+    return counts, edges, sizes
+
+
+def stringency_sweep_hist(df, probCutOffs=PROB_CUTOFFS, N=N_PAD,
+                          measure="aligned_len", bin_width=SWEEP_BIN,
+                          size_range=SWEEP_RANGE):
+    lo, hi = size_range
+    out = {}
+    for cut in probCutOffs:
+        runs  = extract_shadow_runs(df, cut, N)
+        sizes = [r[measure] for r in runs]
+        counts, edges = _bin(sizes, lo, hi, bin_width)
+        out[cut] = counts
+        print("    cutoff %.2f: %d runs, %d in [%d,%d]"
+              % (cut, len(runs), sum(counts.values()), lo, hi), file=sys.stderr)
+    return out, edges
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Plotting
+# ─────────────────────────────────────────────────────────────────────────
+def _nice(lim):
+    raw = lim / 2.
+    mag = 10. ** math.floor(math.log10(raw)) if raw > 0 else 1
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag:
+            return graph.axis.parter.linear(tickdists=[m * mag])
+    return None
+
+
+def plot_footprint_sizes(lib_hists_by_cut, edges, pdf_path,
+                         measure=SIZE_MEASURE, bin_width=SIZE_BIN, merged=True):
     """
-    This function will execute Part 4: for each pvalCutoff, plot the number of shadow
-    calls of each length, as a vertical array of plots (linked x-axes, x in [30,100]),
-    one libraryID per line (same color across graphs), key top right and just outside
-    of the array of graphs. The y-axis is log-scaled; lengths with zero shadow calls
-    are floored to a small positive value so they can still be plotted on that scale.
+    Multi-panel footprint SIZE figure, laid out like the stringency sweep:
+    one panel per P_B cutoff (low at bottom, high at top), linked x-axes; within
+    each panel one line per library (consistent color across panels), normalized
+    to frequency. Key on the top panel.
+
+    lib_hists_by_cut: {cutoff: {libraryID: (counts_dict, sizes_list)}}
+    merged: only affects the title annotation (the histograms are already
+            built merged or unmerged by the caller).
     """
-    FLOOR = 0.5  ##stand-in for zero counts on the log-scaled y-axis
-    lengths = list(range(30, 101))
-    ##
-    pvalCutoffs = sorted(shadowDict.keys())  ##low (bottom) to high (top)
-    libraryIDs = sorted({libraryID for cutoff in shadowDict for libraryID in shadowDict[cutoff]})
-    ##
-    ##find a common y-axis max across every cutoff/library/length so all graphs share a scale
-    maxCt = 0
-    for cutoff in pvalCutoffs:
-        for libraryID in libraryIDs:
-            lengthAndCts = shadowDict[cutoff].get(libraryID, {}).get('lengthAndCts', {})
-            for length, ct in lengthAndCts.items():
-                if 30 <= length <= 100:
-                    maxCt = max(maxCt, ct)
-    ymax = maxCt / 0.9 if maxCt > 0 else 1
-    ##
-    c = canvas.canvas()
-    bottomGraph = None
-    for ii, cutoff in enumerate(pvalCutoffs):
-        isTopGraph = (ii == len(pvalCutoffs) - 1)
-        ##
-        if bottomGraph is None:
-            xAxis = graph.axis.linear(min=30, max=100, title='Shadow length (nt)')
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
+    cutoffs = sorted(lib_hists_by_cut)
+    libIDs  = sorted({lib for h in lib_hists_by_cut.values() for lib in h})
+    lefts   = edges[:-1]
+    centers = [e + bin_width / 2. for e in lefts]
+    unit    = {"genomic_nt": "nt", "n_sites": "Ref=A sites",
+               "aligned_len": "aligned nt"}[measure]
+    pw, ph, vgap = 10, 2.4, 0.5
+
+    # shared y-max (frequency) across every cutoff/library/bin
+    ymax = 0.0
+    for cut in cutoffs:
+        for libID, (counts, _sizes) in lib_hists_by_cut[cut].items():
+            tot = sum(counts.values()) or 1
+            for e in lefts:
+                ymax = max(ymax, counts.get(e, 0) / tot)
+    ymax = (ymax or 1) * 1.15
+
+    tag = "merged" if merged else "unmerged"
+    c = canvas.canvas(); bottom = None
+    for ii, cut in enumerate(cutoffs):                 # low at bottom, high at top
+        ypos = ii * (ph + vgap)
+        is_top = (ii == len(cutoffs) - 1)
+        if bottom is None:
+            xax = graph.axis.linear(min=edges[0], max=edges[-1],
+                                    title="Footprint size (%s, %s)" % (unit, tag))
         else:
-            xAxis = graph.axis.linkedaxis(bottomGraph.axes['x'], painter=None)
-        ##
-        graphKwargs = {'width': 12, 'height': 3, 'ypos': ii * 3.5,
-                       'x': xAxis,
-                       'y': graph.axis.log(min=FLOOR, max=ymax, title=r'Ct, P$_B$ $>$ %s' % cutoff)}
-        if isTopGraph:
-            graphKwargs['key'] = graph.key.key(pos='tr', hinside=0)
-        g = graph.graphxy(**graphKwargs)
-        ##
-        for libIdx, libraryID in enumerate(libraryIDs):
-            lengthAndCts = shadowDict[cutoff].get(libraryID, {}).get('lengthAndCts', {})
-            ##every length in the plotted range gets a point; missing/zero-count
-            ##lengths are floored so the line stays visible on the log-scaled axis
-            lineData = [(length, lengthAndCts.get(length, 0) or FLOOR) for length in lengths]
-            g.plot(graph.data.points(lineData, x=1, y=2, title=libraryID),
-                   [graph.style.line([common.colors(libIdx)])])
+            xax = graph.axis.linkedaxis(bottom.axes["x"], painter=None)
+        gkw = dict(width=pw, height=ph, xpos=0, ypos=ypos, x=xax,
+                   y=graph.axis.linear(min=0, max=ymax, parter=_nice(ymax),
+                                       title=r"freq, P$_B>$%s" % cut))
+        if is_top:
+            gkw["key"] = graph.key.key(pos="tr", hinside=0)
+        g = graph.graphxy(**gkw)
+        for i, libID in enumerate(libIDs):
+            counts, sizes = lib_hists_by_cut[cut].get(libID, ({}, []))
+            tot = sum(counts.values()) or 1
+            if is_top:
+                med = np.median(sizes) if sizes else 0
+                title = r"%s (med %.0f, n=%d)" % (libID.replace("_", r"\_"),
+                                                  med, len(sizes))
+            else:
+                title = None
+            g.plot(graph.data.points([(ctr, counts.get(e, 0) / tot)
+                                      for ctr, e in zip(centers, lefts)],
+                                     x=1, y=2, title=title),
+                   [graph.style.line([_libcolor(i), style.linewidth.Thick])])
         c.insert(g)
-        if bottomGraph is None:
-            bottomGraph = g
-    ##
-    c.writePDFfile(outPrefix)
+        if bottom is None:
+            bottom = g
+    c.writePDFfile(str(pdf_path))
 
 
-def mkPositionCountPlot(shadowDict, outPrefix):
+def plot_stringency_sweep(lib_hists, edges, pdf_path, bin_width=SWEEP_BIN,
+                          normalize=True):
     """
-    This function will execute Part 5: for each pvalCutoff, plot a nested bar graph
-    (TL/CDS/UTR3 bars placed side-by-side within each libraryID's group), vertically
-    arrayed as in Part 4. The y-axis is log-scaled; regions with zero shadow calls
-    are floored to a small positive value so they can still be plotted on that scale.
+    lib_hists: {libraryID: {cutoff: counts_dict}}. Vertical array of panels, one
+    per cutoff (low at bottom, high at top), linked x-axes; within each panel one
+    line per library (same color across panels). Key on the top panel, outside.
     """
-    FLOOR = 0.5  ##stand-in for zero counts on the log-scaled y-axis
-    regions = ['TL', 'CDS', 'UTR3']
-    regionColors = [common.colors(0), common.colors(1), common.colors(2)]
-    ##
-    pvalCutoffs = sorted(shadowDict.keys())
-    libraryIDs = sorted({libraryID for cutoff in shadowDict for libraryID in shadowDict[cutoff]})
-    ##
-    ##find a common y-axis max across cutoffs/libraries/regions
-    maxCt = 0
-    for cutoff in pvalCutoffs:
-        for libraryID in libraryIDs:
-            positionCts = shadowDict[cutoff].get(libraryID, {}).get('positionCts', {})
-            for region in regions:
-                maxCt = max(maxCt, positionCts.get(region, 0))
-    ymax = maxCt / 0.9 if maxCt > 0 else 1
-    ##
-    c = canvas.canvas()
-    bottomGraph = None
-    for ii, cutoff in enumerate(pvalCutoffs):
-        isTopGraph = (ii == len(pvalCutoffs) - 1)
-        ##
-        if bottomGraph is None:
-            xAxis = graph.axis.nestedbar(title='Library')
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
+    libIDs  = sorted(lib_hists)
+    cutoffs = sorted({c for h in lib_hists.values() for c in h})
+    lefts   = edges[:-1]
+    centers = [e + bin_width / 2. for e in lefts]
+    pw, ph, vgap = 10, 2.4, 0.5
+
+    # shared y-max across every library/cutoff/bin
+    ymax = 0.0
+    for libID in libIDs:
+        for cut in cutoffs:
+            counts = lib_hists[libID].get(cut, {})
+            tot = sum(counts.values()) if normalize else 1
+            for e in lefts:
+                ymax = max(ymax, counts.get(e, 0) / (tot or 1))
+    ymax = (ymax or 1) * 1.15
+    ylab = "frequency" if normalize else "count"
+
+    c = canvas.canvas(); bottom = None
+    for ii, cut in enumerate(cutoffs):                 # low at bottom, high at top
+        ypos = ii * (ph + vgap)
+        is_top = (ii == len(cutoffs) - 1)
+        if bottom is None:
+            xax = graph.axis.linear(min=edges[0], max=edges[-1],
+                                    title="Shadow length (aligned nt)")
         else:
-            xAxis = graph.axis.linkedaxis(bottomGraph.axes['x'], painter=None)
-        ##
-        graphKwargs = {'width': 12, 'height': 3, 'ypos': ii * 3.5,
-                       'x': xAxis,
-                       'y': graph.axis.log(min=FLOOR, max=ymax, title='Ct, -log10(p)>%s' % cutoff)}
-        if isTopGraph:
-            graphKwargs['key'] = graph.key.key(pos='tr', hinside=0)
-        g = graph.graphxy(**graphKwargs)
-        ##
-        for regionIdx, region in enumerate(regions):
-            barData = []
-            for libraryID in libraryIDs:
-                positionCts = shadowDict[cutoff].get(libraryID, {}).get('positionCts', {})
-                ##zero-count regions are floored so they still render on the log-scaled axis
-                barData.append(((libraryID, region), positionCts.get(region, 0) or FLOOR))
-            g.plot(graph.data.points(barData, xname=1, y=2, title=region),
-                   [graph.style.bar([regionColors[regionIdx]])])
+            xax = graph.axis.linkedaxis(bottom.axes["x"], painter=None)
+        gkw = dict(width=pw, height=ph, xpos=0, ypos=ypos, x=xax,
+                   y=graph.axis.linear(min=0, max=ymax, parter=_nice(ymax),
+                                       title=r"%s, P$_B>$%s" % (ylab, cut)))
+        if is_top:
+            gkw["key"] = graph.key.key(pos="tr", hinside=0)
+        g = graph.graphxy(**gkw)
+        for i, libID in enumerate(libIDs):
+            counts = lib_hists[libID].get(cut, {})
+            tot = sum(counts.values()) if normalize else 1
+            title = libID.replace("_", r"\_") if is_top else None
+            g.plot(graph.data.points([(ctr, counts.get(e, 0) / (tot or 1))
+                                      for ctr, e in zip(centers, lefts)],
+                                     x=1, y=2, title=title),
+                   [graph.style.line([_libcolor(i), style.linewidth.Thick])])
         c.insert(g)
-        ##
-        if bottomGraph is None:
-            bottomGraph = g
-    ##
-    c.writePDFfile(outPrefix)
+        if bottom is None:
+            bottom = g
+    c.writePDFfile(str(pdf_path))
 
 
-def plotPvalVersusLengthNumberAndLocation(gtfDict, parquetFiles, outPrefix, N=30):
-    """
-    gtfDict is of the format:
-    {strand:{chr:{absIndx:[(txtName,relStart,relStop)]}}}
+# ─────────────────────────────────────────────────────────────────────────
+# Driver
+# ─────────────────────────────────────────────────────────────────────────
+def _size_hist(df, cutoff, merged):
+    """Footprint-size histogram for one library at one cutoff, merged or not."""
+    if merged:
+        runs = extract_merged_runs(df, cutoff, N_PAD, MAX_GAP_NT)
+    else:
+        runs = extract_shadow_runs(df, cutoff, N_PAD)
+    sizes = [r[SIZE_MEASURE] for r in runs]
+    counts, edges = _bin(sizes, SIZE_RANGE[0], SIZE_RANGE[1], SIZE_BIN)
+    return counts, edges, sizes
 
-    parquetFiles is of the format:
-    fileNamei repi parquetFile
-    Will first make a libraryID=fileNamei-repi
 
-    N=30(default) is the window that was used in the shadow calling for pval computation
+def analyze_library(parquetFile, libraryID):
+    """Return per-cutoff size hists (merged & unmerged) + the sweep, for one lib."""
+    print("Loading %s (%s)..." % (parquetFile, libraryID), file=sys.stderr)
+    df = pd.read_parquet(parquetFile)          # native columns, no JSON decode
 
-    Each parquetFile will have the following fields:
-    'chrom', 'gene_strand', 'is_reverse', 'transcript_id', 'gene_name',
-       'gene_biotype', 'read_id', 'read_start', 'read_end', 'edit_string',
-       'barcode', 'bar_seq', 'read_sequence', 'read_sequence_aligned',
-       'ref_sequence_aligned', 'aligned_pairs', 'absolute_indices',
-       'global_edit_freq', 'n_a_positions', 'shadow_string', 'shadow_tx_pos',
-       'shadow_gpos', 'shadow_pval', 'shadow_neg_log10p', 'shadow_edit',
-       'shadow_ref_cov', 'n_shadow_sites', 'min_pval'
+    merged_by_cut   = {}    # cutoff -> (counts, sizes)
+    unmerged_by_cut = {}
+    edges = None
+    for cut in PROB_CUTOFFS:
+        mc, edges, ms = _size_hist(df, cut, merged=True)
+        uc, _, us = _size_hist(df, cut, merged=False)
+        merged_by_cut[cut]   = (mc, ms)
+        unmerged_by_cut[cut] = (uc, us)
+    # console summary at the fixed cutoff
+    if FIXED_CUTOFF in merged_by_cut:
+        ms = merged_by_cut[FIXED_CUTOFF][1]
+        if ms:
+            print("    P_B>%s merged: n=%d median=%.0f IQR=[%.0f,%.0f]"
+                  % (FIXED_CUTOFF, len(ms), np.median(ms),
+                     np.percentile(ms, 25), np.percentile(ms, 75)), file=sys.stderr)
 
-    Each row of the parquetFile is a read, with each position in that read having some
-        shadowCall/statistics. This function will mostly pay attention to 'shadow_neg_log10p',
-        which is the negative log_10 of 'shadow_pval'.
+    sweep_hist, sweep_edges = stringency_sweep_hist(df)
+    return merged_by_cut, unmerged_by_cut, edges, sweep_hist, sweep_edges
 
-        'shadow_gpos' and 'shadow_neg_log10p' are lists of values that contain a shadow_neg_log10p
-        value that has passed initial significance threshold. The goal of this function is to explore
-        effects of additional significance thresholds. The 'shadow_gpos' values are values that correspond
-        to 'absolute_indices', absolute genomic indices.
-
-    The overall goal of this function is to explore the effect different p-value cutoffs (by
-        restricting to positions that have shadow_neg_log10p>theCutoff) and analyzing the
-        resulting calls. This will happen in several parts:
-
-    Part 1: load the parquetFiles into memory
-
-    Part 2: Combine overlapping shadows according to various pval cutoffs
-    For each entry in a hard-coded list of neg_log10p values,
-    this function will loop through every read_id in every library. If a consecutive
-    group of bases exist after zipping shadow_gpos and shadow_neg_log10p
-    with shadow_neg_log10p all above neg_log10p_cutoff, then that consecutive group of bases
-    is a contiguous shadow. The nucleotide sequence of the shadow is the sequence of nucleotides
-    from ref_sequence_aligned of these bases, which can be obtained by zipping 'absolute_indices' and
-    'ref_sequence_aligned', including -N/2 bases upstream from the first nucleotide
-    with a significant pval, and +N/2 bases downstream from the last nucleotide with a significant pval.
-
-    At this point, for every pval cutoff there will be an object of the format:
-    {libraryID:{read_id:[shadowList]}}
-    where each entry in shadowList will be of the format:
-    {'shadowSeq': sequence of the nts involved in the call, which will be at least N nts long,
-    'startIdx':first nt of the call in genomic space,
-     'endIdx':last nt of the call in genomic space,
-      'startIdxRelStartOfCDS':first nt of the call in relStart space,
-       'startIdxRelStopOfCDS':first nt of the call in relStop space,
-       'endIdxRelStartOfCDS':last nt of the call in relStart space,
-       'endIdxRelStopOfCDS':last nt of the call in relStop space}
-    To obtain the information for startIdxRelStartOfCDS, startIdxRelStopOfCDS, endIdxRelStartOfCDS,
-        and endIdxRelStopOfCDS, look up the relevant positions in the gtfDict.
-
-    Within the for loop containing each pval cutoff, the script will then gather summary data
-    in Part 3.
-
-    Part 3: Gather the following summary data about every shadowList entry:
-     - the number and length of every shadow call, in format:
-        lengthAndCts={libraryID:{length:ct}}
-     - the number of shadow calls in each region of the gene:
-        positionCts={libraryID:{'TL':ct1,'CDS':ct2,'UTR3':ct3}}
-        where: TL is endIdxRelStartOfCDS in range (-inf,-25]
-                CDS is startIdxRelStartOfCDS>=25 and endIdxRelStopOfCDS<=-25
-                UTR3 is startIdxRelStopOfCDS in range [+25,+inf)
-
-    At this point there will be one large object--a dataframe or a nested dict--with information:
-        {pvalCutoff:{'lengthAndCts':lengthAndCts,'positionCts':positionCts}}
-    These data will be plotted in Part 4 & Part 5
-
-    Part 4: Plot the length and cts
-    For each pvalCutoff, plot the number of shadow calls of each length. Do this as a vertical array
-        of plots with linked x-axes. The x-axes contains the length, and ranges from [30,100].
-        The y-axis contains the counts. Keep all y-axes on the same scale. Array the plots vertically
-        from low pval cutoff (less significant) on the bottom to higher pval cutoff (more significant)
-        near the top. Within each graph, have a different libraryID as a single line, and keep those
-        lines the same colors across all graphs. Show the key to the top right and just outside the
-        array of graphs.
-
-    Part 5: Plot where shadow calls are
-    For each pvalCutoff, for each libraryID, plot the number of shadow calls in each of TL/CDS/UTR.
-        Do this as a stacked bar graph where each bar is a different libraryID, and TL/CDS/UTR
-        are different stacks on the same bar. Do formatting as with Part 4, but now the x-axes will
-        be libraryID rather than length. As with Part 4, vertically array different p-value cutoffs
-        and keep the y-axes of the individal plots on the same scale.
-
-    """
-    ##list pvalue cutoffs
-    probCutOffs = [0.5, 0.6, 0.7, 0.8, 0.9]
-    ##initialize dictionary
-    ##will be of the format:
-    ##{pvalCutoff:{libraryID:{readID:[shadowList]}}}
-    shadowDict = collections.defaultdict(lambda: collections.defaultdict(dict))
-    ##
-    with open(parquetFiles, 'r') as f:
-        for line in f:
-            line = line.strip().split()
-            fileName, repName, parquetFile = line[0:]
-            libraryID = '%s-%s' % (fileName, repName)
-            ##
-            ##Part 1: Load files into memory
-            print('Analyzing parquetFile %s...' % (parquetFile))
-            df = pd.read_parquet(parquetFile)
-            ##
-            ##Part 2: Combine overlapping shadows according to various pval cutoffs
-            for cutoff in probCutOffs:
-                print('Working on probCutOff: %s...' % (cutoff))
-                tempDict = extractShadows(df, gtfDict, cutoff, N)
-                ##
-                ##Part 3: Gather summary data about every shadowList entry:
-                ##lengthAndCts
-                lengthAndCts = gatherLengthAndCts(tempDict)
-                ##positionCts
-                positionCts = gatherPositionCts(tempDict)
-                ##
-                ##now save that data
-                shadowDict[cutoff][libraryID] = {'lengthAndCts': lengthAndCts,
-                                                  'positionCts': positionCts}
-    ##
-    ##Part 1-3 complete, now do Part 4
-    mkLengthAndCountPlot(shadowDict, outPrefix + '.lengthAndCts')
-    ##
-    ##Part 4 complete, now do Part 5
-    mkPositionCountPlot(shadowDict, outPrefix + '.positionCts')
 
 def main(args):
-    gtfFile, parquetFiles, outPrefix = args[0:]
-    ##
-    ##first parse the gtf file to a dictionary
-    gtfDict, cdsLengths = polysomeShadowQC.parseGTF(gtfFile)
-    ##gtfDict is of the format:
-    ##{strand:{chr:{absIndx:[(txtName,relStart,relStop)]}}}
-    ##
-    ##now analyze the effect of p-value cutoffs on the footprints
-    plotPvalVersusLengthNumberAndLocation(gtfDict, parquetFiles, outPrefix, 50)
+    global PALETTE
+    if canvas is not None:
+        PALETTE = [color.cmyk(1, 0.5, 0, 0), color.cmyk(0, 1, 1, 0),
+                   color.cmyk(0.4, 1, 0, 0), color.cmyk(1, 0, 1, 0.1),
+                   color.cmyk(0, 0.5, 1, 0), color.cmyk(0.7, 0, 0, 0),
+                   color.cmyk(0, 0, 0, 0.7), color.cmyk(0.3, 0, 1, 0.2)]
 
-if __name__ == '__main__':
-    Tee()
+    parquetList, outPrefix = args[0], args[1]
+
+    # {cutoff: {libID: (counts, sizes)}} for merged and unmerged
+    merged_by_cut   = collections.defaultdict(dict)
+    unmerged_by_cut = collections.defaultdict(dict)
+    sweep_by_lib    = {}
+    fp_edges = sweep_edges = None
+
+    with open(parquetList) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            fileName, rep, parquetFile = parts[0], parts[1], parts[2]
+            libraryID = "%s-%s" % (fileName, rep)
+            mbc, ubc, fpe, swh, swe = analyze_library(parquetFile, libraryID)
+            for cut in mbc:
+                merged_by_cut[cut][libraryID]   = mbc[cut]
+                unmerged_by_cut[cut][libraryID] = ubc[cut]
+            sweep_by_lib[libraryID] = swh
+            fp_edges, sweep_edges = fpe, swe
+
+    if not sweep_by_lib:
+        print("no libraries processed", file=sys.stderr); return
+
+    print("Plotting combined figures across %d libraries..." % len(sweep_by_lib),
+          file=sys.stderr)
+    # View 1a: footprint size, MERGED, multi-panel over cutoffs
+    plot_footprint_sizes(dict(merged_by_cut), fp_edges,
+                         "%s.footprint_sizes.merged" % outPrefix, merged=True)
+    # View 1b: footprint size, UNMERGED, same layout
+    plot_footprint_sizes(dict(unmerged_by_cut), fp_edges,
+                         "%s.footprint_sizes.unmerged" % outPrefix, merged=False)
+    # # View 2: stringency sweep (aligned length)
+    # plot_stringency_sweep(sweep_by_lib, sweep_edges,
+    #                       "%s.stringency_sweep" % outPrefix)
+
+
+if __name__ == "__main__":
     main(sys.argv[1:])

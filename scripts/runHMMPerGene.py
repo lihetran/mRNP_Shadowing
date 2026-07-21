@@ -1,30 +1,3 @@
-'''
-July 10, LT
-
-In order to call ribosome footprints, we are going to build a Bernoulli Naive Bayesian Classifier. To do this, we will estimate whether positions or windows of a translated molecule are more likely to have come from a
-ribosome-less (phenol-extracted, A) population of molecules or an unedited (mock tadA, B) population of molecules.
-
-Step 1: For each gene, build reference frequency table.
-    - do Laplace, plus 1 smoothing
-    - we're going to have 2 frequency tables, one for ribosome-less/TadA and one for mock Tad
-
-Step 2: Estimate class priors
-    - P(A) = 0.8
-    - P(B) = 0.2
-    - It would be cool to do gradient descent to optimize these initial priors, for now these numbers are based on 30 nt RPFs and ~150 nt spacing on RNAs
-
-Step 3: For each read, compute the log-likelihood of the read coming from class A or class B
-    - P(A|C) or P(B|C) where C is new read
-    - do this in a sliding window so that the question is "which class is this window of the read more likely to have come from?"
-Step 4: Call the read as class A or class B based on the log-likelihood
-    - we should have some probability attached to calls that'll let us know how confident we are about said call
-
-Step 5: Output the read calls to a parquet file for downstream analysis
-
-
-
-'''
-
 import argparse
 import sys
 import re
@@ -38,15 +11,29 @@ import pandas as pd
 import scipy.stats
 from logJosh import Tee
 import json
-
+import pickle
 
 HIS_CODONS = {"CAT", "CAC"}
-
 def complement_base(b: str) -> str:
     return b.translate(str.maketrans("ACGTacgt", "TGCAtgca"))
 
 def reverse_complement(seq: str) -> str:
     return seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
+
+def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
+    parquet_dir = Path(parquet_dir)
+    chunks = sorted(parquet_dir.glob("*.parquet"))
+    if not chunks:
+        return pd.DataFrame()
+    dfs = [pd.read_parquet(c) for c in chunks]
+    df  = pd.concat(dfs, ignore_index=True)
+    print(f"  Loaded {len(df):,} reads from {len(chunks)} chunk(s).",
+          file=sys.stderr)
+    return df
+
+def load_model_from_pickle(pickle_path: str) -> dict:
+    with open(pickle_path, "rb") as f:
+        return pickle.load(f)
 
 def parse_gtf(gtf_path: str) -> dict:
     """
@@ -145,6 +132,23 @@ def parse_gtf(gtf_path: str) -> dict:
 def cds_length(gene: dict) -> int:
     return sum(ce - cs for cs, ce in gene["cds"])
 
+def find_his_codon_tx_positions(ref_fasta, gene):
+    chrom, strand = gene["chrom"], gene["strand"]
+    tx_seq = ""
+    for (cs, ce) in gene["cds"]:
+        seg = ref_fasta.fetch(chrom, cs, ce).upper()
+        if strand == "-":
+            seg = reverse_complement(seg)
+        tx_seq += seg
+    his_pos, seen = [], set()
+    for i in range(0, len(tx_seq) - 2, 3):
+        if tx_seq[i:i+3] in HIS_CODONS:
+            p = i + 1
+            if p not in seen:
+                seen.add(p)
+                his_pos.append(p)
+    return his_pos
+
 def _subtract_intervals(exons, cds):
     """
     exons, cds: lists of (start, end) genomic half-open intervals, unsorted.
@@ -168,53 +172,6 @@ def _subtract_intervals(exons, cds):
         if cur < ee:
             out.append((cur, ee))         # trailing piece
     return out
-
-
-def find_his_codon_tx_positions(ref_fasta, gene):
-    chrom, strand = gene["chrom"], gene["strand"]
-    tx_seq = ""
-    for (cs, ce) in gene["cds"]:
-        seg = ref_fasta.fetch(chrom, cs, ce).upper()
-        if strand == "-":
-            seg = reverse_complement(seg)
-        tx_seq += seg
-    his_pos, seen = [], set()
-    for i in range(0, len(tx_seq) - 2, 3):
-        if tx_seq[i:i+3] in HIS_CODONS:
-            p = i + 1
-            if p not in seen:
-                seen.add(p)
-                his_pos.append(p)
-    return his_pos
-
-def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
-    parquet_dir = Path(parquet_dir)
-    chunks = sorted(parquet_dir.glob("*.parquet"))
-    if not chunks:
-        return pd.DataFrame()
-    dfs = [pd.read_parquet(c) for c in chunks]
-    df  = pd.concat(dfs, ignore_index=True)
-    print(f"  Loaded {len(df):,} reads from {len(chunks)} chunk(s).",
-          file=sys.stderr)
-    return df
-
-def find_his_codon_tx_positions(ref_fasta, gene):
-    chrom, strand = gene["chrom"], gene["strand"]
-    tx_seq = ""
-    for (cs, ce) in gene["cds"]:
-        seg = ref_fasta.fetch(chrom, cs, ce).upper()
-        if strand == "-":
-            seg = reverse_complement(seg)
-        tx_seq += seg
-    his_pos, seen = [], set()
-    for i in range(0, len(tx_seq) - 2, 3):
-        if tx_seq[i:i+3] in HIS_CODONS:
-            p = i + 1
-            if p not in seen:
-                seen.add(p)
-                his_pos.append(p)
-    return his_pos
-
 
 def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
@@ -287,99 +244,6 @@ def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
 
     return full
 
-
-def _gpos_to_tx_map(gene, ref_fasta, include_utrs=True):
-    chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
-    strand    = gene["strand"]
-    want      = "A" if strand == "+" else "T"
-
-    def _walk(segments, tx_start):
-        """Yield (gpos, tx_pos) in transcript order, starting at tx_start."""
-        tx = tx_start
-        for (cs, ce) in segments:
-            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
-            for gpos in rng:
-                yield gpos, tx
-                tx += 1
-
-    out = {}
-    for gpos, tx in _walk(gene["cds"], 0):
-        if chrom_seq[gpos] == want:
-            out[gpos] = tx
-
-    if include_utrs:
-        cds_len = cds_length(gene)
-        for gpos, tx in _walk(gene["utr3"], cds_len):
-            if chrom_seq[gpos] == want:
-                out[gpos] = tx
-        # 5'UTR: walk in transcript order, then offset so it ends at -1
-        u5 = list(_walk(gene["utr5"], 0))
-        n5 = len(u5)
-        for gpos, tx in u5:
-            if chrom_seq[gpos] == want:
-                out[gpos] = tx - n5
-
-    return out
-
-def classify_tx(tx_pos, cds_len):
-    if tx_pos < 0: return "UTR5"
-    if tx_pos < cds_len: return "CDS"
-    return "UTR3"
-
-
-def build_reference_freq_and_coverage(df: pd.DataFrame, gpos_to_tx: dict,
-                                       gene: dict) -> tuple:
-    """
-    Returns (ref_freq, ref_cov) where:
-      ref_freq = {tx_pos: p_edit}
-      ref_cov  = {tx_pos: n_reads_with_AG_call}
-    """
-    if df.empty:
-        return {}, {}
-
-    min_gp = min(gpos_to_tx.keys(), default=None)
-    max_gp = max(gpos_to_tx.keys(), default=None)
-    if min_gp is None:
-        return {}, {}
-
-    if "read_start" in df.columns and "read_end" in df.columns:
-        sub = df[(df["read_start"] <= max_gp) & (df["read_end"] >= min_gp)]
-    else:
-        sub = df
-
-    edit_counts = collections.defaultdict(lambda: [0, 0])
-
-    for read in sub.itertuples():
-        edit_str = read.edit_string
-        abs_indices = read.absolute_indices
-        n_edit = len(edit_str)
-
-        for i, ref_pos in enumerate(abs_indices):
-            if ref_pos is None:
-                continue
-            if isinstance(ref_pos, float) and ref_pos != ref_pos:
-                continue
-            ref_pos = int(ref_pos)
-            if ref_pos < min_gp or ref_pos > max_gp:
-                continue
-            if ref_pos not in gpos_to_tx:
-                continue
-            if i >= n_edit:
-                continue
-            ev = edit_str[i]
-            if ev == "2":
-                continue
-            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
-
-    ref_freq = {}
-    ref_cov  = {}
-    for tx, (n0, n1) in edit_counts.items():
-        total = n0 + n1
-        if total > 0:
-            ref_freq[tx] = max(1e-6, min(1 - 1e-6, n1 / total))
-            ref_cov[tx]  = total
-    return ref_freq, ref_cov
-
 def collect_read_edits(df: pd.DataFrame, gpos_to_tx: dict,
                         gene: dict) -> dict:
     """
@@ -425,460 +289,43 @@ def collect_read_edits(df: pd.DataFrame, gpos_to_tx: dict,
 
     return dict(read_edits)
 
-def passes_coverage(df_ref: pd.DataFrame, df_qry: pd.DataFrame,
-                    min_coverage: float) -> bool:
-    """
-    Use read count as a fast coverage proxy. Both libraries must have at
-    least min_coverage reads overlapping the gene.
-    """
-    return len(df_ref) >= min_coverage and len(df_qry) >= min_coverage
+def _gpos_to_tx_map(gene, ref_fasta, include_utrs=True):
+    chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
+    strand    = gene["strand"]
+    want      = "A" if strand == "+" else "T"
 
-def build_frequency_df(df: pd.DataFrame, gpos_to_tx: dict, alpha=1, beta=1):
-    '''
-    Very similar to build reference freq and coverage but going to apply Laplace smoothing
-    '''
-    if df.empty:
-        return {}, {}
+    def _walk(segments, tx_start):
+        """Yield (gpos, tx_pos) in transcript order, starting at tx_start."""
+        tx = tx_start
+        for (cs, ce) in segments:
+            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
+            for gpos in rng:
+                yield gpos, tx
+                tx += 1
 
-    min_gp = min(gpos_to_tx.keys(), default=None)
-    max_gp = max(gpos_to_tx.keys(), default=None)
-    if min_gp is None:
-        return {}, {}
+    out = {}
+    for gpos, tx in _walk(gene["cds"], 0):
+        if chrom_seq[gpos] == want:
+            out[gpos] = tx
 
-    if "read_start" in df.columns and "read_end" in df.columns:
-        sub = df[(df["read_start"] <= max_gp) & (df["read_end"] >= min_gp)]
-    else:
-        sub = df
+    if include_utrs:
+        cds_len = cds_length(gene)
+        for gpos, tx in _walk(gene["utr3"], cds_len):
+            if chrom_seq[gpos] == want:
+                out[gpos] = tx
+        # 5'UTR: walk in transcript order, then offset so it ends at -1
+        u5 = list(_walk(gene["utr5"], 0))
+        n5 = len(u5)
+        for gpos, tx in u5:
+            if chrom_seq[gpos] == want:
+                out[gpos] = tx - n5
 
-    edit_counts = collections.defaultdict(lambda: [0, 0])
+    return out
 
-    for read in sub.itertuples():
-        edit_str = read.edit_string
-        abs_indices = read.absolute_indices
-        n_edit = len(edit_str)
-
-        for i, ref_pos in enumerate(abs_indices):
-            if ref_pos is None:
-                continue
-            if isinstance(ref_pos, float) and ref_pos != ref_pos:
-                continue
-            ref_pos = int(ref_pos)
-            if ref_pos < min_gp or ref_pos > max_gp:
-                continue
-            if ref_pos not in gpos_to_tx:
-                continue
-            if i >= n_edit:
-                continue
-            ev = edit_str[i]
-            if ev == "2":
-                continue
-            edit_counts[gpos_to_tx[ref_pos]][int(ev)] += 1
-
-    ref_freq = {}
-    ref_cov = {}
-    for tx, (n0, n1) in edit_counts.items():
-        total = n0 + n1
-        if total > 0:
-            # Laplace / Beta(alpha, beta) smoothing:
-            #   alpha = pseudocount of 1s, beta = pseudocount of 0s
-            ref_freq[tx] = (n1 + alpha) / (total + alpha + beta)
-            ref_cov[tx] = total  # coverage stays the RAW count
-    return ref_freq, ref_cov
-
-def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
-    pA, covA = build_frequency_df(A_df, gpos_to_tx, alpha, beta)
-    pB, covB = build_frequency_df(B_df, gpos_to_tx, alpha, beta)
-
-    w1, w0 = {}, {}
-    for tx in pA.keys() & pB.keys():  # positions BOTH populations saw
-        a, b = pA[tx], pB[tx]
-        w1[tx] = math.log(a) - math.log(b)  # weight when the bit is 1
-        w0[tx] = math.log(1 - a) - math.log(1 - b)  # weight when the bit is 0
-
-    # nA, nB = len(A_df), len(B_df)
-    # prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
-    prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
-
-    transA = train_transitions(A_df, gpos_to_tx, alpha, beta)
-    transB = train_transitions(B_df, gpos_to_tx, alpha, beta)
-
-
-    return {"pA": pA, "pB": pB, "covA": covA, "covB": covB,
-            "w1": w1, "w0": w0,
-            "prior_A": prior_A,
-            "prior_log_odds": math.log(prior_A / (1 - prior_A)), "transA": transA, "transB": transB}
-
-def classify_read(model, edit_string, absolute_indices, gpos_to_tx, use_prior=True):
-    log_odds = model["prior_log_odds"] if use_prior else 0.0
-    n_edit = len(edit_string)
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":                               # no-info base, skip
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["w1"]:                   # position unseen in training
-            continue
-        log_odds += model["w1"][tx] if ev == "1" else model["w0"][tx]
-    p_A = 1.0 / (1.0 + math.exp(-log_odds))
-    return {"P_A": p_A, "P_B": 1 - p_A, "label": "A" if p_A >= 0.5 else "B"}
-
-def classify_positions(model, read_id, chrom, edit_string, absolute_indices,
-                       gpos_to_tx, use_prior=True):
-    base = model["prior_log_odds"] if use_prior else 0.0
-    n_edit = len(edit_string)
-    positions, txs, labels, A, B = [], [], [], [], []
-
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["w1"]:
-            continue
-
-        log_odds = base + (model["w1"][tx] if ev == "1" else model["w0"][tx])
-        p_A = 1.0 / (1.0 + math.exp(-log_odds))
-
-        positions.append(ref_pos)
-        txs.append(tx)
-        A.append(p_A)
-        B.append(1.0 - p_A)
-        labels.append("A" if p_A >= 0.5 else "B")
-
-    yield {"read_id": read_id, "chrom": chrom,
-           "absolute_indices": positions, "tx": txs,
-           "labels": labels, "P_A": A, "P_B": B}
-    # return events
-
-import math, bisect
-
-def classify_positions_windowed(model, read_id, chrom, edit_string, absolute_indices,
-                                gpos_to_tx, window=30, coord="tx",
-                                use_prior=True):
-    base = model["prior_log_odds"] if use_prior else 0.0
-    n_edit = len(edit_string)
-
-    # pass 1: collect scored sites (read order) with per-site contribution
-    sites = []                                        # (tx, ref_pos, contrib)
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["w1"]:
-            continue
-        contrib = model["w1"][tx] if ev == "1" else model["w0"][tx]
-        sites.append((tx, ref_pos, contrib))
-
-    if not sites:
-        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [],
-               "tx": [], "labels": [], "P_A": [], "P_B": [], "win_n": []}
-        return
-
-    # sorted-by-coordinate copy for prefix sums + window lookup
-    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
-    ordered = sorted(sites, key=key)
-    scoords = [key(s) for s in ordered]
-    prefix  = [0.0]
-    for s in ordered:
-        prefix.append(prefix[-1] + s[2])
-
-    half = window / 2.0
-    positions, txs, labels, A, B, win_n = [], [], [], [], [], []
-    for tx, ref_pos, _ in sites:                      # emit in read order
-        center = tx if coord == "tx" else ref_pos
-        l = bisect.bisect_left(scoords,  center - half)
-        r = bisect.bisect_right(scoords, center + half)
-        log_odds = base + (prefix[r] - prefix[l])
-        p_A = 1.0 / (1.0 + math.exp(-log_odds))
-        positions.append(ref_pos); txs.append(tx)
-        A.append(p_A); B.append(1.0 - p_A)
-        labels.append("A" if p_A >= 0.5 else "B")
-        win_n.append(r - l)
-
-    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
-           "tx": txs, "labels": labels, "P_A": A, "P_B": B, "win_n": win_n}
-
-
-
-def classify_positions_windowed2(model, read_id, chrom, edit_string,
-                                absolute_indices, gpos_to_tx,
-                                window=30, coord="tx", use_prior=True):
-    n_edit = len(edit_string)
-
-    # pass 1: collect the scored sites, keeping the RATES
-    sites = []  # (tx, ref_pos, bit, pA_i, pB_i)
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["pA"]:
-            continue
-        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
-
-    if not sites:
-        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
-               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
-               "edits": [], "win_n": []}
-        return
-
-    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
-    ordered = sorted(sites, key=key)
-    scoords = [key(s) for s in ordered]
-    half = window / 2.0
-
-    prior_A = model["prior_A"] if use_prior else 0.5
-    prior_B = 1.0 - prior_A
-    LN10 = math.log(10.0)
-
-    positions, txs, labels = [], [], []
-    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
-
-    # pass 2: one centered window per scored site
-    for s in sites:  # emit in read order
-        center = key(s)
-        l = bisect.bisect_left(scoords, center - half)
-        r = bisect.bisect_right(scoords, center + half)
-        win = ordered[l:r]  # the sites in this window
-        n = len(win)
-
-        # ---- likelihoods of THIS window's string under each population -----
-        # natural-log accumulation (no prior here: pure P(region | pop))
-        lnA = 0.0
-        lnB = 0.0
-        for (_tx, _rp, bit, pA_i, pB_i) in win:
-            lnA += math.log(pA_i if bit == 1 else 1 - pA_i)
-            lnB += math.log(pB_i if bit == 1 else 1 - pB_i)
-
-        # per-site mean log10 likelihood -> comparable across window sizes
-        logL_A = (lnA / LN10) / n  # negative
-        logL_B = (lnB / LN10) / n  # negative
-
-        # ---- posterior: P(A | window string), prior applies here -----------
-        pa_num = math.log(prior_A) + lnA
-        pb_num = math.log(prior_B) + lnB
-        m = max(pa_num, pb_num)  # log-sum-exp for stability
-        pA_post = math.exp(pa_num - m) / (math.exp(pa_num - m) + math.exp(pb_num - m))
-
-        positions.append(s[1]);
-        txs.append(s[0])
-        A.append(pA_post);
-        B.append(1.0 - pA_post)
-        lA.append(logL_A);
-        lB.append(logL_B)
-        labels.append("A" if pA_post >= 0.5 else "B")
-        eds.append(s[2]);
-        win_n.append(n)
-
-    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
-           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
-           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
-
-def train_transitions(ref_df, gpos_to_tx, alpha=1.0, beta=1.0,
-                      edit_col="edit_string", ai_col="absolute_indices"):
-    c = {0: [0, 0], 1: [0, 0]}          # c[prev][cur]
-    first = [0, 0]
-    for row in ref_df.itertuples():
-        es = getattr(row, edit_col); ai = getattr(row, ai_col)
-        seq = []
-        for i, ref_pos in enumerate(ai):
-            if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-                continue
-            ref_pos = int(ref_pos)
-            if ref_pos not in gpos_to_tx or i >= len(es):
-                continue
-            ev = es[i]
-            if ev == "2":
-                continue
-            seq.append((gpos_to_tx[ref_pos], int(ev)))
-        if not seq:
-            continue
-        seq.sort(key=lambda p: p[0])
-        bits = [b for _t, b in seq]
-        first[bits[0]] += 1
-        for prev, cur in zip(bits, bits[1:]):
-            c[prev][cur] += 1
-    def smooth(n1, n0):
-        return (n1 + alpha) / (n0 + n1 + alpha + beta)
-    return {"p1_given0": smooth(c[0][1], c[0][0]),
-            "p1_given1": smooth(c[1][1], c[1][0]),
-            "pi1":       smooth(first[1], first[0])}
-
-def classify_positions_markov(model, read_id, chrom, edit_string,
-                              absolute_indices, gpos_to_tx,
-                              window=30, coord="tx", use_prior=True):
-    n_edit = len(edit_string)
-    sites = []
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["pA"] or tx not in model["pB"]:
-            continue
-        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
-
-    if not sites:
-        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
-               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
-               "edits": [], "win_n": []}
-        return
-
-    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
-    ordered = sorted(sites, key=key)
-    scoords = [key(s) for s in ordered]
-    half = window / 2.0
-
-    tA, tB = model["transA"], model["transB"]
-    prior_A = model["prior_A"] if use_prior else 0.5
-    prior_B = 1.0 - prior_A
-    LN10 = math.log(10.0)
-
-    def factor(pop_first, pop_t, bit, prev):
-        if prev is None:
-            return pop_first if bit else 1 - pop_first
-        p1 = pop_t["p1_given1"] if prev else pop_t["p1_given0"]
-        return p1 if bit else 1 - p1
-
-    positions, txs, labels = [], [], []
-    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
-    for s in sites:
-        center = key(s)
-        l = bisect.bisect_left(scoords, center - half)
-        r = bisect.bisect_right(scoords, center + half)
-        win = ordered[l:r]
-        n = len(win)
-
-        lnA = lnB = 0.0
-        prev = None
-        for (_tx, _rp, bit, _pa, _pb) in win:
-            lnA += math.log(factor(tA["pi1"], tA, bit, prev))
-            lnB += math.log(factor(tB["pi1"], tB, bit, prev))
-            prev = bit
-
-        logL_A = (lnA / LN10) / n
-        logL_B = (lnB / LN10) / n
-        pa_num = math.log(prior_A) + lnA
-        pb_num = math.log(prior_B) + lnB
-        m = max(pa_num, pb_num)
-        pA_post = math.exp(pa_num - m) / (math.exp(pa_num - m) + math.exp(pb_num - m))
-
-        positions.append(s[1]); txs.append(s[0])
-        A.append(pA_post); B.append(1.0 - pA_post)
-        lA.append(logL_A);  lB.append(logL_B)
-        labels.append("A" if pA_post >= 0.5 else "B")
-        eds.append(s[2]);   win_n.append(n)
-
-    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
-           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
-           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
-
-def classify_positions_hmm(model, read_id, chrom, edit_string,
-                           absolute_indices, gpos_to_tx,
-                           mean_block_nt=30, coord="tx", use_prior=True):
-    '''built with claude'''
-    import math, numpy as np
-    n_edit = len(edit_string)
-
-    # ---- pass 1: IDENTICAL to the window version -------------------------
-    sites = []                       # (tx, ref_pos, bit, pA_i, pB_i)
-    for i, ref_pos in enumerate(absolute_indices):
-        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-            continue
-        ref_pos = int(ref_pos)
-        if ref_pos not in gpos_to_tx or i >= n_edit:
-            continue
-        ev = edit_string[i]
-        if ev == "2":
-            continue
-        tx = gpos_to_tx[ref_pos]
-        if tx not in model["pA"] or tx not in model["pB"]:
-            continue
-        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
-
-    if not sites:
-        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
-               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
-               "edits": [], "win_n": []}
-        return
-
-    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
-    ordered = sorted(sites, key=key)
-    coords  = [key(s) for s in ordered]
-    n = len(ordered)
-
-    # ---- pass 2: HMM instead of windows ----------------------------------
-    occupancy = (1.0 - model["prior_A"]) if use_prior else 0.5   # P(protected)
-    a_BA = 1.0 / mean_block_nt                       # leave protected, per nt
-    a_AB = a_BA * occupancy / (1.0 - occupancy)      # enter protected, per nt
-    T  = np.array([[1 - a_AB, a_AB],
-                   [a_BA,     1 - a_BA]])
-    pi = np.array([1 - occupancy, occupancy])        # [A=unprotected, B=protected]
-
-    # irregular Ref=A spacing: step matrix over the gap between sites
-    Tstep = [np.linalg.matrix_power(T, max(1, int(coords[k] - coords[k-1])))
-             for k in range(1, n)]
-
-    def emis(k):
-        _tx, _rp, bit, pA_i, pB_i = ordered[k]
-        return np.array([pA_i if bit else 1 - pA_i,
-                         pB_i if bit else 1 - pB_i])
-
-    alpha = np.zeros((n, 2)); c = np.zeros(n)
-    v = pi * emis(0); c[0] = v.sum(); alpha[0] = v / c[0]
-    for k in range(1, n):
-        v = (alpha[k-1] @ Tstep[k-1]) * emis(k)
-        c[k] = v.sum(); alpha[k] = v / c[k]
-    beta = np.zeros((n, 2)); beta[-1] = 1.0
-    for k in range(n-2, -1, -1):
-        beta[k] = (Tstep[k] @ (emis(k+1) * beta[k+1])) / c[k+1]
-    post = alpha * beta
-    post /= post.sum(1, keepdims=True)
-
-    # map back to READ order
-    by_coord = {key(s): j for j, s in enumerate(ordered)}
-    positions, txs, labels = [], [], []
-    A, B, lA, lB, eds, win_n = [], [], [], [], [], []
-    for s in sites:
-        j = by_coord[key(s)]
-        pB_post = float(post[j, 1])
-        _tx, _rp, bit, pA_i, pB_i = s
-        positions.append(s[1]); txs.append(s[0])
-        A.append(1.0 - pB_post); B.append(pB_post)
-        lA.append(math.log10(pA_i if bit else 1 - pA_i))   # per-site emission
-        lB.append(math.log10(pB_i if bit else 1 - pB_i))
-        labels.append("B" if pB_post >= 0.5 else "A")
-        eds.append(bit); win_n.append(n)
-
-    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
-           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
-           "logL_A": lA, "logL_B": lB, "edits": eds, "win_n": win_n}
+def classify_tx(tx_pos, cds_len):
+    if tx_pos < 0: return "UTR5"
+    if tx_pos < cds_len: return "CDS"
+    return "UTR3"
 
 def classify_positions_hmm2(model, read_id, chrom, edit_string,
                            absolute_indices, gpos_to_tx,
@@ -1208,8 +655,6 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
     c.writePDFfile(pdf_path)
 
 
-
-
 def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                         label1="A", label2="B", label3="sample",
                         ref_cov_A=None, ref_cov_B=None,
@@ -1423,22 +868,17 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Bernoulli Naive Bayes Shadow Classifier."
     )
-    p.add_argument("--parquet1", required=True)
-    p.add_argument("--parquet2", required=True)
-    p.add_argument("--parquet3", required=True)
-    p.add_argument("--label1", default="ribosome-less")
-    p.add_argument("--label2", default="mock TadA")
-    p.add_argument("--label3", default="query library")
+    p.add_argument("--parquet", required=True)
+    p.add_argument("--label", default="sample")
+    p.add_argument("--model", required=True, default=None, help="Trained model stored as pickle file")
     p.add_argument("--ref", required=True)
     p.add_argument("--gtf", required=True)
-    p.add_argument("--output", default="bernoulliShadow")
+    p.add_argument("--output", default="HMM")
     p.add_argument("--window", type=int,   default=30)
-    p.add_argument("--min_coverage", type=float, default=100.0)
     p.add_argument("--min_query_reads", type=int, default=10,
                    help="Minimum number of query (spanning) reads a gene must "
                         "have to be analyzed (default: 10). Separate from "
                         "--min_coverage, which gates the reference background.")
-    p.add_argument("--min_sites",    type=int,   default=5)
     p.add_argument("--num_reads",    type=int,   default=10)
     p.add_argument("--top_n_plots",  type=int,   default=10,
                    help="Number of genes to plot, ranked by number of "
@@ -1446,13 +886,6 @@ def parse_args():
     p.add_argument("--require_his_codon", action="store_true",
                    help="Only process genes that contain at least one His "
                         "codon (CAT/CAC).")
-    p.add_argument("--background_all_reads", action="store_true",
-                   help="When --cds_spanning is set, build the reference "
-                        "background frequencies from ALL overlapping "
-                        "reference reads (not just spanning ones) for a more "
-                        "precise per-position estimate. Query reads are still "
-                        "restricted to spanning. No effect without "
-                        "--cds_spanning.")
     p.add_argument("--min_edit_freq", type=float, default=0.0,
                    help="Only consider query reads whose per-read "
                         "global_edit_freq is >= this value. Filters out "
@@ -1464,155 +897,4 @@ def parse_args():
                    help="Only include reads whose alignment spans the full "
                         "CDS of the gene.")
     return p.parse_args()
-
-def main():
-    args = parse_args()
-    print(f"label3={args.label3!r}  output={args.output!r}")
-    out = args.output
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    train_df1 = load_all_parquet_chunks(args.parquet1)
-    train_df2 = load_all_parquet_chunks(args.parquet2)
-    query_df = load_all_parquet_chunks(args.parquet3)
-    # train_df1 = pd.read_parquet(args.parquet1)
-    # train_df2 = pd.read_parquet(args.parquet2)
-    # query_df = pd.read_parquet(args.parquet3)
-
-    print(f"Loaded {len(train_df1):,} reads from {args.label1}.", file=sys.stderr)
-    print(f"Loaded {len(train_df2):,} reads from {args.label2}.", file=sys.stderr)
-    print(f"Loaded {len(query_df):,} reads from {args.label3}.", file=sys.stderr)
-
-    if args.cds_spanning:
-        print("CDS spanning filter: ON (query only)", file=sys.stderr)
-    if args.require_his_codon:
-        print("His codon filter: ON (genes need >=1 CAT/CAC)",
-              file=sys.stderr)
-    if args.min_edit_freq > 0.0:
-        print(f"Query edit-freq filter: ON "
-              f"(global_edit_freq >= {args.min_edit_freq})", file=sys.stderr)
-
-    print("\nParsing GTF...", file=sys.stderr)
-    genes = parse_gtf(args.gtf)
-    print(f"{len(genes):,} genes.", file=sys.stderr)
-
-    ref_fasta = pysam.FastaFile(args.ref)
-
-    pdf_dir = Path(f"{out}_gene_pdfs")
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    summary_rows = []
-    n_pass = 0
-
-    gene_names = list(genes.keys())
-    print(f"\nPass 1: scanning {len(gene_names):,} genes "
-          f"(summary + ranking)...", file=sys.stderr)
-
-    # Diagnostics
-    max_bg = 0
-    max_qry = 0
-
-    gene_span_counts = {}  # gname -> n_query_reads (ranking metric)
-    model_dict = {} # dictionary to hold model information per passing gene
-    shadow_call_frames = []
-    shadow_calls_path = f"{out}_shadow_calls.parquet"
-    for i, gname in enumerate(gene_names):
-        if (i + 1) % 50 == 0:
-            print(f"  {i + 1}/{len(gene_names)} scanned, "
-                  f"{n_pass} passing...", file=sys.stderr)
-
-        gene = genes[gname]
-        gene_len = cds_length(gene)
-
-        his_positions = find_his_codon_tx_positions(ref_fasta, gene)
-        if args.require_his_codon and len(his_positions) == 0:
-            continue
-
-        # Background: ALWAYS all overlapping reference reads (never spanning),
-        # never edit-freq filtered — maximum per-position support.
-        t1 = get_gene_df(train_df1, gene, cds_spanning=False)
-        t2 = get_gene_df(train_df2, gene, cds_spanning=False)
-
-        # Query: the reads we make protection calls on.
-        df_qry = get_gene_df(query_df, gene, cds_spanning=args.cds_spanning,
-                             min_edit_freq=args.min_edit_freq)
-
-        max_bg = max(max_bg, len(t1))
-        max_qry = max(max_qry, len(df_qry))
-
-        # Two independent coverage thresholds
-        if len(t1) < args.min_coverage or len(t2) < args.min_coverage: # both need to pass
-            continue
-        if len(df_qry) < args.min_query_reads:
-            continue
-
-        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
-        tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
-        tx_lo = min(gpos_to_tx.values())
-        tx_hi = max(gpos_to_tx.values())
-
-        # Train the model on the first two libraries
-        model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx)
-        print("Trained gene model: ", gname, file=sys.stderr)
-        n_pass += 1
-        # Classify
-        rows = []
-        for _, row in df_qry.iterrows():
-            # rows.extend(classify_positions(
-            #     model_dict[gname], row['read_id'], row['chrom'],
-            #     row['edit_string'], row['absolute_indices'], gpos_to_tx, use_prior=True
-            # ))
-            rows.extend(classify_positions_windowed2(
-                model_dict[gname], row['read_id'], row['chrom'],
-                row['edit_string'], row['absolute_indices'], gpos_to_tx,
-                window=args.window, coord="tx", use_prior=True
-            ))
-            # rows.extend(classify_positions_hmm2(
-            #     model_dict[gname], row['read_id'], row['chrom'],
-            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            # mean_block_nt=30, coord="tx", use_prior=True)
-            # )
-            # rows.extend(classify_positions_markov(
-            #     model_dict[gname], row['read_id'], row['chrom'],
-            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            #     window=args.window, coord="tx", use_prior=True)
-            # )
-        df = pd.DataFrame(rows)
-        # df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
-        plot_pb_by_tx_pyx(
-            gname, df, his_positions, tx_lo, tx_hi,
-            pdf_path=pdf_dir / f"{gname}.pdf",
-            label1="P(Shadow)", label2=args.label3,
-            ref_cov=model_dict[gname]["covA"]
-        )
-        plot_signed_log_pyx(
-            gname, df, his_positions, tx_lo, tx_hi,
-            pdf_path=pdf_dir / f"{gname}_log.pdf",
-            label1=args.label1, label2=args.label2,
-            label3=args.label3,
-            ref_cov_A=model_dict[gname]["covA"],
-            ref_cov_B=model_dict[gname]["covB"]
-        )
-        gene_calls = write_shadow_calls_to_df(
-            gname, df_qry, rows,  # `rows` = the classify records
-            read_edits=None,
-            ref_cov=model_dict[gname]["covA"],
-            gpos_to_tx=gpos_to_tx, tx_to_gpos=tx_to_gpos,
-            prob_threshold=0.5,  # tune per model (HMM wants lower)
-            cds_start_tx=0, cds_end_tx=gene_len,  # your CDS bounds in tx coords
-        )
-        if not gene_calls.empty:
-            shadow_call_frames.append(gene_calls)
-        # print(calls_dict)
-        # convert to
-
-    if shadow_call_frames:
-        shadow_df = pd.concat(shadow_call_frames, ignore_index=True)
-        shadow_df.to_parquet(shadow_calls_path, index=False)
-        print(f"wrote {len(shadow_df)} shadow-call reads across "
-              f"{shadow_df['shadow_gene'].nunique()} genes -> {shadow_calls_path}",
-              file=sys.stderr)
-if __name__ == "__main__":
-    Tee()
-    main()
-
-
-
 
