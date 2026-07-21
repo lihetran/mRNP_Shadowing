@@ -389,7 +389,7 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
         return np.array([pA_i if bit else 1 - pA_i,
                          pB_i if bit else 1 - pB_i])
 
-    # ---- forward-backward, scaled ---------------------------------------
+    # ---- forward-backward, scaled, written by Claude ---------------------------
     alpha = np.zeros((n, 2)); c = np.zeros(n)
     v = pi * emis(0); c[0] = v.sum(); alpha[0] = v / c[0]
     for k in range(1, n):
@@ -866,7 +866,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Bernoulli Naive Bayes Shadow Classifier."
+        description="Shadow Hidden Markov Model."
     )
     p.add_argument("--parquet", required=True)
     p.add_argument("--label", default="sample")
@@ -898,3 +898,118 @@ def parse_args():
                         "CDS of the gene.")
     return p.parse_args()
 
+
+def main():
+    args = parse_args()
+    out = args.output
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    query_df = load_all_parquet_chunks(args.parquet)
+    print(f"Loaded {len(query_df):,} reads from {args.label}.", file=sys.stderr)
+    if args.model is not None:
+        model_dict = load_model_from_pickle(args.model)
+    else:
+        # exit
+        raise ValueError("No model provided. Please specify a trained model using --model.")
+
+    if args.cds_spanning:
+        print("CDS spanning filter: ON (query only)", file=sys.stderr)
+    if args.require_his_codon:
+        print("His codon filter: ON (genes need >=1 CAT/CAC)",
+              file=sys.stderr)
+    if args.min_edit_freq > 0.0:
+        print(f"Query edit-freq filter: ON "
+              f"(global_edit_freq >= {args.min_edit_freq})", file=sys.stderr)
+
+    print("\nParsing GTF...", file=sys.stderr)
+    genes = parse_gtf(args.gtf)
+    print(f"{len(genes):,} genes.", file=sys.stderr)
+
+    ref_fasta = pysam.FastaFile(args.ref)
+
+    pdf_dir = Path(f"{out}_gene_pdfs")
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    summary_rows = []
+    n_pass = 0
+
+    gene_names = list(genes.keys())
+    print(f"\nPass 1: scanning {len(gene_names):,} genes "
+          f"(summary + ranking)...", file=sys.stderr)
+
+    shadow_call_frames = []
+    shadow_calls_path = f"{out}_shadow_calls.parquet"
+
+    for i, gname in enumerate(gene_names):
+        if (i + 1) % 50 == 0:
+            print(f"  {i + 1}/{len(gene_names)} scanned, "
+                  f"{n_pass} passing...", file=sys.stderr)
+
+        gene = genes[gname]
+        gene_len = cds_length(gene)
+
+        his_positions = find_his_codon_tx_positions(ref_fasta, gene)
+        if args.require_his_codon and len(his_positions) == 0:
+            continue
+
+        # Query: the reads we make protection calls on.
+        df_qry = get_gene_df(query_df, gene, cds_spanning=args.cds_spanning,
+                             min_edit_freq=args.min_edit_freq)
+        if len(df_qry) < args.min_query_reads:
+            continue
+
+        if gname not in model_dict:
+            print(f"  {gname} skipped: no model found for this gene.", file=sys.stderr)
+            continue
+
+        n_pass += 1
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
+        tx_lo = min(gpos_to_tx.values())
+        tx_hi = max(gpos_to_tx.values())
+
+        rows = []
+        for _, row in df_qry.iterrows():
+            rows.extend(classify_positions_hmm2(
+                model_dict[gname], row['read_id'], row['chrom'],
+                row['edit_string'], row['absolute_indices'], gpos_to_tx,
+            mean_block_nt=50, coord="tx", use_prior=True)
+            )
+
+        df = pd.DataFrame(rows)
+        # df.to_parquet(f"{out}_{gname}_calls.parquet", index=False)
+        plot_pb_by_tx_pyx(
+            gname, df, his_positions, tx_lo, tx_hi,
+            pdf_path=pdf_dir / f"{gname}.pdf",
+            label1="P(Shadow)", label2=args.label,
+            ref_cov=model_dict[gname]["covA"]
+        )
+        plot_signed_log_pyx(
+            gname, df, his_positions, tx_lo, tx_hi,
+            pdf_path=pdf_dir / f"{gname}_log.pdf",
+            label1="ribosome-less", label2="Mock TadA",
+            label3=args.label,
+            ref_cov_A=model_dict[gname]["covA"],
+            ref_cov_B=model_dict[gname]["covB"]
+        )
+        gene_calls = write_shadow_calls_to_df(
+            gname, df_qry, rows,  # `rows` = the classify records
+            read_edits=None,
+            ref_cov=model_dict[gname]["covA"],
+            gpos_to_tx=gpos_to_tx, tx_to_gpos=tx_to_gpos,
+            prob_threshold=0.5,  # tune per model (HMM wants lower)
+            cds_start_tx=0, cds_end_tx=gene_len,  # your CDS bounds in tx coords
+        )
+        if not gene_calls.empty:
+            shadow_call_frames.append(gene_calls)
+    # print(calls_dict)
+    # convert to
+
+
+    if shadow_call_frames:
+        shadow_df = pd.concat(shadow_call_frames, ignore_index=True)
+        shadow_df.to_parquet(shadow_calls_path, index=False)
+        print(f"wrote {len(shadow_df)} shadow-call reads across "
+              f"{shadow_df['shadow_gene'].nunique()} genes -> {shadow_calls_path}",
+              file=sys.stderr)
+if __name__ == "__main__":
+    Tee()
+    main()

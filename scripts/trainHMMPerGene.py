@@ -462,7 +462,7 @@ def train_transitions(ref_df, gpos_to_tx, alpha=1.0, beta=1.0,
             "p1_given1": smooth(c[1][1], c[1][0]),
             "pi1":       smooth(first[1], first[0])}
 
-def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
+def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None, block = 30):
     pA, covA = build_frequency_df(A_df, gpos_to_tx, alpha, beta)
     pB, covB = build_frequency_df(B_df, gpos_to_tx, alpha, beta)
 
@@ -474,7 +474,8 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None):
 
     # nA, nB = len(A_df), len(B_df)
     # prior_log_odds = math.log(nA / nB) if nA and nB else 0.0
-    prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
+    # prior_A = 0.8 # based off of 30 nt RPF and 150 nt spacing
+    prior_A = 1.0 - (block / 150)
 
     transA = train_transitions(A_df, gpos_to_tx, alpha, beta)
     transB = train_transitions(B_df, gpos_to_tx, alpha, beta)
@@ -543,7 +544,7 @@ def main():
         tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
 
         # Train the model on the first two libraries
-        model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx)
+        model_dict[gname] = train(t1, t2, gpos_to_tx=gpos_to_tx, block = 50)
         print("Trained gene model: ", gname, file=sys.stderr)
 
         n_pass += 1
