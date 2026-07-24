@@ -53,10 +53,85 @@ def generate_substitution_profile(df):
                 update_substitution_profile(profile, r, q)
     return profile
 
+_TEX_SPECIAL = {
+    '\\': r'\textbackslash{}', '&': r'\&', '%': r'\%', '$': r'\$',
+    '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}',
+    '~': r'\textasciitilde{}', '^': r'\textasciicircum{}',
+}
+
+def tex_escape(s):
+    """Escape characters (e.g. '_') that PyX's TeX text engine treats as
+    special, so library names/labels render literally instead of erroring."""
+    return ''.join(_TEX_SPECIAL.get(ch, ch) for ch in str(s))
+
+
+def _bar_chart_pyx(libs, values_by_lib, ylabel, title, output_path):
+    """
+    Shared grouped-barplot renderer.
+
+    libs: list of (profile, color, label) tuples (profile unused here).
+    values_by_lib: list (parallel to libs) of {sub_type: value} dicts.
+    """
+    bases     = ['A', 'C', 'G', 'T']
+    sub_types = [(ref, alt) for ref in bases for alt in bases if ref != alt]
+
+    y_max = max((max(v.values()) for v in values_by_lib), default=0.0)
+    y_max = max(y_max * 1.15, 1e-9)
+
+    n_libs, n_subs = len(libs), len(sub_types)
+    panel_w, panel_h = 14, 6
+
+    c = canvas.canvas()
+    g = graph.graphxy(
+        width=panel_w, height=panel_h, xpos=0, ypos=0,
+        x=graph.axis.linear(min=0, max=n_subs, parter=None,
+                             title="Substitution type"),
+        y=graph.axis.linear(min=0, max=y_max, title=ylabel),
+    )
+    c.insert(g)
+
+    group_pad = 0.12
+    usable    = 1.0 - 2 * group_pad
+    bar_w     = usable / n_libs
+
+    for si, sub in enumerate(sub_types):
+        for li, (values, (_, col, label)) in enumerate(zip(values_by_lib, libs)):
+            val = values[sub]
+            bx0 = si + group_pad + li * bar_w
+            bx1 = bx0 + bar_w
+            cx0, cy0 = g.pos(bx0, 0.0)
+            cx1, cy1 = g.pos(bx1, val)
+            if cy1 > cy0:
+                c.fill(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0), [col])
+                c.stroke(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0),
+                         [style.linewidth.thin, color.gray(0.3)])
+        cxm, cym = g.pos(si + 0.5, 0.0)
+        c.text(cxm, cym - 0.35, f"{sub[0]}{{$\\to$}}{sub[1]}",
+               [text.halign.center, text.size.scriptsize])
+
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.5,
+           tex_escape(title), [text.halign.center, text.size.Large])
+
+    leg_x     = g.xpos + g.width + 0.4
+    leg_y_top = g.ypos + g.height - 0.3
+    leg_lw, leg_dy = 0.6, 0.55
+    for li, (_, col, label) in enumerate(libs):
+        ly = leg_y_top - li * leg_dy
+        c.fill(path.rect(leg_x, ly - 0.12, leg_lw, 0.24), [col])
+        c.stroke(path.rect(leg_x, ly - 0.12, leg_lw, 0.24),
+                 [style.linewidth.thin, color.gray(0.3)])
+        c.text(leg_x + leg_lw + 0.15, ly, tex_escape(label),
+               [text.valign.middle, text.size.small])
+
+    c.writePDFfile(output_path)
+    print(f"  Saved -> {output_path}.pdf", file=sys.stderr)
+
+
 def plot_substitution_profile(profiles, output_prefix):
     """
-    Grouped barplot of substitution rates (fraction of all observed
-    substitutions) across libraries.
+    Render two grouped barplots comparing substitution profiles across
+    libraries: one of raw counts, one of fractions (each library's
+    substitutions normalized to sum to 1).
 
     profiles: list of (profile_dict, color, label) tuples, where
     profile_dict maps (ref_base, alt_base) -> count.
@@ -75,59 +150,16 @@ def plot_substitution_profile(profiles, output_prefix):
             return {sub: 0.0 for sub in sub_types}
         return {sub: profile[sub] / total for sub in sub_types}
 
-    frac_libs = [fractions(profile) for profile, _, _ in libs]
-    y_max = max((max(f.values()) for f in frac_libs), default=0.0)
-    y_max = max(y_max * 1.15, 0.01)
+    counts_by_lib = [{sub: profile[sub] for sub in sub_types}
+                     for profile, _, _ in libs]
+    frac_by_lib   = [fractions(profile) for profile, _, _ in libs]
 
-    n_libs, n_subs = len(libs), len(sub_types)
-    panel_w, panel_h = 14, 6
-
-    c = canvas.canvas()
-    g = graph.graphxy(
-        width=panel_w, height=panel_h, xpos=0, ypos=0,
-        x=graph.axis.linear(min=0, max=n_subs, parter=None,
-                             title="Substitution type"),
-        y=graph.axis.linear(min=0, max=y_max,
-                             title="Fraction of substitutions"),
-    )
-    c.insert(g)
-
-    group_pad = 0.12
-    usable    = 1.0 - 2 * group_pad
-    bar_w     = usable / n_libs
-
-    for si, sub in enumerate(sub_types):
-        for li, (frac, (_, col, label)) in enumerate(zip(frac_libs, libs)):
-            rate = frac[sub]
-            bx0  = si + group_pad + li * bar_w
-            bx1  = bx0 + bar_w
-            cx0, cy0 = g.pos(bx0, 0.0)
-            cx1, cy1 = g.pos(bx1, rate)
-            if cy1 > cy0:
-                c.fill(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0), [col])
-                c.stroke(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0),
-                         [style.linewidth.thin, color.gray(0.3)])
-        cxm, cym = g.pos(si + 0.5, 0.0)
-        c.text(cxm, cym - 0.35, f"{sub[0]}{{$\\to$}}{sub[1]}",
-               [text.halign.center, text.size.scriptsize])
-
-    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.5,
-           "Substitution profile", [text.halign.center, text.size.Large])
-
-    leg_x     = g.xpos + g.width + 0.4
-    leg_y_top = g.ypos + g.height - 0.3
-    leg_lw, leg_dy = 0.6, 0.55
-    for li, (_, col, label) in enumerate(libs):
-        ly = leg_y_top - li * leg_dy
-        c.fill(path.rect(leg_x, ly - 0.12, leg_lw, 0.24), [col])
-        c.stroke(path.rect(leg_x, ly - 0.12, leg_lw, 0.24),
-                 [style.linewidth.thin, color.gray(0.3)])
-        c.text(leg_x + leg_lw + 0.15, ly, label,
-               [text.valign.middle, text.size.small])
-
-    plot_path = f"{output_prefix}_substitution_profile_pyx"
-    c.writePDFfile(plot_path)
-    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
+    _bar_chart_pyx(libs, counts_by_lib, "Substitution count",
+                   "Substitution profile (counts)",
+                   f"{output_prefix}_substitution_counts_pyx")
+    _bar_chart_pyx(libs, frac_by_lib, "Fraction of substitutions",
+                   "Substitution profile (frequency)",
+                   f"{output_prefix}_substitution_frequency_pyx")
 
 
 def main(args):
