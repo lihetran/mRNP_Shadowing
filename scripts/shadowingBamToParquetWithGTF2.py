@@ -139,7 +139,11 @@ def read_generator(bam_path, ref_sequence, chrom, strand_index, coding_only=Fals
             read_start = read.reference_start
             read_end   = read.reference_end
 
-            aligned_pairs    = read.get_aligned_pairs()
+            # list, not tuple: pyarrow can serialize a list-of-lists with None
+            # gaps (from indels) as list<list<int64>>, but chokes on a
+            # list-of-tuples with the same None gaps ("did not recognize
+            # Python value type when inferring an Arrow data type").
+            aligned_pairs    = [list(p) for p in read.get_aligned_pairs()]
             absolute_indices = get_absolute_positions(read)
 
             # Determine strand, transcript_id, gene_name, and gene_biotype from GTF
@@ -237,29 +241,20 @@ def write_chunk(df, base_path, chunk_index):
     print(f"Saved chunk {chunk_index} with {len(df)} rows to {chunk_file}")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Convert BAM file to parquet chunks for PCA pipeline."
-    )
-    parser.add_argument("bam_file",      type=str, help="Input BAM file")
-    parser.add_argument("ref_fasta",     type=str, help="Reference FASTA file")
-    parser.add_argument("output_dir",    type=str, help="Output directory for parquet chunks")
-    parser.add_argument("--gtf",         type=str, required=True,
-                        help="GTF annotation file for strand determination")
-    parser.add_argument("--coding_only", action="store_true",
-                        help="Only write reads assigned to protein-coding genes")
-    parser.add_argument("--chunk_size",  type=int, default=50000,
-                        help="Rows per output parquet chunk (default: 50000)")
-
-    args = parser.parse_args()
-
-    bam_file   = Path(args.bam_file)
-    ref_fasta  = Path(args.ref_fasta)
-    output_dir = Path(args.output_dir)
+def generate_parquet(bam_file, ref_fasta, output_dir, gtf_file,
+                      coding_only=False, chunk_size=50000):
+    """
+    Convert an aligned bam into chunked parquet files under output_dir.
+    Returns the total number of reads written. Importable so other scripts
+    (e.g. a combined align+parquet pipeline) can call it directly.
+    """
+    bam_file   = Path(bam_file)
+    ref_fasta  = Path(ref_fasta)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Building strand index from {args.gtf}...")
-    strand_index = build_strand_index(args.gtf)
+    print(f"Building strand index from {gtf_file}...")
+    strand_index = build_strand_index(gtf_file)
     print(f"  Loaded annotations for {len(strand_index)} chromosomes")
 
     ref_dict = SeqIO.to_dict(SeqIO.parse(ref_fasta, "fasta"))
@@ -276,12 +271,12 @@ def main():
         chrom_total = 0
 
         for record in read_generator(bam_file, ref_seq.seq, chrom, strand_index,
-                                     coding_only=args.coding_only):
+                                     coding_only=coding_only):
             rows.append(record)
             total += 1
             chrom_total += 1
 
-            if len(rows) >= args.chunk_size:
+            if len(rows) >= chunk_size:
                 df = pd.DataFrame(rows)
                 df = optimize_dataframe(df)
                 write_chunk(df, parquet_path, chunk_index)
@@ -297,6 +292,27 @@ def main():
         write_chunk(df, parquet_path, chunk_index)
 
     print(f"All done! {total} total reads written across {chunk_index + 1} chunk(s)")
+    return total
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert BAM file to parquet chunks for PCA pipeline."
+    )
+    parser.add_argument("bam_file",      type=str, help="Input BAM file")
+    parser.add_argument("ref_fasta",     type=str, help="Reference FASTA file")
+    parser.add_argument("output_dir",    type=str, help="Output directory for parquet chunks")
+    parser.add_argument("--gtf",         type=str, required=True,
+                        help="GTF annotation file for strand determination")
+    parser.add_argument("--coding_only", action="store_true",
+                        help="Only write reads assigned to protein-coding genes")
+    parser.add_argument("--chunk_size",  type=int, default=50000,
+                        help="Rows per output parquet chunk (default: 50000)")
+
+    args = parser.parse_args()
+
+    generate_parquet(args.bam_file, args.ref_fasta, args.output_dir, args.gtf,
+                      coding_only=args.coding_only, chunk_size=args.chunk_size)
 
 
 if __name__ == '__main__':

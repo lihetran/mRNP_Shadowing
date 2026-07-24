@@ -261,6 +261,32 @@ def plot_editing_efficiency(efficiencies, output_file):
     plt.savefig(output_file, dpi=300)
 
 
+def align_reads(reads_bam, ref_fasta, out_bam):
+    """
+    Run the full dual-pathway (A->G / T->C) alignment strategy described in
+    this module's docstring against reads_bam/ref_fasta. Returns the path to
+    the final sorted, indexed bam. Importable so other scripts (e.g. a
+    combined align+parquet pipeline) can call it directly.
+    """
+    mutated_bam_ag, read_dict_ag = mutateBamSenseAG(reads_bam)
+    mutated_bam_tc, read_dict_tc = mutateBamAntisenseTC(reads_bam)
+    print(f'Mutated bam files: {mutated_bam_ag}, {mutated_bam_tc}')
+
+    mutated_ref_ag = mutateFastaAG(ref_fasta)
+    mutated_ref_tc = mutateFastaTC(ref_fasta)
+    print(f'Mutated reference fasta files: {mutated_ref_ag}, {mutated_ref_tc}')
+
+    tmp_ag_bam = out_bam.replace('.bam', '_AG_tmp.bam')
+    tmp_tc_bam = out_bam.replace('.bam', '_TC_tmp.bam')
+    dorado_align_raw(mutated_bam_ag, mutated_ref_ag, tmp_ag_bam)
+    dorado_align_raw(mutated_bam_tc, mutated_ref_tc, tmp_tc_bam)
+
+    aligned_bam = merge_dual_pathway_alignments(
+        tmp_ag_bam, tmp_tc_bam, read_dict_ag, read_dict_tc, out_bam)
+    print(f'Aligned bam file: {aligned_bam}')
+    return aligned_bam
+
+
 def main():
     parser = argparse.ArgumentParser(description='Map APOBEC edited reads to reference sequence')
     parser.add_argument('--reads_bam', required=True, help='Input unaligned bam file from Dorado basecalling')
@@ -268,22 +294,7 @@ def main():
     parser.add_argument('--out_bam', required=True, help='Output aligned bam file')
     args = parser.parse_args()
 
-    mutated_bam_ag, read_dict_ag = mutateBamSenseAG(args.reads_bam)
-    mutated_bam_tc, read_dict_tc = mutateBamAntisenseTC(args.reads_bam)
-    print(f'Mutated bam files: {mutated_bam_ag}, {mutated_bam_tc}')
-
-    mutated_ref_ag = mutateFastaAG(args.ref_fasta)
-    mutated_ref_tc = mutateFastaTC(args.ref_fasta)
-    print(f'Mutated reference fasta files: {mutated_ref_ag}, {mutated_ref_tc}')
-
-    tmp_ag_bam = args.out_bam.replace('.bam', '_AG_tmp.bam')
-    tmp_tc_bam = args.out_bam.replace('.bam', '_TC_tmp.bam')
-    dorado_align_raw(mutated_bam_ag, mutated_ref_ag, tmp_ag_bam)
-    dorado_align_raw(mutated_bam_tc, mutated_ref_tc, tmp_tc_bam)
-
-    aligned_bam = merge_dual_pathway_alignments(
-        tmp_ag_bam, tmp_tc_bam, read_dict_ag, read_dict_tc, args.out_bam)
-    print(f'Aligned bam file: {aligned_bam}')
+    align_reads(args.reads_bam, args.ref_fasta, args.out_bam)
     # # calculate editing efficiency
     # ref_dict = SeqIO.to_dict(SeqIO.parse(args.ref_fasta, 'fasta'))
     # e = get_editing_efficiency(aligned_bam, ref_dict)
