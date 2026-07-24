@@ -26,7 +26,8 @@ from shadowingBamToParquetWithGTF2 import generate_parquet
 
 
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
-                  out_bam=None, coding_only=False, chunk_size=50000):
+                  out_bam=None, coding_only=False, chunk_size=50000,
+                  keep_intermediates=False):
     """
     Align reads_bam against ref_fasta (dual A->G/T->C pathway), then convert
     the resulting aligned bam straight into parquet chunks under output_dir.
@@ -39,7 +40,8 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
         out_bam = str(output_dir / f"{Path(reads_bam).stem}_aligned.bam")
 
     print(f"=== Step 1/2: aligning {reads_bam} ===")
-    aligned_bam = align_reads(reads_bam, ref_fasta, out_bam)
+    aligned_bam = align_reads(reads_bam, ref_fasta, out_bam,
+                               keep_intermediates=keep_intermediates)
 
     print(f"\n=== Step 2/2: generating parquet from {aligned_bam} ===")
     total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
@@ -63,11 +65,14 @@ def main():
                         help='Only write reads assigned to protein-coding genes')
     parser.add_argument('--chunk_size', type=int, default=50000,
                         help='Rows per output parquet chunk (default: 50000)')
+    parser.add_argument('--keep_intermediates', action='store_true',
+                        help='Keep per-run intermediate alignment bams instead of deleting them')
     args = parser.parse_args()
 
     aligned_bam, total = run_pipeline(
         args.reads_bam, args.ref_fasta, args.gtf, args.output_dir,
-        out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size)
+        out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size,
+        keep_intermediates=args.keep_intermediates)
 
     print(f"\nPipeline complete: {total} reads written from {aligned_bam}")
 

@@ -115,10 +115,20 @@ def mutateBamAntisenseTC(input_bam):
 
     return mutated_bam, read_dict
 
+def _fasta_is_stale(input_fasta, output_fasta):
+    """True if output_fasta needs to be (re)built: missing, empty, or older
+    than input_fasta (the source genome was updated since it was mutated)."""
+    if not output_fasta.exists() or output_fasta.stat().st_size == 0:
+        return True
+    return output_fasta.stat().st_mtime < input_fasta.stat().st_mtime
+
 def mutateFastaAG(input_fasta):
     # create a mutated fasta file where all A's are changed to G's, same coordinates as input_fasta
     input_fasta = Path(input_fasta)
     output_fasta = input_fasta.with_name(input_fasta.stem + '_mutated_AG.fasta')
+    if not _fasta_is_stale(input_fasta, output_fasta):
+        print(f'  {output_fasta} already exists and is up to date; skipping.')
+        return output_fasta
     with open(output_fasta, 'w') as out_fasta:
         for record in SeqIO.parse(input_fasta, 'fasta'):
             seq = str(record.seq)
@@ -132,6 +142,9 @@ def mutateFastaTC(input_fasta):
     # create a mutated fasta file where all T's are changed to C's, same coordinates as input_fasta
     input_fasta = Path(input_fasta)
     output_fasta = input_fasta.with_name(input_fasta.stem + '_mutated_TC.fasta')
+    if not _fasta_is_stale(input_fasta, output_fasta):
+        print(f'  {output_fasta} already exists and is up to date; skipping.')
+        return output_fasta
     with open(output_fasta, 'w') as out_fasta:
         for record in SeqIO.parse(input_fasta, 'fasta'):
             seq = str(record.seq)
@@ -160,44 +173,57 @@ def merge_dual_pathway_alignments(tmp_ag_bam, tmp_tc_bam, read_dict_ag, read_dic
 
     Where a read has a primary hit in both pathways (rare -- e.g. a repeat
     region), the higher-mapping-quality hit wins.
-    """
-    def load_primary(bam_path):
-        hits = {}
-        with pysam.AlignmentFile(bam_path, "rb") as bam:
-            for read in bam:
-                if not read.is_unmapped and not read.is_secondary and not read.is_supplementary:
-                    hits[read.query_name] = read
-        return hits
 
-    ag_hits = load_primary(tmp_ag_bam)
-    tc_hits = load_primary(tmp_tc_bam)
+    Memory: only the smaller pathway's bam (by file size, a cheap proxy for
+    read count that avoids a separate counting pass) is loaded into an
+    in-memory index; the larger pathway is streamed against it one read at a
+    time, popping matched entries out of the index as they're consumed. This
+    holds at most one pathway's full hit set in memory at once instead of
+    both simultaneously -- on real data, holding both was the dominant
+    driver of peak RSS (tens of GB for a full sequencing run).
+    """
+    if Path(tmp_ag_bam).stat().st_size <= Path(tmp_tc_bam).stat().st_size:
+        index_bam, index_pathway, index_dict = tmp_ag_bam, 'ag', read_dict_ag
+        stream_bam, stream_pathway, stream_dict = tmp_tc_bam, 'tc', read_dict_tc
+    else:
+        index_bam, index_pathway, index_dict = tmp_tc_bam, 'tc', read_dict_tc
+        stream_bam, stream_pathway, stream_dict = tmp_ag_bam, 'ag', read_dict_ag
+
+    index_hits = {}
+    with pysam.AlignmentFile(index_bam, "rb") as bam:
+        for read in bam:
+            if not read.is_unmapped and not read.is_secondary and not read.is_supplementary:
+                index_hits[read.query_name] = read
 
     ambiguous = 0
-    with pysam.AlignmentFile(tmp_ag_bam, "rb") as template_bam:
+    with pysam.AlignmentFile(index_bam, "rb") as template_bam:
         with pysam.AlignmentFile(out_bam, "wb", template=template_bam) as out:
-            for read_id in set(ag_hits) | set(tc_hits):
-                ag_read = ag_hits.get(read_id)
-                tc_read = tc_hits.get(read_id)
 
-                if ag_read is not None and tc_read is not None:
-                    ambiguous += 1
-                    pathway = 'ag' if ag_read.mapping_quality >= tc_read.mapping_quality else 'tc'
-                    chosen = ag_read if pathway == 'ag' else tc_read
-                elif ag_read is not None:
-                    chosen, pathway = ag_read, 'ag'
-                else:
-                    chosen, pathway = tc_read, 'tc'
-
+            def write_chosen(chosen, pathway, seq_dict):
                 chosen.reference_id = template_bam.get_tid(chosen.reference_name)
                 chosen.query_qualities = None
-                if pathway == 'ag':
-                    chosen.is_reverse = False
-                    chosen.query_sequence = read_dict_ag[read_id]
-                else:
-                    chosen.is_reverse = True
-                    chosen.query_sequence = read_dict_tc[read_id]
-
+                chosen.is_reverse = (pathway != 'ag')
+                chosen.query_sequence = seq_dict[chosen.query_name]
                 out.write(chosen)
+
+            with pysam.AlignmentFile(stream_bam, "rb") as sbam:
+                for stream_read in sbam:
+                    if (stream_read.is_unmapped or stream_read.is_secondary
+                            or stream_read.is_supplementary):
+                        continue
+                    index_read = index_hits.pop(stream_read.query_name, None)
+                    if index_read is None:
+                        write_chosen(stream_read, stream_pathway, stream_dict)
+                    else:
+                        ambiguous += 1
+                        if index_read.mapping_quality >= stream_read.mapping_quality:
+                            write_chosen(index_read, index_pathway, index_dict)
+                        else:
+                            write_chosen(stream_read, stream_pathway, stream_dict)
+
+            # whatever's left in index_hits mapped only via the index pathway
+            for index_read in index_hits.values():
+                write_chosen(index_read, index_pathway, index_dict)
 
     if ambiguous:
         print(f'  {ambiguous} reads mapped via both the A->G and T->C pathways; '
@@ -261,12 +287,19 @@ def plot_editing_efficiency(efficiencies, output_file):
     plt.savefig(output_file, dpi=300)
 
 
-def align_reads(reads_bam, ref_fasta, out_bam):
+def align_reads(reads_bam, ref_fasta, out_bam, keep_intermediates=False):
     """
     Run the full dual-pathway (A->G / T->C) alignment strategy described in
     this module's docstring against reads_bam/ref_fasta. Returns the path to
     the final sorted, indexed bam. Importable so other scripts (e.g. a
     combined align+parquet pipeline) can call it directly.
+
+    keep_intermediates: if False (default), delete this run's per-run
+    intermediates (mutated bams, per-pathway tmp alignment bams, and the
+    pre-sort merged bam) once the final sorted+indexed bam exists. The
+    mutated reference fastas are never deleted here -- they're cached and
+    reused across runs against the same genome (see mutateFastaAG/
+    mutateFastaTC's staleness check), not owned by this one run.
     """
     mutated_bam_ag, read_dict_ag = mutateBamSenseAG(reads_bam)
     mutated_bam_tc, read_dict_tc = mutateBamAntisenseTC(reads_bam)
@@ -284,6 +317,16 @@ def align_reads(reads_bam, ref_fasta, out_bam):
     aligned_bam = merge_dual_pathway_alignments(
         tmp_ag_bam, tmp_tc_bam, read_dict_ag, read_dict_tc, out_bam)
     print(f'Aligned bam file: {aligned_bam}')
+
+    if not keep_intermediates:
+        intermediates = [mutated_bam_ag, mutated_bam_tc, tmp_ag_bam, tmp_tc_bam, out_bam]
+        removed = 0
+        for path in intermediates:
+            if Path(path).exists():
+                Path(path).unlink()
+                removed += 1
+        print(f'Removed {removed} intermediate file(s): {", ".join(intermediates)}')
+
     return aligned_bam
 
 
@@ -292,9 +335,13 @@ def main():
     parser.add_argument('--reads_bam', required=True, help='Input unaligned bam file from Dorado basecalling')
     parser.add_argument('--ref_fasta', required=True, help='Reference fasta file')
     parser.add_argument('--out_bam', required=True, help='Output aligned bam file')
+    parser.add_argument('--keep_intermediates', action='store_true',
+                        help='Keep per-run intermediate bams (mutated bams, per-pathway '
+                             'tmp alignments, pre-sort merged bam) instead of deleting them')
     args = parser.parse_args()
 
-    align_reads(args.reads_bam, args.ref_fasta, args.out_bam)
+    align_reads(args.reads_bam, args.ref_fasta, args.out_bam,
+                keep_intermediates=args.keep_intermediates)
     # # calculate editing efficiency
     # ref_dict = SeqIO.to_dict(SeqIO.parse(args.ref_fasta, 'fasta'))
     # e = get_editing_efficiency(aligned_bam, ref_dict)
