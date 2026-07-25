@@ -425,6 +425,264 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
            "edits": eds, "win_n": win_n}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# HMM3: explicit-duration (semi-Markov) version of the above.
+#
+# State A (unprotected) is unchanged: geometric dwell, rate a_AB to exit.
+# State B (protected) no longer has a constant per-nt exit rate -- instead
+# it has an explicit nt-length duration pmf D_B, so a candidate protected
+# run competes against "does this length look like a ribosome footprint"
+# rather than being explained equally well by any length (which is what a
+# memoryless geometric does, and why it can't tell a real footprint apart
+# from an arbitrarily-sized secondary-structure block).
+#
+# Segment length is measured on the observed-site grid (distance in nt from
+# the last site before a run to the last site inside it), matching the same
+# granularity classify_positions_hmm2 already accepts for its Tstep/gap
+# correction -- the exact boundary between two consecutive scored sites is
+# unidentifiable from data anyway, since nothing is observed in between.
+#
+# THIS IS A FIRST DRAFT, not yet validated against synthetic data with a
+# known duration distribution -- do that before trusting it on real reads.
+# In particular the segment-posterior rescaling (un-scaling alphaA/betaA
+# back to true probabilities via the recorded log_c cumulative sums) is the
+# trickiest part of this math and the most likely place for a subtle bug.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _duration_pmf_default(mean_nt=30.0, sd_nt=6.0, dmax=120):
+    """
+    Discretized Gaussian duration pmf, D_B[d-1] = P(protected segment length
+    == d nt) for d = 1..dmax. Placeholder so classify_positions_hmm3 is
+    runnable/sanity-checkable before a Baum-Welch training loop exists to
+    re-estimate D_B from real query data.
+    """
+    d = np.arange(1, dmax + 1, dtype=float)
+    w = np.exp(-0.5 * ((d - mean_nt) / sd_nt) ** 2)
+    return w / w.sum()
+
+
+def _duration_to_hazard(D_B):
+    """
+    Convert a duration pmf D_B[d-1] = P(length == d), d = 1..Dmax, into
+    per-duration hazard rates: hazard[d-1] = P(segment ends at length d |
+    it already reached length d) = D_B(d) / P(length >= d). The last entry
+    is forced to 1.0 -- a segment can't run past Dmax by construction.
+    """
+    Dmax = len(D_B)
+    tail = np.cumsum(D_B[::-1])[::-1]        # tail[i] = P(length >= i+1)
+    hazard = np.array([D_B[i] / tail[i] if tail[i] > 1e-300 else 1.0
+                       for i in range(Dmax)])
+    hazard[-1] = 1.0
+    return hazard
+
+
+def _forward_backward_hsmm(coords, eA, eB, pi_A, a_AB, D_B):
+    """
+    Explicit-duration (semi-Markov) forward-backward for the 2-state model
+    described in the module notes above, via the standard "expanded state"
+    equivalence: any discrete duration distribution can be represented
+    EXACTLY as an ordinary Markov chain by giving state B one sub-state per
+    possible elapsed duration (B_1..B_Dmax), each advancing to the next or
+    exiting to A with a duration-specific hazard rate. That reduces the
+    whole thing to a plain forward-backward over a bigger state space -- the
+    same recursion classify_positions_hmm2 already uses, just more states --
+    instead of custom segment-indexed math.
+
+    (An earlier version of this function used hand-derived segment-indexed
+    recursions directly on the sparse site list. It had a real bug -- P_B
+    blowing up past 1, log-likelihood off by ~9 nats -- caught by
+    cross-checking against exactly this expanded-chain construction used as
+    a brute-force reference. Since the reference checked out and is far
+    simpler to reason about, it's now the actual implementation rather than
+    just a validation tool.)
+
+    Runs at full nucleotide resolution across [coords[0], coords[-1]], not
+    skipping between sites the way the 2-state Tstep/gap trick does, since
+    duration bookkeeping needs single-nt granularity. Fine computationally
+    for one gene's span (at most a few kb).
+
+    coords, eA, eB: as before, per SCORED SITE (sparse)
+    D_B: duration pmf, D_B[d-1] = P(protected segment length == d nt)
+
+    Returns:
+      post_B       -- np.array, P(site k is state B | all observations)
+      expected_len -- dict {d: expected number of length-d segments implied
+                      by this read} -- this read's contribution to a
+                      Baum-Welch M-step's duration histogram: the standard
+                      xi-statistic for the B_d -> A transition
+      loglik       -- natural-log likelihood of this read under the model
+      extra        -- dict with the two sufficient statistics an M-step for
+                      a_AB needs, pooled the same way as expected_len:
+                        "expected_A_occupancy" = expected nt spent in state A
+                        "expected_AB_starts"   = expected number of A->B_1
+                                                 (new block) events
+    """
+    Dmax   = len(D_B)
+    hazard = _duration_to_hazard(D_B)
+    S      = 1 + Dmax    # state 0 = A, states 1..Dmax = B_1..B_Dmax
+
+    T = np.zeros((S, S))
+    T[0, 0] = 1 - a_AB
+    T[0, 1] = a_AB
+    for d in range(1, Dmax):            # B_d (1-indexed) is row/col d
+        T[d, d + 1] = 1 - hazard[d - 1]
+        T[d, 0]     = hazard[d - 1]
+    T[Dmax, 0] = 1.0                    # forced exit at max duration
+
+    pi = np.zeros(S)
+    pi[0] = pi_A
+    pi[1] = 1.0 - pi_A
+
+    L = int(coords[-1] - coords[0]) + 1
+    site_at = {int(c - coords[0]): i for i, c in enumerate(coords)}
+
+    def emis_vec(t):
+        e = np.ones(S)
+        i = site_at.get(t)
+        if i is not None:
+            e[0]  = eA[i]
+            e[1:] = eB[i]
+        return e
+
+    alpha = np.zeros((L, S)); c = np.zeros(L)
+    v = pi * emis_vec(0); c[0] = v.sum(); alpha[0] = v / c[0]
+    for t in range(1, L):
+        v = (alpha[t - 1] @ T) * emis_vec(t)
+        c[t] = v.sum(); alpha[t] = v / c[t]
+
+    beta = np.zeros((L, S)); beta[-1] = 1.0
+    for t in range(L - 2, -1, -1):
+        beta[t] = (T @ (emis_vec(t + 1) * beta[t + 1])) / c[t + 1]
+
+    post = alpha * beta
+    post /= post.sum(axis=1, keepdims=True)
+
+    post_B = np.array([post[int(c_ - coords[0]), 1:].sum() for c_ in coords])
+    loglik = float(np.sum(np.log(c)))
+
+    # expected_len[d]: expected number of "B_d -> A" exits across the whole
+    # read -- the standard Baum-Welch xi-statistic for that one transition,
+    # summed over every nt position. This is exactly what an M-step would
+    # accumulate across many reads to re-estimate D_B.
+    expected_len = collections.defaultdict(float)
+    expected_AB_starts = 0.0
+    for t in range(L - 1):
+        e_next = emis_vec(t + 1)
+        for d in range(1, Dmax + 1):
+            if alpha[t, d] <= 0.0:
+                continue
+            xi = alpha[t, d] * T[d, 0] * e_next[0] * beta[t + 1, 0] / c[t + 1]
+            if xi > 1e-12:
+                expected_len[d] += xi
+        if alpha[t, 0] > 0.0:
+            expected_AB_starts += alpha[t, 0] * T[0, 1] * e_next[1] * beta[t + 1, 1] / c[t + 1]
+
+    # expected_A_occupancy: expected total nt spent in state A, i.e.
+    # sum_t gamma_t(A) -- gamma is just post[:,0] here (already normalized).
+    expected_A_occupancy = float(post[:, 0].sum())
+
+    extra = {"expected_A_occupancy": expected_A_occupancy,
+             "expected_AB_starts": expected_AB_starts}
+
+    return post_B, dict(expected_len), loglik, extra
+
+
+def classify_positions_hmm3(model, read_id, chrom, edit_string,
+                            absolute_indices, gpos_to_tx,
+                            coord="tx", D_B=None, a_AB=None):
+    """
+    Explicit-duration (semi-Markov) counterpart to classify_positions_hmm2.
+    Same output schema (one dict per read, yielded) so this is a drop-in
+    for write_shadow_calls_to_df / the plotting functions -- plus one extra
+    key, "expected_seg_len", this read's contribution to the segment-length
+    histogram a future Baum-Welch training loop would accumulate across
+    many reads to re-estimate D_B.
+
+    D_B, a_AB: pulled from `model` if not passed explicitly
+    (model["D_B"], model["a_AB"]) -- these are exactly the two things a
+    training loop would fit from real query data. Falls back to a
+    placeholder Gaussian D_B and the same a_AB formula
+    classify_positions_hmm2 uses, so this runs before that training loop
+    exists.
+
+    NOTE: "surprise" (per-site -log10 P(bit | past)) doesn't have as clean
+    a per-site decomposition here as it did under hmm2's per-step scaling
+    factors, since a single segment can span many sites at once. Left as
+    NaN for now -- needs its own derivation, not a guessed placeholder.
+    """
+    n_edit = len(edit_string)
+
+    sites = []
+    for i, ref_pos in enumerate(absolute_indices):
+        if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+            continue
+        ref_pos = int(ref_pos)
+        if ref_pos not in gpos_to_tx or i >= n_edit:
+            continue
+        ev = edit_string[i]
+        if ev == "2":
+            continue
+        tx = gpos_to_tx[ref_pos]
+        if tx not in model["pA"] or tx not in model["pB"]:
+            continue
+        sites.append((tx, ref_pos, int(ev), model["pA"][tx], model["pB"][tx]))
+
+    if not sites:
+        yield {"read_id": read_id, "chrom": chrom, "absolute_indices": [], "tx": [],
+               "labels": [], "P_A": [], "P_B": [], "logL_A": [], "logL_B": [],
+               "surprise": [], "edits": [], "win_n": [], "expected_seg_len": {}}
+        return
+
+    key = (lambda s: s[0]) if coord == "tx" else (lambda s: s[1])
+    indexed = list(enumerate(sites))
+    ordered = sorted(indexed, key=lambda p: key(p[1]))
+    coords  = np.array([key(s) for _ri, s in ordered], dtype=float)
+    n = len(ordered)
+
+    if D_B is None:
+        D_B = model.get("D_B")
+        if D_B is None:
+            D_B = _duration_pmf_default(mean_nt=model.get("rpf_len_nt", 30))
+    if a_AB is None:
+        a_AB = model.get("a_AB")
+        if a_AB is None:
+            occupancy     = 1.0 - model["prior_A"]
+            mean_block_nt = model.get("rpf_len_nt", 30)
+            a_BA          = 1.0 / mean_block_nt
+            a_AB          = a_BA * occupancy / (1.0 - occupancy)
+
+    pi_A = model["prior_A"]
+
+    bits    = [s[2] for _ri, s in ordered]
+    pA_list = [s[3] for _ri, s in ordered]
+    pB_list = [s[4] for _ri, s in ordered]
+    eA = np.array([pA_list[i] if bits[i] else 1 - pA_list[i] for i in range(n)])
+    eB = np.array([pB_list[i] if bits[i] else 1 - pB_list[i] for i in range(n)])
+
+    post_B, expected_len, _loglik, _extra = _forward_backward_hsmm(
+        coords, eA, eB, pi_A, a_AB, D_B)
+
+    pB_by_readidx = {ri: float(post_B[j]) for j, (ri, _s) in enumerate(ordered)}
+
+    positions, txs, labels = [], [], []
+    A, B, lA, lB, sur, eds, win_n = [], [], [], [], [], [], []
+    for ri, s in enumerate(sites):
+        tx, ref_pos, bit, pA_i, pB_i = s
+        pB_post = pB_by_readidx[ri]
+        positions.append(ref_pos); txs.append(tx)
+        A.append(1.0 - pB_post);  B.append(pB_post)
+        lA.append(math.log10(pA_i if bit else 1 - pA_i))
+        lB.append(math.log10(pB_i if bit else 1 - pB_i))
+        sur.append(float("nan"))               # see docstring note above
+        labels.append("B" if pB_post >= 0.5 else "A")
+        eds.append(bit); win_n.append(n)
+
+    yield {"read_id": read_id, "chrom": chrom, "absolute_indices": positions,
+           "tx": txs, "labels": labels, "P_A": A, "P_B": B,
+           "logL_A": lA, "logL_B": lB, "surprise": sur,
+           "edits": eds, "win_n": win_n, "expected_seg_len": expected_len}
+
+
 def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
                              ref_cov, gpos_to_tx, tx_to_gpos,
                              prob_threshold=0.5, min_win_n=1,

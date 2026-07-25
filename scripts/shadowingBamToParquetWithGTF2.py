@@ -34,10 +34,35 @@ Usage:
 
 import argparse
 import pysam
+from collections import defaultdict
 from pathlib import Path
 from Bio import SeqIO
 from intervaltree import IntervalTree
 import pandas as pd
+
+
+def build_barcode_lookup(summary_path):
+    '''Build a read_id -> barcode_arrangement lookup from a MinKNOW
+    sequencing_summary.txt (native barcoding kit runs). The summary file is
+    tens of GB, so only its read_id/barcode_arrangement columns are read,
+    and the result is cached as a small parquet file in the current working
+    directory (named after the summary file) so repeat runs don't re-scan
+    it. Cache is rebuilt if missing or older than the summary file.'''
+    summary_path = Path(summary_path)
+    cache_path = Path.cwd() / f"{summary_path.stem}_barcode_lookup.parquet"
+
+    if cache_path.exists() and cache_path.stat().st_mtime >= summary_path.stat().st_mtime:
+        print(f"  Loading cached barcode lookup from {cache_path}")
+        df = pd.read_parquet(cache_path)
+    else:
+        print(f"  Building barcode lookup from {summary_path} (scanning the full file once)...")
+        df = pd.read_csv(summary_path, sep='\t',
+                          usecols=['read_id', 'barcode_arrangement'],
+                          dtype={'read_id': str, 'barcode_arrangement': 'category'})
+        df.to_parquet(cache_path, compression='zstd', index=False)
+        print(f"  Cached barcode lookup to {cache_path}")
+
+    return dict(zip(df['read_id'], df['barcode_arrangement'].astype(str)))
 
 
 def parse_gtf_attributes(attr_string):
@@ -121,8 +146,12 @@ def get_absolute_positions(read):
     return [p[1] for p in read.get_aligned_pairs()]
 
 
-def read_generator(bam_path, ref_sequence, chrom, strand_index, coding_only=False):
-    '''Yield one read dict at a time. Includes chrom as a field.'''
+def read_generator(bam_path, ref_sequence, chrom, strand_index, coding_only=False,
+                    barcode_lookup=None):
+    '''Yield one read dict at a time. Includes chrom as a field.
+    barcode_lookup: optional read_id -> barcode_arrangement dict (see
+    build_barcode_lookup); reads not found in it are labelled
+    "unclassified", same bucket as MinKNOW's own unclassified reads.'''
     ref_seq = str(ref_sequence).upper()
     with pysam.AlignmentFile(bam_path, "rb") as bam:
         for read in bam.fetch(chrom):
@@ -216,6 +245,8 @@ def read_generator(bam_path, ref_sequence, chrom, strand_index, coding_only=Fals
                 'edit_string':               edit_string,
                 'barcode':                   barcode,
                 'bar_seq':                   bar_seq,
+                'barcode_arrangement':       (barcode_lookup.get(read.query_name, 'unclassified')
+                                               if barcode_lookup is not None else None),
                 'read_sequence':             read_seq,
                 'read_sequence_aligned':     read_string,
                 'ref_sequence_aligned':      ref_string,
@@ -242,11 +273,16 @@ def write_chunk(df, base_path, chunk_index):
 
 
 def generate_parquet(bam_file, ref_fasta, output_dir, gtf_file,
-                      coding_only=False, chunk_size=50000):
+                      coding_only=False, chunk_size=50000, barcode_lookup=None):
     """
     Convert an aligned bam into chunked parquet files under output_dir.
     Returns the total number of reads written. Importable so other scripts
     (e.g. a combined align+parquet pipeline) can call it directly.
+
+    barcode_lookup: optional read_id -> barcode_arrangement dict (see
+    build_barcode_lookup). When given, output is split into one
+    output_dir/<barcode>/ subdirectory per barcode (unmatched reads go to
+    output_dir/unclassified/) instead of a single flat output_dir.
     """
     bam_file   = Path(bam_file)
     ref_fasta  = Path(ref_fasta)
@@ -259,39 +295,46 @@ def generate_parquet(bam_file, ref_fasta, output_dir, gtf_file,
 
     ref_dict = SeqIO.to_dict(SeqIO.parse(ref_fasta, "fasta"))
 
-    # Single parquet base path for all chromosomes combined
-    parquet_path = output_dir / f"{bam_file.stem}.parquet"
-
-    rows        = []
-    chunk_index = 0
+    # One buffer + chunk counter per barcode group; key is None (single flat
+    # output_dir) when barcode_lookup isn't given, else the barcode string.
+    rows        = defaultdict(list)
+    chunk_index = defaultdict(int)
     total       = 0
+
+    def flush(key):
+        base_dir = output_dir if key is None else output_dir / key
+        base_dir.mkdir(parents=True, exist_ok=True)
+        parquet_path = base_dir / f"{bam_file.stem}.parquet"
+        df = pd.DataFrame(rows[key])
+        df = optimize_dataframe(df)
+        write_chunk(df, parquet_path, chunk_index[key])
+        rows[key].clear()
+        chunk_index[key] += 1
 
     for chrom, ref_seq in ref_dict.items():
         print(f"Processing chromosome {chrom}...")
         chrom_total = 0
 
         for record in read_generator(bam_file, ref_seq.seq, chrom, strand_index,
-                                     coding_only=coding_only):
-            rows.append(record)
+                                     coding_only=coding_only, barcode_lookup=barcode_lookup):
+            key = record['barcode_arrangement'] if barcode_lookup is not None else None
+            rows[key].append(record)
             total += 1
             chrom_total += 1
 
-            if len(rows) >= chunk_size:
-                df = pd.DataFrame(rows)
-                df = optimize_dataframe(df)
-                write_chunk(df, parquet_path, chunk_index)
-                rows.clear()
-                chunk_index += 1
+            if len(rows[key]) >= chunk_size:
+                flush(key)
 
         print(f"  Finished {chrom}: {chrom_total} reads")
 
-    # Write any remaining rows
-    if rows:
-        df = pd.DataFrame(rows)
-        df = optimize_dataframe(df)
-        write_chunk(df, parquet_path, chunk_index)
+    # Write any remaining buffered rows for every barcode group
+    for key in list(rows.keys()):
+        if rows[key]:
+            flush(key)
 
-    print(f"All done! {total} total reads written across {chunk_index + 1} chunk(s)")
+    n_groups = len(chunk_index)
+    print(f"All done! {total} total reads written across {n_groups} barcode group(s), "
+          f"{sum(chunk_index.values())} chunk(s) total")
     return total
 
 
@@ -308,11 +351,20 @@ def main():
                         help="Only write reads assigned to protein-coding genes")
     parser.add_argument("--chunk_size",  type=int, default=50000,
                         help="Rows per output parquet chunk (default: 50000)")
+    parser.add_argument("--barcode_summary", type=str, default=None,
+                        help="Path to a MinKNOW sequencing_summary.txt with a "
+                             "barcode_arrangement column (native barcoding kit runs). "
+                             "When given, output is split into output_dir/<barcode>/ "
+                             "subdirectories (unmatched reads go to output_dir/unclassified/).")
 
     args = parser.parse_args()
 
+    barcode_lookup = (build_barcode_lookup(args.barcode_summary)
+                       if args.barcode_summary else None)
+
     generate_parquet(args.bam_file, args.ref_fasta, args.output_dir, args.gtf,
-                      coding_only=args.coding_only, chunk_size=args.chunk_size)
+                      coding_only=args.coding_only, chunk_size=args.chunk_size,
+                      barcode_lookup=barcode_lookup)
 
 
 if __name__ == '__main__':

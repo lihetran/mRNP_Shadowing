@@ -23,9 +23,15 @@ import collections
 from pathlib import Path
 
 import pysam
+import numpy as np
 import pandas as pd
 from logJosh import Tee
 import pickle
+
+from runHMMPerGene import _forward_backward_hsmm, _duration_pmf_default
+# NOTE: _gpos_to_tx_map is NOT imported -- this file already defines its own
+# copy below (matching this codebase's existing per-script duplication
+# convention); importing it too would just create a confusing shadow.
 
 def complement_base(b: str) -> str:
     return b.translate(str.maketrans("ACGTacgt", "TGCAtgca"))
@@ -485,6 +491,144 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None, block = 30):
             "w1": w1, "w0": w0,
             "prior_A": prior_A,
             "prior_log_odds": math.log(prior_A / (1 - prior_A)), "transA": transA, "transB": transB}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Baum-Welch for the explicit-duration (HMM3) model's transition parameters
+# (D_B, a_AB). Emissions (pA/pB, from train() above) stay fixed -- see the
+# design discussion this came out of: neither ribosome-less nor mock-TadA
+# contains real occupancy-switching to learn transitions from (ribosome-less
+# is always state A; mock-TadA is unedited, i.e. no signal either way), so
+# this fits transitions from the real experimental query reads instead --
+# the only population that actually contains a molecule switching between
+# genuinely edited and genuinely protected stretches.
+#
+# Fit ONE shared D_B/a_AB pooled across every gene, not per-gene: most genes
+# don't clear enough query reads to stably support a whole duration
+# histogram (Dmax free parameters) on their own.
+# ─────────────────────────────────────────────────────────────────────────
+
+def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
+                                 min_sites=2):
+    """
+    For every gene with an already-trained model (pA/pB, from train()),
+    collect that gene's query reads and precompute each read's (coords, eA,
+    eB) triplet -- the per-read input _forward_backward_hsmm needs. Pooled
+    across every gene, since D_B/a_AB are fit as ONE shared distribution
+    (see module notes above).
+
+    min_sites: skip reads with fewer than this many scored sites -- a read
+    with 0-1 sites carries no information about how state changes with
+    position, and just adds noise/cost to the E-step.
+    """
+    reads = []
+    for gname, gmodel in model_dict.items():
+        gene = genes.get(gname)
+        if gene is None:
+            continue
+
+        df_g = get_gene_df(query_df, gene, cds_spanning=False)
+        if df_g.empty:
+            continue
+
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+
+        for row in df_g.itertuples():
+            edit_str = row.edit_string
+            abs_idx  = row.absolute_indices
+            n_edit   = len(edit_str)
+
+            sites = []
+            for i, ref_pos in enumerate(abs_idx):
+                if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
+                    continue
+                ref_pos = int(ref_pos)
+                if ref_pos not in gpos_to_tx or i >= n_edit:
+                    continue
+                ev = edit_str[i]
+                if ev == "2":
+                    continue
+                tx = gpos_to_tx[ref_pos]
+                if tx not in gmodel["pA"] or tx not in gmodel["pB"]:
+                    continue
+                sites.append((tx, int(ev), gmodel["pA"][tx], gmodel["pB"][tx]))
+
+            if len(sites) < min_sites:
+                continue
+
+            sites.sort(key=lambda s: s[0])
+            coords = np.array([s[0] for s in sites], dtype=float)
+            bits   = [s[1] for s in sites]
+            pA_l   = [s[2] for s in sites]
+            pB_l   = [s[3] for s in sites]
+            eA = np.array([pA_l[i] if bits[i] else 1 - pA_l[i]
+                           for i in range(len(sites))])
+            eB = np.array([pB_l[i] if bits[i] else 1 - pB_l[i]
+                           for i in range(len(sites))])
+            reads.append((coords, eA, eB))
+
+    return reads
+
+
+def train_hsmm_durations(reads, pi_A, D_B_init=None, a_AB_init=None,
+                          max_iters=20, tol=1e-4, verbose=True):
+    """
+    Baum-Welch: fit a shared protected-state duration pmf D_B and entry rate
+    a_AB by EM over a pool of reads (coords, eA, eB) from
+    collect_hsmm_training_reads(). Each iteration:
+      E-step: run _forward_backward_hsmm on every read with the CURRENT
+              D_B/a_AB, accumulating each read's expected_len (duration
+              counts) and a_AB sufficient statistics, plus total
+              log-likelihood for a convergence check.
+      M-step: normalize the pooled duration counts into the new D_B;
+              new a_AB = pooled A->B starts / pooled A occupancy.
+
+    Returns (D_B, a_AB, history) where history is the total log-likelihood
+    per iteration -- should increase monotonically iteration to iteration
+    (that's the EM guarantee); if it doesn't, something's wrong upstream.
+    """
+    D_B  = D_B_init  if D_B_init  is not None else _duration_pmf_default()
+    a_AB = a_AB_init if a_AB_init is not None else 0.01
+    Dmax = len(D_B)
+
+    history = []
+    prev_ll = None
+
+    for it in range(max_iters):
+        total_len       = collections.defaultdict(float)
+        total_A_occ     = 0.0
+        total_AB_starts = 0.0
+        total_ll        = 0.0
+
+        for coords, eA, eB in reads:
+            _post_B, expected_len, loglik, extra = _forward_backward_hsmm(
+                coords, eA, eB, pi_A, a_AB, D_B)
+            total_ll += loglik
+            for d, w in expected_len.items():
+                total_len[d] += w
+            total_A_occ     += extra["expected_A_occupancy"]
+            total_AB_starts += extra["expected_AB_starts"]
+
+        history.append(total_ll)
+        if verbose:
+            print(f"  iter {it}: total logL = {total_ll:.2f}  "
+                  f"(a_AB={a_AB:.5f})", file=sys.stderr)
+
+        if prev_ll is not None and abs(total_ll - prev_ll) < tol * abs(prev_ll):
+            if verbose:
+                print(f"  converged after {it} iterations.", file=sys.stderr)
+            break
+        prev_ll = total_ll
+
+        # ---- M-step ----
+        len_sum = sum(total_len.values())
+        if len_sum > 0:
+            D_B = np.array([total_len.get(d, 1e-6) for d in range(1, Dmax + 1)])
+            D_B = D_B / D_B.sum()
+        if total_A_occ > 0:
+            a_AB = total_AB_starts / total_A_occ
+
+    return D_B, a_AB, history
 
 def parse_args():
     p = argparse.ArgumentParser(

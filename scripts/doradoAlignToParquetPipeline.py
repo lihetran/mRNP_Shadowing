@@ -13,7 +13,8 @@ Usage:
       --ref_fasta  genome.fa \
       --gtf        genome.gtf \
       --output_dir parquet_out/ \
-      [--out_bam aligned.bam] [--coding_only] [--chunk_size 50000]
+      [--out_bam aligned.bam] [--coding_only] [--chunk_size 50000] \
+      [--barcode_summary sequencing_summary.txt]
 
   from doradoAlignToParquetPipeline import run_pipeline
   run_pipeline(reads_bam="...", ref_fasta="...", gtf="...", output_dir="...")
@@ -22,16 +23,21 @@ import argparse
 from pathlib import Path
 
 from doradoAligner_AtoG import align_reads
-from shadowingBamToParquetWithGTF2 import generate_parquet
+from shadowingBamToParquetWithGTF2 import generate_parquet, build_barcode_lookup
 
 
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                   out_bam=None, coding_only=False, chunk_size=50000,
-                  keep_intermediates=False):
+                  keep_intermediates=False, barcode_summary=None):
     """
     Align reads_bam against ref_fasta (dual A->G/T->C pathway), then convert
     the resulting aligned bam straight into parquet chunks under output_dir.
     Returns (aligned_bam_path, total_reads_written).
+
+    barcode_summary: optional path to a MinKNOW sequencing_summary.txt with a
+    barcode_arrangement column (native barcoding kit runs). When given,
+    output is split into output_dir/<barcode>/ subdirectories (unmatched
+    reads go to output_dir/unclassified/).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -39,13 +45,16 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
     if out_bam is None:
         out_bam = str(output_dir / f"{Path(reads_bam).stem}_aligned.bam")
 
+    barcode_lookup = build_barcode_lookup(barcode_summary) if barcode_summary else None
+
     print(f"=== Step 1/2: aligning {reads_bam} ===")
     aligned_bam = align_reads(reads_bam, ref_fasta, out_bam,
                                keep_intermediates=keep_intermediates)
 
     print(f"\n=== Step 2/2: generating parquet from {aligned_bam} ===")
     total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
-                              coding_only=coding_only, chunk_size=chunk_size)
+                              coding_only=coding_only, chunk_size=chunk_size,
+                              barcode_lookup=barcode_lookup)
 
     return aligned_bam, total
 
@@ -67,12 +76,17 @@ def main():
                         help='Rows per output parquet chunk (default: 50000)')
     parser.add_argument('--keep_intermediates', action='store_true',
                         help='Keep per-run intermediate alignment bams instead of deleting them')
+    parser.add_argument('--barcode_summary', default=None,
+                        help='Path to a MinKNOW sequencing_summary.txt with a '
+                             'barcode_arrangement column (native barcoding kit runs). '
+                             'When given, output is split into output_dir/<barcode>/ '
+                             'subdirectories (unmatched reads go to output_dir/unclassified/).')
     args = parser.parse_args()
 
     aligned_bam, total = run_pipeline(
         args.reads_bam, args.ref_fasta, args.gtf, args.output_dir,
         out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size,
-        keep_intermediates=args.keep_intermediates)
+        keep_intermediates=args.keep_intermediates, barcode_summary=args.barcode_summary)
 
     print(f"\nPipeline complete: {total} reads written from {aligned_bam}")
 
