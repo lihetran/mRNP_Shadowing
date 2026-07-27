@@ -14,21 +14,57 @@ Usage:
       --gtf        genome.gtf \
       --output_dir parquet_out/ \
       [--out_bam aligned.bam] [--coding_only] [--chunk_size 50000] \
-      [--barcode_summary sequencing_summary.txt]
+      [--barcode_summary sequencing_summary.txt] [--shard_size 2000000]
 
   from doradoAlignToParquetPipeline import run_pipeline
   run_pipeline(reads_bam="...", ref_fasta="...", gtf="...", output_dir="...")
 """
 import argparse
+import pysam
 from pathlib import Path
 
 from doradoAligner_AtoG import align_reads
 from shadowingBamToParquetWithGTF2 import generate_parquet, build_barcode_lookup
 
 
+def shard_reads_bam(reads_bam, shard_size, shard_dir):
+    """
+    Stream reads_bam into a sequence of smaller unaligned bam shards of at
+    most shard_size reads each, written under shard_dir. A generator, not a
+    pre-materialized list: each shard path is yielded as soon as that shard
+    is written, so a caller that processes-and-deletes each shard before
+    asking for the next never needs more than ~1 extra shard's worth of
+    disk space, regardless of how many shards there are in total.
+    """
+    shard_dir = Path(shard_dir)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(reads_bam).stem
+
+    with pysam.AlignmentFile(reads_bam, "rb", check_sq=False) as in_bam:
+        shard_index = 0
+        out = None
+        count = 0
+        shard_path = None
+        for read in in_bam:
+            if out is None:
+                shard_path = shard_dir / f"{stem}_shard{shard_index}.bam"
+                out = pysam.AlignmentFile(str(shard_path), "wb", template=in_bam)
+                count = 0
+            out.write(read)
+            count += 1
+            if count >= shard_size:
+                out.close()
+                yield shard_path
+                out = None
+                shard_index += 1
+        if out is not None:
+            out.close()
+            yield shard_path
+
+
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                   out_bam=None, coding_only=False, chunk_size=50000,
-                  keep_intermediates=False, barcode_summary=None):
+                  keep_intermediates=False, barcode_summary=None, shard_size=None):
     """
     Align reads_bam against ref_fasta (dual A->G/T->C pathway), then convert
     the resulting aligned bam straight into parquet chunks under output_dir.
@@ -38,25 +74,75 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
     barcode_arrangement column (native barcoding kit runs). When given,
     output is split into output_dir/<barcode>/ subdirectories (unmatched
     reads go to output_dir/unclassified/).
+
+    shard_size: optional read count per shard. doradoAligner_AtoG's
+    dual-pathway alignment holds every read's full sequence in memory twice
+    (once per pathway) for the whole duration of the alignment step, which
+    OOMs on tens-of-millions-of-read runs. When shard_size is given,
+    reads_bam is streamed into shards of at most this many reads, each
+    fully aligned and converted to parquet (accumulating into the same
+    output_dir/<barcode>/ subdirectories) before the next shard is even
+    created, bounding peak memory to one shard's worth instead of the
+    whole input. When omitted, behaves exactly as before (single pass).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if out_bam is None:
-        out_bam = str(output_dir / f"{Path(reads_bam).stem}_aligned.bam")
+    # Built once regardless of sharding -- it doesn't depend on the shard,
+    # and building it before alignment would otherwise sit in memory
+    # needlessly throughout the (already memory-heavy) alignment step.
+    barcode_lookup = None
 
+    if not shard_size:
+        if out_bam is None:
+            out_bam = str(output_dir / f"{Path(reads_bam).stem}_aligned.bam")
+
+        print(f"=== Step 1/2: aligning {reads_bam} ===")
+        aligned_bam = align_reads(reads_bam, ref_fasta, out_bam,
+                                   keep_intermediates=keep_intermediates)
+
+        barcode_lookup = build_barcode_lookup(barcode_summary) if barcode_summary else None
+
+        print(f"\n=== Step 2/2: generating parquet from {aligned_bam} ===")
+        total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
+                                  coding_only=coding_only, chunk_size=chunk_size,
+                                  barcode_lookup=barcode_lookup)
+
+        return aligned_bam, total
+
+    # Sharded path: barcode lookup is shared across shards, built once up
+    # front since it doesn't grow with shard count and every shard needs it.
     barcode_lookup = build_barcode_lookup(barcode_summary) if barcode_summary else None
 
-    print(f"=== Step 1/2: aligning {reads_bam} ===")
-    aligned_bam = align_reads(reads_bam, ref_fasta, out_bam,
-                               keep_intermediates=keep_intermediates)
+    shard_dir = output_dir / f"{Path(reads_bam).stem}_shards"
+    total = 0
+    last_aligned_bam = None
 
-    print(f"\n=== Step 2/2: generating parquet from {aligned_bam} ===")
-    total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
-                              coding_only=coding_only, chunk_size=chunk_size,
-                              barcode_lookup=barcode_lookup)
+    for i, shard_path in enumerate(shard_reads_bam(reads_bam, shard_size, shard_dir)):
+        print(f"\n=== Shard {i}: {shard_path} ===")
+        shard_out_bam = str(shard_dir / f"{shard_path.stem}_aligned.bam")
 
-    return aligned_bam, total
+        print(f"--- Step 1/2: aligning {shard_path} ---")
+        aligned_bam = align_reads(str(shard_path), ref_fasta, shard_out_bam,
+                                   keep_intermediates=keep_intermediates)
+
+        print(f"--- Step 2/2: generating parquet from {aligned_bam} ---")
+        shard_total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
+                                        coding_only=coding_only, chunk_size=chunk_size,
+                                        barcode_lookup=barcode_lookup)
+        total += shard_total
+        last_aligned_bam = aligned_bam
+        print(f"  Shard {i} done: {shard_total} reads (running total: {total})")
+
+        if not keep_intermediates:
+            for p in (shard_path, Path(aligned_bam), Path(str(aligned_bam) + ".bai")):
+                if p.exists():
+                    p.unlink()
+
+    if not keep_intermediates and shard_dir.exists() and not any(shard_dir.iterdir()):
+        shard_dir.rmdir()
+
+    return last_aligned_bam, total
 
 
 def main():
@@ -81,12 +167,19 @@ def main():
                              'barcode_arrangement column (native barcoding kit runs). '
                              'When given, output is split into output_dir/<barcode>/ '
                              'subdirectories (unmatched reads go to output_dir/unclassified/).')
+    parser.add_argument('--shard_size', type=int, default=None,
+                        help='Read count per shard. doradoAligner_AtoG holds every read\'s '
+                             'full sequence in memory twice for the whole alignment step, '
+                             'which OOMs on tens-of-millions-of-read runs; sharding bounds '
+                             'peak memory to one shard at a time (try 2000000 as a starting '
+                             'point). Omit for the original single-pass behavior.')
     args = parser.parse_args()
 
     aligned_bam, total = run_pipeline(
         args.reads_bam, args.ref_fasta, args.gtf, args.output_dir,
         out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size,
-        keep_intermediates=args.keep_intermediates, barcode_summary=args.barcode_summary)
+        keep_intermediates=args.keep_intermediates, barcode_summary=args.barcode_summary,
+        shard_size=args.shard_size)
 
     print(f"\nPipeline complete: {total} reads written from {aligned_bam}")
 

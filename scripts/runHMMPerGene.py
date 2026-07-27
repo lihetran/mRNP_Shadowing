@@ -449,16 +449,23 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
 # trickiest part of this math and the most likely place for a subtle bug.
 # ─────────────────────────────────────────────────────────────────────────
 
-def _duration_pmf_default(mean_nt=30.0, sd_nt=6.0, dmax=120):
-    """
-    Discretized Gaussian duration pmf, D_B[d-1] = P(protected segment length
-    == d nt) for d = 1..dmax. Placeholder so classify_positions_hmm3 is
-    runnable/sanity-checkable before a Baum-Welch training loop exists to
-    re-estimate D_B from real query data.
-    """
-    d = np.arange(1, dmax + 1, dtype=float)
-    w = np.exp(-0.5 * ((d - mean_nt) / sd_nt) ** 2)
-    return w / w.sum()
+def get_duration_pmf(mode="gaussian", dmax=120, **kwargs):
+    if mode == "gaussian":
+        return _duration_pmf_default(
+            mean_nt=kwargs.get("mean_nt", 50.0),
+            sd_nt=kwargs.get("sd_nt", 6.0),
+            dmax=dmax)
+    elif mode == "bimodal":
+        return _duration_pmf_bimodal(
+            mean1=kwargs.get("mean1", 50.0),
+            sd1=kwargs.get("sd1", 4.0),
+            weight1=kwargs.get("weight1", 0.6),
+            mean2=kwargs.get("mean2", 80.0),
+            sd2=kwargs.get("sd2", 6.0),
+            dmax=dmax)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
 
 
 def _duration_to_hazard(D_B):
@@ -519,8 +526,8 @@ def _forward_backward_hsmm(coords, eA, eB, pi_A, a_AB, D_B):
     """
     Dmax   = len(D_B)
     hazard = _duration_to_hazard(D_B)
-    S      = 1 + Dmax    # state 0 = A, states 1..Dmax = B_1..B_Dmax
-
+    S = 1 + Dmax    # state 0 = A, states 1..Dmax = B_1..B_Dmax
+    ## Build Transition matrix T[s_from, s_to] = P(next_state | current_state)
     T = np.zeros((S, S))
     T[0, 0] = 1 - a_AB
     T[0, 1] = a_AB
@@ -528,7 +535,7 @@ def _forward_backward_hsmm(coords, eA, eB, pi_A, a_AB, D_B):
         T[d, d + 1] = 1 - hazard[d - 1]
         T[d, 0]     = hazard[d - 1]
     T[Dmax, 0] = 1.0                    # forced exit at max duration
-
+    ## Initial state distribution: pi[s] = P(state at t=0)
     pi = np.zeros(S)
     pi[0] = pi_A
     pi[1] = 1.0 - pi_A
