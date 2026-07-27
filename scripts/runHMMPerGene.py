@@ -21,6 +21,22 @@ def complement_base(b: str) -> str:
 def reverse_complement(seq: str) -> str:
     return seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
 
+_TEX_ESCAPE = {
+    "\\": r"\textbackslash{}", "_": r"\_", "%": r"\%", "$": r"\$",
+    "#": r"\#", "&": r"\&", "{": r"\{", "}": r"\}",
+    "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+}
+
+def tex_escape(s) -> str:
+    """
+    PyX's canvas.text() runs its argument through TeX, where _ % $ # & { } ~ ^
+    \\ are all special characters -- an unescaped one (e.g. a --label or
+    gene_name containing "_") crashes with "Missing $ inserted." deep in
+    pyx.text. Everything placed in a plot title/label here is user- or
+    data-supplied (CLI --label, GTF gene_name, read_id), so escape it first.
+    """
+    return "".join(_TEX_ESCAPE.get(ch, ch) for ch in str(s))
+
 def _available_columns(parquet_dir: str, wanted: list) -> list:
     """Which of `wanted` columns actually exist in this dir's parquet schema
     (checked against just the first chunk -- every chunk in one library
@@ -471,7 +487,7 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
 # trickiest part of this math and the most likely place for a subtle bug.
 # ─────────────────────────────────────────────────────────────────────────
 
-def _duration_pmf_default(mean_nt=30.0, sd_nt=6.0, dmax=120):
+def _duration_pmf_default(mean_nt=50.0, sd_nt=6.0, dmax=120):
     """
     Discretized Gaussian duration pmf, D_B[d-1] = P(protected segment length
     == d nt) for d = 1..dmax. Placeholder so classify_positions_hmm3 is
@@ -530,6 +546,43 @@ def _duration_to_hazard(D_B):
                        for i in range(Dmax)])
     hazard[-1] = 1.0
     return hazard
+
+
+def plot_duration_hazard(D_B, output_path, title=None, a_AB=None):
+    """
+    Quick look at a duration pmf D_B and its implied hazard curve
+    (_duration_to_hazard) side by side -- for eyeballing whether a candidate
+    D_B (placeholder Gaussian/bimodal now, Baum-Welch-fit later) has the
+    shape you expect before trusting it inside classify_positions_hmm3.
+    Matplotlib rather than PyX/TeX -- this is a throwaway diagnostic, not a
+    per-gene report figure.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    D_B = np.asarray(D_B, dtype=float)
+    hazard = _duration_to_hazard(D_B)
+    d = np.arange(1, len(D_B) + 1)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+
+    ax1.plot(d, D_B, color="tab:blue")
+    ax1.set_ylabel("P(length = d)")
+    ax1.set_title(title or "Duration pmf D_B")
+
+    ax2.plot(d, hazard, color="tab:red")
+    ax2.set_ylabel("hazard(d) = P(exit | length >= d)")
+    ax2.set_xlabel("protected segment length (nt)")
+    ax2.set_ylim(0, 1.05)
+
+    if a_AB is not None:
+        fig.suptitle(f"a_AB (A→B entry rate) = {a_AB:.4g}", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote duration/hazard plot to {output_path}", file=sys.stderr)
 
 
 def _forward_backward_hsmm(coords, eA, eB, pi_A, a_AB, D_B):
@@ -643,7 +696,7 @@ def _forward_backward_hsmm(coords, eA, eB, pi_A, a_AB, D_B):
     return post_B, dict(expected_len), loglik, extra
 
 
-def classify_positions_hmm3(model, read_id, chrom, edit_string,
+def classify_positions_hsmm(model, read_id, chrom, edit_string,
                             absolute_indices, gpos_to_tx,
                             coord="tx", D_B=None, a_AB=None):
     """
@@ -913,7 +966,7 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         title_y = g_cov.ypos + g_cov.height + 0.4
 
     c.text(g_meta.xpos + g_meta.width / 2., title_y,
-           f"{gene_name} - {label2}",
+           f"{tex_escape(gene_name)} - {tex_escape(label2)}",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     n_show = min(num_reads, len(df))
@@ -964,7 +1017,7 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
         label_txt = str(row["read_id"])[:20] if "read_id" in df.columns else f"read {jj}"
         c.text(panel_w + 0.15, ypos + tick_h + read_h / 2.,
-               label_txt, [pyx_text.valign.middle, pyx_text.size.tiny])
+               tex_escape(label_txt), [pyx_text.valign.middle, pyx_text.size.tiny])
 
     c.writePDFfile(pdf_path)
 
@@ -1110,11 +1163,12 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
 
         # inline legend, top-left inside the coverage panel
         for kk, (_d, col, lab) in enumerate(cov_tracks):
-            c.text(g_cov.xpos + 0.2, g_cov.ypos + cov_h - 0.18 - kk * 0.28, lab,
+            c.text(g_cov.xpos + 0.2, g_cov.ypos + cov_h - 0.18 - kk * 0.28, tex_escape(lab),
                    [pyx_text.halign.left, pyx_text.valign.top, pyx_text.size.tiny, col])
         title_y = g_cov.ypos + g_cov.height + 0.4
 
-    c.text(g_meta.xpos + g_meta.width / 2., title_y, f"{gene_name} - {label3}",
+    c.text(g_meta.xpos + g_meta.width / 2., title_y,
+           f"{tex_escape(gene_name)} - {tex_escape(label3)}",
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     # ── individual read panels: upper trace / edit ticks / lower trace ───────
@@ -1170,7 +1224,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         c.insert(g_ticks)
 
         label_txt = str(row["read_id"])[:20] if "read_id" in df.columns else f"read {jj}"
-        c.text(panel_w + 0.15, ypos + half_h + tick_h / 2., label_txt,
+        c.text(panel_w + 0.15, ypos + half_h + tick_h / 2., tex_escape(label_txt),
                [pyx_text.valign.middle, pyx_text.size.tiny])
 
     # print(f"y_lim_hi={y_lim_hi!r}  y_lim_lo={y_lim_lo!r}  "
@@ -1255,7 +1309,10 @@ def main():
 
     shadow_call_frames = []
     shadow_calls_path = f"{out}_shadow_calls.parquet"
-
+    ## Build D_B from the placeholder, then run the Hidden semi-Markov model
+    D_B = get_duration_pmf(mode="bimodal", dmax=150)
+    ## plot duration distribution
+    plot_duration_hazard(D_B, f"{out}_duration_distribution.pdf", title=f"Duration distribution")
     for i, gname in enumerate(gene_names):
         if (i + 1) % 50 == 0:
             print(f"  {i + 1}/{len(gene_names)} scanned, "
@@ -1286,10 +1343,17 @@ def main():
 
         rows = []
         for _, row in df_qry.iterrows():
-            rows.extend(classify_positions_hmm2(
+            ## two-state HMM classification of each read, yielding a list of dicts
+            # rows.extend(classify_positions_hmm2(
+            #     model_dict[gname], row['read_id'], row['chrom'],
+            #     row['edit_string'], row['absolute_indices'], gpos_to_tx,
+            # mean_block_nt=50, coord="tx", use_prior=True)
+            # )
+
+            ## Hidden semi-Markov model classification of each read, yielding a list of dicts
+            rows.extend(classify_positions_hsmm(
                 model_dict[gname], row['read_id'], row['chrom'],
-                row['edit_string'], row['absolute_indices'], gpos_to_tx,
-            mean_block_nt=50, coord="tx", use_prior=True)
+                row['edit_string'], row['absolute_indices'], gpos_to_tx, coord="tx", D_B=D_B)
             )
 
         df = pd.DataFrame(rows)
@@ -1320,8 +1384,6 @@ def main():
             shadow_call_frames.append(gene_calls)
     # print(calls_dict)
     # convert to
-
-
     if shadow_call_frames:
         shadow_df = pd.concat(shadow_call_frames, ignore_index=True)
         shadow_df.to_parquet(shadow_calls_path, index=False)
