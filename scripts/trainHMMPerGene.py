@@ -25,6 +25,7 @@ from pathlib import Path
 import pysam
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from logJosh import Tee
 import pickle
 
@@ -39,12 +40,35 @@ def complement_base(b: str) -> str:
 def reverse_complement(seq: str) -> str:
     return seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
 
-def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
+def _available_columns(parquet_dir: str, wanted: list) -> list:
+    """Which of `wanted` columns actually exist in this dir's parquet schema
+    (checked against just the first chunk -- every chunk in one library
+    shares one schema). Some optional columns (e.g. global_edit_freq) aren't
+    always present."""
+    parquet_dir = Path(parquet_dir)
+    chunks = sorted(parquet_dir.glob("*.parquet"))
+    if not chunks:
+        return wanted
+    have = set(pq.read_schema(chunks[0]).names)
+    return [c for c in wanted if c in have]
+
+
+def load_all_parquet_chunks(parquet_dir: str, columns=None) -> pd.DataFrame:
+    """
+    columns, if given, is passed straight to pd.read_parquet so pyarrow
+    never converts the unwanted columns to pandas objects in the first
+    place. Trimming columns AFTER a full-column read doesn't help peak
+    memory -- the Arrow-to-pandas conversion for big object columns
+    (read_sequence, aligned_pairs, ...) is what actually blows up RSS, and
+    that conversion has already happened by the time you slice columns off
+    the result (confirmed: on a real 725,847-read library, full-column
+    read+concat peaked at 51.9GB RSS vs. 3.67GB with columns= passed here).
+    """
     parquet_dir = Path(parquet_dir)
     chunks = sorted(parquet_dir.glob("*.parquet"))
     if not chunks:
         return pd.DataFrame()
-    dfs = [pd.read_parquet(c) for c in chunks]
+    dfs = [pd.read_parquet(c, columns=columns) for c in chunks]
     df  = pd.concat(dfs, ignore_index=True)
     print(f"  Loaded {len(df):,} reads from {len(chunks)} chunk(s).",
           file=sys.stderr)
@@ -511,17 +535,34 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None, block = 30):
 def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
                                  min_sites=2):
     """
-    For every gene with an already-trained model (pA/pB, from train()),
-    collect that gene's query reads and precompute each read's (coords, eA,
-    eB) triplet -- the per-read input _forward_backward_hsmm needs. Pooled
-    across every gene, since D_B/a_AB are fit as ONE shared distribution
-    (see module notes above).
+    Generator: for every gene with an already-trained model (pA/pB, from
+    train()), stream that gene's query reads and yield each read's (coords,
+    eA, eB) triplet -- the per-read input _forward_backward_hsmm needs.
+    Pooled across every gene, since D_B/a_AB are fit as ONE shared
+    distribution (see module notes above).
+
+    This used to build and return one big list holding every read across
+    every gene at once -- on a real full-scale query library that's a
+    genuine OOM risk (confirmed: a real run was killed at 63GB RSS). It's a
+    generator now specifically so train_hsmm_durations can re-stream this
+    fresh each EM iteration instead of ever holding the whole read set in
+    memory simultaneously. Only the columns actually used below are kept
+    from query_df, since the raw parquet also carries several large
+    per-read columns (aligned_pairs, read_sequence, ref_sequence_aligned,
+    ...) this function never touches -- dropping them here keeps this
+    function's own working set small regardless of what the caller does
+    with its own reference to query_df.
 
     min_sites: skip reads with fewer than this many scored sites -- a read
     with 0-1 sites carries no information about how state changes with
     position, and just adds noise/cost to the E-step.
     """
-    reads = []
+    needed_cols = ["chrom", "gene_strand", "read_start", "read_end",
+                   "edit_string", "absolute_indices"]
+    if "global_edit_freq" in query_df.columns:
+        needed_cols.append("global_edit_freq")
+    query_df = query_df[needed_cols]
+
     for gname, gmodel in model_dict.items():
         gene = genes.get(gname)
         if gene is None:
@@ -565,23 +606,30 @@ def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
                            for i in range(len(sites))])
             eB = np.array([pB_l[i] if bits[i] else 1 - pB_l[i]
                            for i in range(len(sites))])
-            reads.append((coords, eA, eB))
-
-    return reads
+            yield (coords, eA, eB)
 
 
 def train_hsmm_durations(reads, pi_A, D_B_init=None, a_AB_init=None,
                           max_iters=20, tol=1e-4, verbose=True):
     """
     Baum-Welch: fit a shared protected-state duration pmf D_B and entry rate
-    a_AB by EM over a pool of reads (coords, eA, eB) from
-    collect_hsmm_training_reads(). Each iteration:
+    a_AB by EM over a pool of reads (coords, eA, eB). Each iteration:
       E-step: run _forward_backward_hsmm on every read with the CURRENT
               D_B/a_AB, accumulating each read's expected_len (duration
               counts) and a_AB sufficient statistics, plus total
               log-likelihood for a convergence check.
       M-step: normalize the pooled duration counts into the new D_B;
               new a_AB = pooled A->B starts / pooled A occupancy.
+
+    reads: EITHER a plain list of (coords, eA, eB) tuples (fine for small
+    synthetic runs -- see test_hsmm.py, where materializing everything is
+    simplest), OR a zero-argument callable that returns a fresh
+    generator/iterable of the same tuples each time it's called -- use this
+    for real-scale training, passing e.g.
+        lambda: collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta)
+    Since collect_hsmm_training_reads is a generator, each E-step re-streams
+    reads from query_df instead of ever holding the full read set in memory
+    at once, which is exactly what OOM'd a real training run at 63GB RSS.
 
     Returns (D_B, a_AB, history) where history is the total log-likelihood
     per iteration -- should increase monotonically iteration to iteration
@@ -600,7 +648,8 @@ def train_hsmm_durations(reads, pi_A, D_B_init=None, a_AB_init=None,
         total_AB_starts = 0.0
         total_ll        = 0.0
 
-        for coords, eA, eB in reads:
+        current_reads = reads() if callable(reads) else reads
+        for coords, eA, eB in current_reads:
             _post_B, expected_len, loglik, extra = _forward_backward_hsmm(
                 coords, eA, eB, pi_A, a_AB, D_B)
             total_ll += loglik
@@ -632,7 +681,7 @@ def train_hsmm_durations(reads, pi_A, D_B_init=None, a_AB_init=None,
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Bernoulli Naive Bayes Shadow Classifier."
+        description="Train HMM models for each gene."
     )
     p.add_argument("--parquet1", required=True)
     p.add_argument("--parquet2", required=True)
@@ -650,8 +699,24 @@ def main():
 
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    train_df1 = load_all_parquet_chunks(args.parquet1)
-    train_df2 = load_all_parquet_chunks(args.parquet2)
+
+    # Only the columns get_gene_df/train() actually touch. This MUST be
+    # passed as columns= into pd.read_parquet (not sliced off afterward) --
+    # the raw parquet also carries several large per-read columns this
+    # script never uses (read_sequence, read_sequence_aligned,
+    # ref_sequence_aligned, aligned_pairs, gene_biotype, transcript_id,
+    # gene_name, barcode, bar_seq), and pyarrow's Arrow-to-pandas conversion
+    # for those columns is what actually blows up peak RSS -- that
+    # conversion has already happened by the time a post-load
+    # df[needed_cols] slice runs. Confirmed on a real 725,847-read library:
+    # full-column read+concat peaked at 51.9GB RSS vs. 3.67GB with columns=
+    # passed at read time.
+    needed_cols = ["chrom", "gene_strand", "read_start", "read_end",
+                   "edit_string", "absolute_indices", "global_edit_freq"]
+    cols1 = _available_columns(args.parquet1, needed_cols)
+    cols2 = _available_columns(args.parquet2, needed_cols)
+    train_df1 = load_all_parquet_chunks(args.parquet1, columns=cols1)
+    train_df2 = load_all_parquet_chunks(args.parquet2, columns=cols2)
 
     print(f"Loaded {len(train_df1):,} reads from {args.label1}.", file=sys.stderr)
     print(f"Loaded {len(train_df2):,} reads from {args.label2}.", file=sys.stderr)

@@ -8,6 +8,7 @@ from pathlib import Path
 import pysam
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import scipy.stats
 from logJosh import Tee
 import json
@@ -20,12 +21,33 @@ def complement_base(b: str) -> str:
 def reverse_complement(seq: str) -> str:
     return seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
 
-def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
+def _available_columns(parquet_dir: str, wanted: list) -> list:
+    """Which of `wanted` columns actually exist in this dir's parquet schema
+    (checked against just the first chunk -- every chunk in one library
+    shares one schema). Some optional columns (e.g. global_edit_freq) aren't
+    always present."""
+    parquet_dir = Path(parquet_dir)
+    chunks = sorted(parquet_dir.glob("*.parquet"))
+    if not chunks:
+        return wanted
+    have = set(pq.read_schema(chunks[0]).names)
+    return [c for c in wanted if c in have]
+
+
+def load_all_parquet_chunks(parquet_dir: str, columns=None) -> pd.DataFrame:
+    """
+    columns, if given, is passed straight to pd.read_parquet so pyarrow
+    never converts the unwanted columns (read_sequence, aligned_pairs, ...)
+    to pandas objects in the first place -- that Arrow-to-pandas conversion,
+    not the final DataFrame's resident size, is what actually blows up peak
+    RSS on a real full-scale library (confirmed in trainHMMPerGene.py: same
+    bug, 51.9GB peak with all columns vs. 3.67GB with columns= passed here).
+    """
     parquet_dir = Path(parquet_dir)
     chunks = sorted(parquet_dir.glob("*.parquet"))
     if not chunks:
         return pd.DataFrame()
-    dfs = [pd.read_parquet(c) for c in chunks]
+    dfs = [pd.read_parquet(c, columns=columns) for c in chunks]
     df  = pd.concat(dfs, ignore_index=True)
     print(f"  Loaded {len(df):,} reads from {len(chunks)} chunk(s).",
           file=sys.stderr)
@@ -449,6 +471,33 @@ def classify_positions_hmm2(model, read_id, chrom, edit_string,
 # trickiest part of this math and the most likely place for a subtle bug.
 # ─────────────────────────────────────────────────────────────────────────
 
+def _duration_pmf_default(mean_nt=30.0, sd_nt=6.0, dmax=120):
+    """
+    Discretized Gaussian duration pmf, D_B[d-1] = P(protected segment length
+    == d nt) for d = 1..dmax. Placeholder so classify_positions_hmm3 is
+    runnable/sanity-checkable before a Baum-Welch training loop exists to
+    re-estimate D_B from real query data.
+    """
+    d = np.arange(1, dmax + 1, dtype=float)
+    w = np.exp(-0.5 * ((d - mean_nt) / sd_nt) ** 2)
+    return w / w.sum()
+
+
+def _duration_pmf_bimodal(mean1, sd1, weight1, mean2, sd2, dmax):
+    """
+    Discretized two-component Gaussian mixture duration pmf -- for testing
+    whether protected-segment lengths look like a mixture of single-
+    ribosome and collided/disome footprints (see the ~50nt real-data
+    finding) rather than one unimodal shape. weight1 is the mixture weight
+    on the (mean1, sd1) component; the second component gets (1 - weight1).
+    """
+    d = np.arange(1, dmax + 1, dtype=float)
+    dens1 = np.exp(-0.5 * ((d - mean1) / sd1) ** 2) / (sd1 * math.sqrt(2 * math.pi))
+    dens2 = np.exp(-0.5 * ((d - mean2) / sd2) ** 2) / (sd2 * math.sqrt(2 * math.pi))
+    mix = weight1 * dens1 + (1.0 - weight1) * dens2
+    return mix / mix.sum()
+
+
 def get_duration_pmf(mode="gaussian", dmax=120, **kwargs):
     if mode == "gaussian":
         return _duration_pmf_default(
@@ -649,12 +698,12 @@ def classify_positions_hmm3(model, read_id, chrom, edit_string,
     if D_B is None:
         D_B = model.get("D_B")
         if D_B is None:
-            D_B = _duration_pmf_default(mean_nt=model.get("rpf_len_nt", 30))
+            D_B = _duration_pmf_default(mean_nt=model.get("rpf_len_nt", 50))
     if a_AB is None:
         a_AB = model.get("a_AB")
         if a_AB is None:
             occupancy     = 1.0 - model["prior_A"]
-            mean_block_nt = model.get("rpf_len_nt", 30)
+            mean_block_nt = model.get("rpf_len_nt", 50)
             a_BA          = 1.0 / mean_block_nt
             a_AB          = a_BA * occupancy / (1.0 - occupancy)
 
@@ -1168,7 +1217,11 @@ def main():
     args = parse_args()
     out = args.output
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    query_df = load_all_parquet_chunks(args.parquet)
+    needed_cols = ["chrom", "gene_strand", "read_start", "read_end",
+                   "edit_string", "absolute_indices", "global_edit_freq",
+                   "read_id"]
+    query_df = load_all_parquet_chunks(
+        args.parquet, columns=_available_columns(args.parquet, needed_cols))
     print(f"Loaded {len(query_df):,} reads from {args.label}.", file=sys.stderr)
     if args.model is not None:
         model_dict = load_model_from_pickle(args.model)
