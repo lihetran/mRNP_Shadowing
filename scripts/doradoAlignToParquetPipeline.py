@@ -64,7 +64,9 @@ def shard_reads_bam(reads_bam, shard_size, shard_dir):
 
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                   out_bam=None, coding_only=False, chunk_size=50000,
-                  keep_intermediates=False, barcode_summary=None, shard_size=None):
+                  keep_intermediates=False, barcode_summary=None, shard_size=None,
+                  splice_aware=False, use_junc_bed=True, max_intron_length=3000,
+                  flag_intron_threshold=2500, threads=3):
     """
     Align reads_bam against ref_fasta (dual A->G/T->C pathway), then convert
     the resulting aligned bam straight into parquet chunks under output_dir.
@@ -84,6 +86,38 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
     output_dir/<barcode>/ subdirectories) before the next shard is even
     created, bounding peak memory to one shard's worth instead of the
     whole input. When omitted, behaves exactly as before (single pass).
+
+    splice_aware: reads_bam is spliced mRNA/cDNA that may span introns.
+    Forwarded to doradoAligner_AtoG.align_reads -- see its docstring and
+    minimap2_align_splice_aware's docstring for why this does NOT just mean
+    "pass -x splice": plain splice-preset alignment was confirmed to
+    fabricate huge numbers of false splice junctions on real data, so this
+    uses a validated max-intron-length cap via dorado's own bundled
+    minimap2 binary instead of `dorado aligner` directly. False (default)
+    aligns as plain genomic DNA (map-ont) -- use this if reads_bam has no
+    real introns to worry about.
+
+    use_junc_bed: only relevant when splice_aware=True. Build a --junc-bed
+    from gtf and pass it to every alignment call (see
+    doradoAligner_AtoG.build_junction_bed) so minimap2 is biased toward
+    real annotated splice junctions. Set False to fall back to bare
+    splice-preset alignment (e.g. to compare against, or for a GTF whose
+    annotation isn't trustworthy).
+
+    max_intron_length: only relevant when splice_aware=True -- forwarded to
+    align_reads (minimap2 -G). Default 3000 is validated for this yeast
+    genome; pass something larger for organisms with bigger real introns.
+
+    flag_intron_threshold: forwarded to align_reads -- tags (doesn't drop)
+    reads whose longest N op still exceeds this length despite the -G cap,
+    since that cap is a soft minimap2 chaining heuristic and a residual few
+    percent of junctions slip past it on real data. See
+    doradoAligner_AtoG.merge_dual_pathway_alignments's docstring.
+
+    threads: forwarded to align_reads. Default (3) is conservative for a
+    shared machine; raise it when there's known headroom (idle cores, free
+    memory) -- safe to increase without multiplying memory usage, unlike
+    running multiple libraries through this pipeline concurrently.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -99,7 +133,10 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
 
         print(f"=== Step 1/2: aligning {reads_bam} ===")
         aligned_bam = align_reads(reads_bam, ref_fasta, out_bam,
-                                   keep_intermediates=keep_intermediates)
+                                   keep_intermediates=keep_intermediates,
+                                   gtf=gtf if use_junc_bed else None,
+                                   splice_aware=splice_aware, max_intron_length=max_intron_length,
+                                   flag_intron_threshold=flag_intron_threshold, threads=threads)
 
         barcode_lookup = build_barcode_lookup(barcode_summary) if barcode_summary else None
 
@@ -124,7 +161,10 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
 
         print(f"--- Step 1/2: aligning {shard_path} ---")
         aligned_bam = align_reads(str(shard_path), ref_fasta, shard_out_bam,
-                                   keep_intermediates=keep_intermediates)
+                                   keep_intermediates=keep_intermediates,
+                                   gtf=gtf if use_junc_bed else None,
+                                   splice_aware=splice_aware, max_intron_length=max_intron_length,
+                                   flag_intron_threshold=flag_intron_threshold, threads=threads)
 
         print(f"--- Step 2/2: generating parquet from {aligned_bam} ---")
         shard_total = generate_parquet(aligned_bam, ref_fasta, output_dir, gtf,
@@ -173,13 +213,43 @@ def main():
                              'which OOMs on tens-of-millions-of-read runs; sharding bounds '
                              'peak memory to one shard at a time (try 2000000 as a starting '
                              'point). Omit for the original single-pass behavior.')
+    parser.add_argument('--splice_aware', action='store_true',
+                        help='Align reads_bam as spliced mRNA/cDNA that may span introns, '
+                             'instead of plain genomic DNA. See '
+                             'doradoAligner_AtoG.minimap2_align_splice_aware\'s docstring for '
+                             'why this uses a validated max-intron-length cap via dorado\'s '
+                             'own bundled minimap2 binary rather than plain `dorado aligner '
+                             '-x splice` (which was confirmed to fabricate huge numbers of '
+                             'false splice junctions on real data).')
+    parser.add_argument('--no_junc_bed', action='store_true',
+                        help='Only relevant with --splice_aware. Skip building/using a '
+                             '--junc-bed from --gtf. By default the GTF is converted to a '
+                             'junction BED12 and passed to minimap2 to bias splice-site '
+                             'placement toward real annotated junctions.')
+    parser.add_argument('--max_intron_length', type=int, default=3000,
+                        help='Only relevant with --splice_aware: cap (bp) on minimap2 -G. '
+                             'Default 3000 is validated for this yeast genome; pass something '
+                             'larger for organisms with bigger real introns.')
+    parser.add_argument('--flag_intron_threshold', type=int, default=2500,
+                        help='Tag (not drop) reads whose longest N op exceeds this length '
+                             '(bp) with XJ:i:<length>, since --max_intron_length\'s -G cap is '
+                             'a soft chaining heuristic in minimap2 and a residual few percent '
+                             'of junctions still slip past it on real data. Default 2500 '
+                             'matches this genome\'s real annotated max intron (2483bp). Pass '
+                             '0 (or a negative value) to disable tagging.')
+    parser.add_argument('--threads', type=int, default=3,
+                        help='Threads for the alignment step (default 3, conservative for a '
+                             'shared machine). Raise this when there\'s known headroom.')
     args = parser.parse_args()
 
+    flag_intron_threshold = args.flag_intron_threshold if args.flag_intron_threshold > 0 else None
     aligned_bam, total = run_pipeline(
         args.reads_bam, args.ref_fasta, args.gtf, args.output_dir,
         out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size,
         keep_intermediates=args.keep_intermediates, barcode_summary=args.barcode_summary,
-        shard_size=args.shard_size)
+        shard_size=args.shard_size, splice_aware=args.splice_aware,
+        use_junc_bed=not args.no_junc_bed, max_intron_length=args.max_intron_length,
+        flag_intron_threshold=flag_intron_threshold, threads=args.threads)
 
     print(f"\nPipeline complete: {total} reads written from {aligned_bam}")
 
