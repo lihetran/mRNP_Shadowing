@@ -195,9 +195,61 @@ def _subtract_intervals(exons, cds):
             out.append((cur, ee))         # trailing piece
     return out
 
+def _gene_introns(gene: dict) -> list:
+    """
+    Genomic-order (start, end) intron intervals implied by gaps between the
+    gene's annotated exons. gene["exons"] is sorted in TRANSCRIPT order
+    (reversed for minus strand, see parse_gtf), so this re-sorts genomically
+    first -- introns are a genomic concept, independent of strand. Empty
+    for single-exon (intron-less) genes.
+
+    Kept as its own copy rather than imported from runHMMPerGene.py, same
+    convention as _gpos_to_tx_map (see polysomeShadowHMMQC.py's note on
+    this) -- small enough that the duplication cost is low.
+    """
+    exons_sorted = sorted(gene["exons"], key=lambda x: x[0])
+    introns = []
+    for (_s1, e1), (s2, _e2) in zip(exons_sorted, exons_sorted[1:]):
+        if s2 > e1:
+            introns.append((e1, s2))
+    return introns
+
+
+def _read_has_unexplained_gap(absolute_indices, edit_string, introns: list, max_gap_nt: int) -> bool:
+    """
+    True if this read's alignment contains a reference-skipped stretch (a
+    deletion or intron, in CIGAR terms) spanning more than max_gap_nt that
+    does NOT overlap one of the gene's annotated introns. See
+    runHMMPerGene.py's copy of this function for the full rationale --
+    key point: a real intron/deletion shows up as edit_string=='2' runs
+    with a NON-null absolute_indices value (still the real, incrementing
+    ref position), not as a jump or a None in absolute_indices itself.
+    """
+    run_vals = []
+
+    def _flush():
+        if not run_vals:
+            return False
+        lo, hi = min(run_vals), max(run_vals) + 1
+        return hi - lo > max_gap_nt and not any(lo < ihi and hi > ilo for ilo, ihi in introns)
+
+    for i, x in enumerate(absolute_indices):
+        is_null = x is None or (isinstance(x, float) and x != x)
+        is_gap_site = (not is_null) and i < len(edit_string) and edit_string[i] == "2"
+        if is_gap_site:
+            run_vals.append(float(x))
+            continue
+        if _flush():
+            return True
+        run_vals = []
+    return _flush()
+
+
 def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
-                min_edit_freq: float = 0.0) -> pd.DataFrame:
+                min_edit_freq: float = 0.0,
+                drop_unexplained_gaps: bool = False,
+                max_gap_nt: int = 20) -> pd.DataFrame:
     """
     Built with Claude
     Fast vectorised pre-filter to reads overlapping this gene.
@@ -210,6 +262,14 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
     (per-read A->G edit fraction) is >= min_edit_freq. Reads below this
     threshold are likely unedited / poorly edited molecules that carry no
     protection signal and only add noise.
+
+    If drop_unexplained_gaps is True, also drop reads with a gap (see
+    _read_has_unexplained_gap) larger than max_gap_nt between consecutive
+    anchored positions that doesn't overlap one of the gene's annotated
+    introns -- a likely chimeric/mis-aligned read rather than real
+    splicing. Intron-less genes have zero annotated introns, so ANY such
+    gap drops the read there. Applied last, on the already-narrowed subset,
+    since it's a per-row Python-level check rather than a vectorised one.
     """
     mask = ((df_all["chrom"] == gene["chrom"]) & (df_all["gene_strand"] == gene["strand"]))
     if "read_start" in df_all.columns and "read_end" in df_all.columns:
@@ -221,7 +281,17 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
             mask &= ((df_all["read_start"] < gene["gene_end"]) & (df_all["read_end"] > gene["gene_start"]))
     if min_edit_freq > 0.0 and "global_edit_freq" in df_all.columns:
         mask &= (df_all["global_edit_freq"] >= min_edit_freq)
-    return df_all[mask]
+
+    sub = df_all[mask]
+    if (drop_unexplained_gaps and "absolute_indices" in sub.columns
+            and "edit_string" in sub.columns and not sub.empty):
+        introns = _gene_introns(gene)
+        keep = ~sub.apply(
+            lambda row: _read_has_unexplained_gap(
+                row["absolute_indices"], row["edit_string"], introns, max_gap_nt),
+            axis=1)
+        sub = sub[keep]
+    return sub
 
 def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
                  include_utrs: bool = True) -> dict:
@@ -568,7 +638,7 @@ def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
         if gene is None:
             continue
 
-        df_g = get_gene_df(query_df, gene, cds_spanning=False)
+        df_g = get_gene_df(query_df, gene, cds_spanning=False, drop_unexplained_gaps=True)
         if df_g.empty:
             continue
 
@@ -742,8 +812,8 @@ def main():
 
         # Background: ALWAYS all overlapping reference reads (never spanning),
         # never edit-freq filtered — maximum per-position support.
-        t1 = get_gene_df(train_df1, gene, cds_spanning=False)
-        t2 = get_gene_df(train_df2, gene, cds_spanning=False)
+        t1 = get_gene_df(train_df1, gene, cds_spanning=False, drop_unexplained_gaps=True)
+        t2 = get_gene_df(train_df2, gene, cds_spanning=False, drop_unexplained_gaps=True)
 
         # Two independent coverage thresholds
         if len(t1) < args.min_coverage or len(t2) < args.min_coverage:  # both need to pass

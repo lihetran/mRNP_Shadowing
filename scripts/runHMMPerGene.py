@@ -211,9 +211,70 @@ def _subtract_intervals(exons, cds):
             out.append((cur, ee))         # trailing piece
     return out
 
+def _gene_introns(gene: dict) -> list:
+    """
+    Genomic-order (start, end) intron intervals implied by gaps between the
+    gene's annotated exons. gene["exons"] is sorted in TRANSCRIPT order
+    (reversed for minus strand, see parse_gtf), so this re-sorts genomically
+    first -- introns are a genomic concept, independent of strand. Empty
+    for single-exon (intron-less) genes.
+    """
+    exons_sorted = sorted(gene["exons"], key=lambda x: x[0])
+    introns = []
+    for (_s1, e1), (s2, _e2) in zip(exons_sorted, exons_sorted[1:]):
+        if s2 > e1:
+            introns.append((e1, s2))
+    return introns
+
+
+def _read_has_unexplained_gap(absolute_indices, edit_string, introns: list, max_gap_nt: int) -> bool:
+    """
+    True if this read's alignment contains a reference-skipped stretch
+    (a deletion or intron, in CIGAR terms) spanning more than max_gap_nt
+    that does NOT overlap one of the gene's annotated introns.
+
+    IMPORTANT: a real intron/deletion does NOT show up as a jump or a None
+    in absolute_indices -- pysam's get_aligned_pairs() (see
+    shadowingBamToParquetWithGTF2.py's get_absolute_positions) still
+    reports the real, individually-incrementing reference position for
+    every base spanned by a skip, it just has no corresponding read base.
+    The only place that's recorded is edit_string=='2' at those same
+    positions (shadowingBamToParquetWithGTF2.py sets edit=2 whenever
+    read_pos is None, i.e. a skip, alongside the correct ref_pos). So gap
+    detection has to key off runs of edit_string=='2' with a non-null
+    absolute_indices value, not off jumps in the ref values themselves --
+    confirmed on real data (an RPS13 read whose 539 intron positions were
+    all present, correctly incrementing, and all edit_string=='2').
+
+    (edit_string=='2' also marks INSERTIONS, i.e. ref_pos is None -- those
+    already show up as None in absolute_indices and are skipped by the
+    null-check below, so they don't get mistaken for a reference gap.)
+    """
+    run_vals = []
+
+    def _flush():
+        if not run_vals:
+            return False
+        lo, hi = min(run_vals), max(run_vals) + 1
+        return hi - lo > max_gap_nt and not any(lo < ihi and hi > ilo for ilo, ihi in introns)
+
+    for i, x in enumerate(absolute_indices):
+        is_null = x is None or (isinstance(x, float) and x != x)
+        is_gap_site = (not is_null) and i < len(edit_string) and edit_string[i] == "2"
+        if is_gap_site:
+            run_vals.append(float(x))
+            continue
+        if _flush():
+            return True
+        run_vals = []
+    return _flush()
+
+
 def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
-                min_edit_freq: float = 0.0) -> pd.DataFrame:
+                min_edit_freq: float = 0.0,
+                drop_unexplained_gaps: bool = False,
+                max_gap_nt: int = 20) -> pd.DataFrame:
     """
     Built with Claude
     Fast vectorised pre-filter to reads overlapping this gene.
@@ -226,6 +287,14 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
     (per-read A->G edit fraction) is >= min_edit_freq. Reads below this
     threshold are likely unedited / poorly edited molecules that carry no
     protection signal and only add noise.
+
+    If drop_unexplained_gaps is True, also drop reads with a gap (see
+    _read_has_unexplained_gap) larger than max_gap_nt between consecutive
+    anchored positions that doesn't overlap one of the gene's annotated
+    introns -- a likely chimeric/mis-aligned read rather than real
+    splicing. Intron-less genes have zero annotated introns, so ANY such
+    gap drops the read there. Applied last, on the already-narrowed subset,
+    since it's a per-row Python-level check rather than a vectorised one.
     """
     mask = ((df_all["chrom"] == gene["chrom"]) & (df_all["gene_strand"] == gene["strand"]))
     if "read_start" in df_all.columns and "read_end" in df_all.columns:
@@ -237,7 +306,17 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
             mask &= ((df_all["read_start"] < gene["gene_end"]) & (df_all["read_end"] > gene["gene_start"]))
     if min_edit_freq > 0.0 and "global_edit_freq" in df_all.columns:
         mask &= (df_all["global_edit_freq"] >= min_edit_freq)
-    return df_all[mask]
+
+    sub = df_all[mask]
+    if (drop_unexplained_gaps and "absolute_indices" in sub.columns
+            and "edit_string" in sub.columns and not sub.empty):
+        introns = _gene_introns(gene)
+        keep = ~sub.apply(
+            lambda row: _read_has_unexplained_gap(
+                row["absolute_indices"], row["edit_string"], introns, max_gap_nt),
+            axis=1)
+        sub = sub[keep]
+    return sub
 
 def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
                  include_utrs: bool = True) -> dict:
@@ -794,11 +873,25 @@ def classify_positions_hsmm(model, read_id, chrom, edit_string,
 
 def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
                              ref_cov, gpos_to_tx, tx_to_gpos,
-                             prob_threshold=0.5, min_win_n=1,
+                             min_win_n=1,
                              cds_start_tx=0, cds_end_tx=None):
     """
-    Shadow calls in read-level format, mirroring the source parquet schema.
-    Site-anchored: a site is "in shadow" when its posterior P_B >= prob_threshold.
+    Per-read, per-scored-site records in read-level format, mirroring the
+    source parquet schema. NOT thresholded on P_B -- every scored site for
+    every read (subject only to the min_win_n read-level quality gate)
+    gets a row here, so downstream consumers apply whatever P_B cutoff they
+    want themselves (see e.g. polysomeShadowHMMQC.py's PROB_CUTOFFS sweep).
+
+    This used to hard-filter to P_B>=prob_threshold at write time (dropping
+    both individual sub-threshold sites AND entire reads with zero sites
+    clearing it), which (a) discarded the continuous posterior signal
+    needed for e.g. a per-position ribo-seq correlation track, and (b) made
+    "reads observed for this gene" undercounted in anything computed from
+    this file (a read with zero above-threshold sites simply never
+    appeared), which quietly biased any per-read rate (false-positive rate
+    on a ribosome-less control, e.g.) computed downstream. Un-thresholding
+    fixes both at the source instead of working around them per-consumer.
+
     Serves all three models (window / Markov / HMM) via the shared P_B schema.
     """
     qry_by_id = {row.read_id: row for row in df_qry.itertuples()}
@@ -814,10 +907,9 @@ def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
     for rec in records:
         rid = rec["read_id"]
 
-        prot_idx = [k for k in range(len(rec["tx"]))
-                    if rec["P_B"][k] >= prob_threshold
-                    and rec["win_n"][k] >= min_win_n]
-        if not prot_idx:
+        site_idx = [k for k in range(len(rec["tx"]))
+                    if rec["win_n"][k] >= min_win_n]
+        if not site_idx:
             continue
 
         src = qry_by_id.get(rid)
@@ -825,33 +917,18 @@ def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
             continue
         src = src._asdict()
 
-        edit_string = src["edit_string"]
-        abs_idx     = src["absolute_indices"]
-        protected_tx = {rec["tx"][k] for k in prot_idx}
-        shadow_chars = []
-        for i, ref_pos in enumerate(abs_idx):
-            if ref_pos is None or (isinstance(ref_pos, float) and ref_pos != ref_pos):
-                shadow_chars.append("2"); continue
-            ref_pos = int(ref_pos)
-            if i >= len(edit_string) or edit_string[i] == "2":
-                shadow_chars.append("2"); continue
-            tx = gpos_to_tx.get(ref_pos)
-            shadow_chars.append("1" if tx in protected_tx else "0")
-        shadow_string = "".join(shadow_chars)
-
-        tx_pos  = [rec["tx"][k]                   for k in prot_idx]
-        gpos    = [tx_to_gpos.get(rec["tx"][k])   for k in prot_idx]
+        tx_pos  = [rec["tx"][k]                   for k in site_idx]
+        gpos    = [tx_to_gpos.get(rec["tx"][k])   for k in site_idx]
         regions = [region_of(t)                   for t in tx_pos]
-        P_B     = [rec["P_B"][k]                  for k in prot_idx]
-        P_A     = [rec["P_A"][k]                  for k in prot_idx]
-        edit    = [rec["edits"][k]                for k in prot_idx]
-        rcov    = [ref_cov.get(rec["tx"][k])      for k in prot_idx]
+        P_B     = [rec["P_B"][k]                  for k in site_idx]
+        P_A     = [rec["P_A"][k]                  for k in site_idx]
+        edit    = [rec["edits"][k]                for k in site_idx]
+        rcov    = [ref_cov.get(rec["tx"][k])      for k in site_idx]
 
         row = dict(src)
         row.pop("Index", None)
         row.update({
             "shadow_gene":    gene,
-            "shadow_string":  shadow_string,
             "shadow_tx_pos":  tx_pos,
             "shadow_gpos":    gpos,
             "shadow_region":  regions,
@@ -859,7 +936,7 @@ def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
             "shadow_P_A":     P_A,
             "shadow_edit":    edit,
             "shadow_ref_cov": rcov,
-            "n_shadow_sites": len(prot_idx),
+            "n_scored_sites": len(site_idx),
             "n_sites_utr5":   regions.count("UTR5"),
             "n_sites_cds":    regions.count("CDS"),
             "n_sites_utr3":   regions.count("UTR3"),
@@ -1264,6 +1341,16 @@ def parse_args():
     p.add_argument("--cds_spanning", action="store_true",
                    help="Only include reads whose alignment spans the full "
                         "CDS of the gene.")
+    p.add_argument("--drop_unexplained_gaps", action="store_true",
+                   help="Drop reads with an alignment gap (see --max_gap_nt) "
+                        "that doesn't overlap one of the gene's annotated "
+                        "introns -- likely a chimeric/mis-aligned read "
+                        "rather than real splicing. Intron-less genes have "
+                        "no annotated introns, so any such gap drops the read.")
+    p.add_argument("--max_gap_nt", type=int, default=20,
+                   help="Minimum gap size (nt) between consecutive anchored "
+                        "positions to be considered for --drop_unexplained_gaps "
+                        "(default: 20).")
     return p.parse_args()
 
 
@@ -1310,7 +1397,7 @@ def main():
     shadow_call_frames = []
     shadow_calls_path = f"{out}_shadow_calls.parquet"
     ## Build D_B from the placeholder, then run the Hidden semi-Markov model
-    D_B = get_duration_pmf(mode="bimodal", dmax=150)
+    D_B = get_duration_pmf(mode="gaussian", dmax=150)
     ## plot duration distribution
     plot_duration_hazard(D_B, f"{out}_duration_distribution.pdf", title=f"Duration distribution")
     for i, gname in enumerate(gene_names):
@@ -1327,7 +1414,9 @@ def main():
 
         # Query: the reads we make protection calls on.
         df_qry = get_gene_df(query_df, gene, cds_spanning=args.cds_spanning,
-                             min_edit_freq=args.min_edit_freq)
+                             min_edit_freq=args.min_edit_freq,
+                             drop_unexplained_gaps=args.drop_unexplained_gaps,
+                             max_gap_nt=args.max_gap_nt)
         if len(df_qry) < args.min_query_reads:
             continue
 
@@ -1377,7 +1466,6 @@ def main():
             read_edits=None,
             ref_cov=model_dict[gname]["covA"],
             gpos_to_tx=gpos_to_tx, tx_to_gpos=tx_to_gpos,
-            prob_threshold=0.5,  # tune per model (HMM wants lower)
             cds_start_tx=0, cds_end_tx=gene_len,  # your CDS bounds in tx coords
         )
         if not gene_calls.empty:

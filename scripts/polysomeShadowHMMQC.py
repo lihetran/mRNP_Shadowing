@@ -11,16 +11,19 @@ Two complementary views:
           -> "how does calling stringency reshape what I detect?"
   VIEW 3  per-gene call RATE, overall and restricted to His codon sites
           (via findHisCodonPositions.py's cache)
-  VIEW 7  shadow DENSITY (shadows / nt) by gene region -- UTR5 vs CDS vs
-          UTR3 -- so regions/genes of different sizes are directly
-          comparable, and so is one region across libraries.
+  VIEW 7  shadow DENSITY (shadows / nt / read) by gene region -- UTR5 vs
+          CDS vs UTR3 -- so regions/genes of different sizes AND different
+          sequencing depth are directly comparable, and so is one region
+          across libraries.
 
 Input parquet columns used per read:
   read_id, shadow_gene, absolute_indices, shadow_gpos, shadow_P_B,
   shadow_region, n_sites_utr5, n_sites_cds, n_sites_utr3
-  (shadow_P_B/shadow_gpos/shadow_region/n_sites_* are pre-filtered to
-  P_B>=0.5 at the source -- see write_shadow_calls_to_df -- not one entry
-  per every scored Ref=A site.)
+  (shadow_P_B/shadow_gpos/shadow_region/n_sites_* cover EVERY scored Ref=A
+  site for the read, not just ones above some cutoff -- write_shadow_calls_to_df
+  stopped pre-filtering to P_B>=threshold at the source, so every view in
+  this module applies whatever cutoff it needs itself, e.g. via PROB_CUTOFFS
+  or FIXED_CUTOFF.)
 
 Run:
   python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile
@@ -66,6 +69,10 @@ MIN_HIS_OBS_PER_GENE = 1                      # drop a gene from the His-codon
                                                # P_B distribution below this many His sites
 MIN_HIS_READS_PER_GENE = 5                    # drop a gene from the His-shadow-rate (View 6)
                                                # below this many reads with >=1 His-codon site
+MIN_READS_FOR_RUN_RATE = 20                   # View 9: drop a gene from the runs-per-read
+                                               # rate below this many reads (see caveat in
+                                               # _gene_run_counts_by_reads about what "reads"
+                                               # means here)
 MIN_RUN_NT     = 25                           # View 7: a "shadow" is a protected run of at
                                                # least this many genomic nt (footprint-sized),
                                                # not a bare scored site -- an isolated 1-3nt
@@ -78,9 +85,11 @@ HIS_CENTER_FRAC = 0.5                          # View 8: a His codon counts as "
                                                # run length rather than a fixed nt tolerance, so
                                                # a longer run gets proportionally more slack
 HIS_PB_BIN     = 0.05                          # bin width for the His-codon P_B distribution
-HIS_PB_RANGE   = (0.5, 1.0)                   # shadow_P_B is pre-filtered to >=0.5 at the
-                                               # source (see write_shadow_calls_to_df); nothing
-                                               # in this column is ever below that floor
+HIS_PB_RANGE   = (0.0, 1.0)                   # full P_B range -- shadow_P_B is no longer
+                                               # pre-filtered at the source (see
+                                               # write_shadow_calls_to_df), so values below
+                                               # 0.5 are real and would be clipped by a
+                                               # narrower range here
 PALETTE        = None                         # list of pyx colors, set after import
 
 def _libcolor(i):
@@ -185,11 +194,9 @@ def his_codon_pb_observations(df, his_gpos_by_gene):
     this to a single P_B>0.7 rate. Confirmed on real data that a fixed
     cutoff can sit awkwardly relative to one specific site's own achievable
     range: one gene's His-codon site never exceeded P_B=0.64 in ANY
-    library, reading as "0% protected" even though it sits clearly above
-    the P_B>=0.5 floor every shadow-call parquet is pre-filtered to (see
-    write_shadow_calls_to_df's prob_threshold=0.5 in runHMMPerGene.py).
-    The full distribution shows that shape instead of hiding it behind one
-    line.
+    library, reading as "0% protected" even though that's a meaningfully
+    elevated value for that site. The full distribution shows that shape
+    instead of hiding it behind one line.
 
     Returns a list of {"gene": gene, "pb": p} dicts.
     """
@@ -311,6 +318,68 @@ def _gene_region_run_counts(runs, min_genomic_nt=MIN_RUN_NT):
             continue
         counts[r["gene"]][r["region"]] += 1
     return {g: dict(regs) for g, regs in counts.items()}
+
+
+_REGION_TO_NSITES_COL = {"UTR5": "n_sites_utr5", "CDS": "n_sites_cds", "UTR3": "n_sites_utr3"}
+
+
+def _gene_region_read_coverage(df):
+    """
+    Per-gene, per-region READ coverage: {gene: {"UTR5": n, "CDS": n,
+    "UTR3": n}} -- n = number of reads with >=1 scored site in that region
+    (n_sites_<region> > 0). This is the depth term View 7's shadow-density
+    normalization needs alongside region length: density = n_qualifying_runs
+    / (region_length_nt * n_reads_covering_region), the same length+depth
+    double normalization RNA-seq RPKM uses. Region length alone doesn't
+    correct for a region simply being sampled by fewer reads/molecules --
+    that would look like "less shadowed" purely from lower depth, not a
+    real biological difference.
+
+    Only meaningful now that write_shadow_calls_to_df stopped pre-filtering
+    to P_B>=threshold: n_sites_<region> reflects EVERY scored site in that
+    region for the read, not just ones that happened to call as protected
+    (see module docstring) -- so ">0" genuinely means "this read had
+    coverage here," not "this read happened to show a shadow here."
+
+    df: the shadow_calls dataframe (one row per read). Returns only region
+    keys with >=1 covering read present, same convention as
+    _gene_region_run_counts.
+    """
+    coverage = collections.defaultdict(lambda: collections.defaultdict(int))
+    for row in df.itertuples(index=False):
+        gene = row.shadow_gene
+        for region, col in _REGION_TO_NSITES_COL.items():
+            if getattr(row, col) > 0:
+                coverage[gene][region] += 1
+    return {g: dict(regs) for g, regs in coverage.items()}
+
+
+def _gene_run_counts_by_reads(df, runs, min_genomic_nt=MIN_RUN_NT):
+    """
+    Raw ingredients for a per-gene "shadows per read" rate: {gene:
+    (n_qualifying_runs, n_reads)}. n_qualifying_runs = protected RUNS with
+    genomic_nt >= min_genomic_nt (same footprint-size floor as View 7's
+    _gene_region_run_counts, just not split by region), pooled across all
+    reads in the gene. n_reads = every read observed for that gene in df --
+    now the TRUE per-gene read count, since write_shadow_calls_to_df no
+    longer drops reads with zero above-threshold sites (previously this
+    undercounted, the same blind spot _gene_site_counts' n_tot used to
+    have -- both are fixed by the same upstream change).
+
+    df: the same shadow_calls dataframe runs was extracted from (for read
+    counts). runs: output of extract_shadow_runs (each dict has "gene",
+    "genomic_nt").
+    """
+    n_reads = collections.defaultdict(int)
+    for row in df.itertuples(index=False):
+        n_reads[row.shadow_gene] += 1
+
+    n_runs = collections.defaultdict(int)
+    for r in runs:
+        if r["genomic_nt"] >= min_genomic_nt:
+            n_runs[r["gene"]] += 1
+
+    return {g: (n_runs.get(g, 0), n_reads[g]) for g in n_reads}
 
 
 def _gene_his_centered_run_counts(runs, his_gpos_by_gene,
@@ -534,6 +603,31 @@ def gene_call_rates(df, cutoff, min_sites_per_gene=MIN_SITES_PER_GENE):
             if tot >= min_sites_per_gene}
 
 
+def gene_run_rates(df, runs, min_genomic_nt=MIN_RUN_NT,
+                   min_reads_per_gene=MIN_READS_FOR_RUN_RATE):
+    """
+    Per-gene rate of qualifying protected RUNS (genomic_nt >= min_genomic_nt)
+    per read, pooling all reads within each gene first. RUN-level
+    counterpart to gene_call_rates' site-level rate: a bare protected-SITE
+    rate doesn't distinguish one long, footprint-sized run from many short,
+    likely-noise blips (see MIN_RUN_NT's rationale), which is exactly the
+    distinction a false-positive-rate sanity check (e.g. on a ribosome-less
+    control) needs.
+
+    Genes with fewer than min_reads_per_gene reads are dropped -- too few
+    reads to trust a rate from.
+
+    Standalone convenience wrapper around _gene_run_counts_by_reads for a
+    SINGLE library -- pair genes across libraries via _common_genes before
+    computing rates if comparing multiple libraries.
+
+    Returns {gene: rate}.
+    """
+    counts = _gene_run_counts_by_reads(df, runs, min_genomic_nt)
+    return {g: n_runs / n_reads for g, (n_runs, n_reads) in counts.items()
+            if n_reads >= min_reads_per_gene}
+
+
 def stringency_sweep_hist(df, probCutOffs=PROB_CUTOFFS, N=N_PAD,
                           measure="aligned_len", bin_width=SWEEP_BIN,
                           size_range=SWEEP_RANGE):
@@ -755,7 +849,7 @@ def plot_gene_call_rates(rates_by_lib, pdf_path, cutoff=FIXED_CUTOFF,
 
 def plot_region_density_grouped_bars(region_density_mean, region_density_n, pdf_path,
                                      libIDs, region_names=("UTR5", "CDS", "UTR3"),
-                                     ylabel="mean shadows / nt"):
+                                     ylabel="mean shadows / nt / read"):
     """
     Grouped bar chart: one group per region (UTR5/CDS/UTR3), one bar per
     library within each group -- all libraries and all regions visible on
@@ -866,9 +960,12 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     _gene_site_counts_his_split), "region_run_counts": {gene: {"UTR5": n,
     "CDS": n, "UTR3": n}} -- count of qualifying (>=MIN_RUN_NT nt) protected
     RUNS by region at FIXED_CUTOFF (see _gene_region_run_counts), the
-    numerator for View 7's density, "genes_observed": set of every gene
-    with >=1 shadow call in this library, the population View 7 divides
-    over so a gene with no qualifying run still counts as a true 0,
+    numerator for View 7's density, "region_read_coverage": {gene: {"UTR5":
+    n, "CDS": n, "UTR3": n}} -- count of reads with >=1 scored site in that
+    region (see _gene_region_read_coverage), the depth term for View 7's
+    density denominator alongside region length, "genes_observed": set of
+    every gene with >=1 scored site in this library, the population View 7
+    divides over so a gene with no qualifying run still counts as a true 0,
     "his_centered_run_counts": {gene: n} -- count of qualifying runs
     CENTERED on a His codon (see _gene_his_centered_run_counts), the
     numerator for View 8's stricter His-codon rate}.
@@ -892,10 +989,11 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
         df, his_gpos_by_gene, FIXED_CUTOFF)
     region_run_counts = _gene_region_run_counts(runs_by_cut.get(FIXED_CUTOFF, []),
                                                 MIN_RUN_NT)
+    region_read_coverage = _gene_region_read_coverage(df)
     his_centered_run_counts = _gene_his_centered_run_counts(
         runs_by_cut.get(FIXED_CUTOFF, []), his_gpos_by_gene, MIN_RUN_NT, HIS_CENTER_FRAC)
-    # every gene with ANY shadow call in this library -- the population
-    # View 7 iterates over, so a gene with shadow data but no run reaching
+    # every gene with ANY scored site in this library -- the population
+    # View 7 iterates over, so a gene with data but no run reaching
     # MIN_RUN_NT still contributes a true 0 rather than being silently
     # dropped (region_run_counts only lists genes with >=1 qualifying run).
     genes_observed = set(df["shadow_gene"].unique())
@@ -903,6 +1001,7 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     return {"runs_by_cut": runs_by_cut, "site_counts": site_counts,
             "his_obs": his_obs, "his_shadow_counts": his_shadow_counts,
             "other_shadow_counts": other_shadow_counts,
+            "region_read_coverage": region_read_coverage,
             "his_read_totals": his_read_totals,
             "region_run_counts": region_run_counts,
             "genes_observed": genes_observed,
@@ -1056,13 +1155,17 @@ def main(args):
             for g in common_his_vs_other if read_tot.get(g, 0) > 0
         }
 
-    # ---- View 7: shadow density (footprint-sized runs / nt) by region ----
+    # ---- View 7: shadow density (footprint-sized runs / nt / read) by region ----
     # A "shadow" here means a protected RUN of >=MIN_RUN_NT genomic nt at
     # P_B>=FIXED_CUTOFF (see extract_shadow_runs/_gene_region_run_counts),
     # not a bare scored site -- a footprint-sized event, not an isolated
-    # blip. Normalized by REGION LENGTH (nt) from the GTF, not by another
-    # shadow count or by reads, so regions/genes of very different sizes
-    # (a short UTR vs a long CDS) are directly comparable, and so is one
+    # blip. Normalized by BOTH region LENGTH (nt, from the GTF) AND READ
+    # COVERAGE in that region (see _gene_region_read_coverage) -- the same
+    # length+depth double normalization RNA-seq RPKM uses. Length alone
+    # isn't enough: a region sampled by fewer reads/molecules would look
+    # artificially "less shadowed" purely from lower depth, independent of
+    # region size or true biology, so regions/genes of different sizes AND
+    # different sequencing depth are directly comparable, and so is one
     # region across libraries.
     #
     # NOT gene-paired across libraries (unlike Views 3/5/6): each library's
@@ -1070,22 +1173,27 @@ def main(args):
     # (genes_observed), same "every gene gets one vote" philosophy as
     # _gene_weighted_freq, just without requiring the SAME genes to clear a
     # bar in every library at once. No minimum-run-count floor either -- a
-    # gene with 0 qualifying runs in a region is a real, informative data
-    # point (density 0), not noise to be dropped; excluding it would bias
-    # the mean upward by only counting genes that already showed a hit.
+    # gene with 0 qualifying runs in a region (but >=1 read covering it) is
+    # a real, informative data point (density 0), not noise to be dropped;
+    # excluding it would bias the mean upward by only counting genes that
+    # already showed a hit. A region with ZERO covering reads, though, is
+    # missing data rather than a true zero, so that IS excluded below.
     REGION_NAMES = ["UTR5", "CDS", "UTR3"]
     region_density_mean = {region: {} for region in REGION_NAMES}
     region_density_n    = {region: {} for region in REGION_NAMES}
     for ri, region in enumerate(REGION_NAMES):
         for lib in libIDs:
             run_counts     = raw_by_lib[lib]["region_run_counts"]
+            read_coverage  = raw_by_lib[lib]["region_read_coverage"]
             genes_observed = raw_by_lib[lib]["genes_observed"]
-            vals = [run_counts.get(g, {}).get(region, 0) / region_len_by_gene[g][ri]
+            vals = [run_counts.get(g, {}).get(region, 0)
+                    / (region_len_by_gene[g][ri] * read_coverage.get(g, {}).get(region, 0))
                     for g in genes_observed
-                    if g in region_len_by_gene and region_len_by_gene[g][ri] > 0]
+                    if g in region_len_by_gene and region_len_by_gene[g][ri] > 0
+                    and read_coverage.get(g, {}).get(region, 0) > 0]
             region_density_mean[region][lib] = float(np.mean(vals)) if vals else 0.0
             region_density_n[region][lib] = len(vals)
-            print("    %s shadow density (%s): %d genes, mean=%.6f"
+            print("    %s shadow density (%s): %d genes, mean=%.6g"
                   % (region, lib, len(vals), region_density_mean[region][lib]), file=sys.stderr)
 
     print("Plotting combined figures across %d libraries..." % len(libIDs), file=sys.stderr)
@@ -1127,12 +1235,12 @@ def main(args):
                          title="His-CENTERED-run-count / reads-with-His-site by library",
                          min_n=MIN_HIS_READS_PER_GENE, min_n_label="qualifying reads",
                          ylabel="n(His-centered runs) / n(reads with His site)", connect_matched=True)
-    # View 7: shadow density (shadows/nt) by region -- one grouped barplot,
+    # View 7: shadow density (shadows/nt/read) by region -- one grouped barplot,
     # all regions and libraries together, not gene-paired across libraries.
     plot_region_density_grouped_bars(region_density_mean, region_density_n,
                                      "%s.shadow_density_by_region.png" % outPrefix,
                                      libIDs, region_names=REGION_NAMES,
-                                     ylabel="mean shadows / nt")
+                                     ylabel="mean shadows / nt / read")
 
 
 if __name__ == "__main__":
