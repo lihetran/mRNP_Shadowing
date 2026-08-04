@@ -15,6 +15,9 @@ Two complementary views:
           CDS vs UTR3 -- so regions/genes of different sizes AND different
           sequencing depth are directly comparable, and so is one region
           across libraries.
+  VIEW 3-TE  per-gene call rate (View 3) against translation EFFICIENCY
+          from an external RPF/RNA table, one scatter panel per library --
+          only produced if a TE file is passed (optional 5th CLI arg).
 
 Input parquet columns used per read:
   read_id, shadow_gene, absolute_indices, shadow_gpos, shadow_P_B,
@@ -26,10 +29,13 @@ Input parquet columns used per read:
   or FIXED_CUTOFF.)
 
 Run:
-  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile
+  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile [tePath]
 where inFilesParquet.txt is line-delimited:  fileName  rep  parquetFile,
-hisCodonPositions.pickle is findHisCodonPositions.py's output, and gtfFile
-is the GTF used to derive each gene's UTR5/CDS/UTR3 lengths for View 7.
+hisCodonPositions.pickle is findHisCodonPositions.py's output, gtfFile
+is the GTF used to derive each gene's UTR5/CDS/UTR3 lengths for View 7, and
+the optional tePath is a per-gene translation-efficiency table (a .parquet
+with gene_name/TE_score columns, e.g. Weinberg/Bartel RPF-vs-RNA data --
+see load_translation_efficiency) enabling View 3-TE.
 """
 
 import sys, math, collections, pickle
@@ -73,6 +79,9 @@ MIN_READS_FOR_RUN_RATE = 20                   # View 9: drop a gene from the run
                                                # rate below this many reads (see caveat in
                                                # _gene_run_counts_by_reads about what "reads"
                                                # means here)
+TOP_K_CHANGE   = 15                           # plot_gene_change_ranking: how many genes to
+                                               # show at each end (biggest movers / most
+                                               # stable) of the paired per-gene rankings
 MIN_RUN_NT     = 25                           # View 7: a "shadow" is a protected run of at
                                                # least this many genomic nt (footprint-sized),
                                                # not a bare scored site -- an isolated 1-3nt
@@ -182,6 +191,37 @@ def load_his_codon_gpos(pickle_path):
     with open(pickle_path, "rb") as f:
         his_positions = pickle.load(f)
     return {gene: set(gpos) for gene, (_tx_pos, gpos) in his_positions.items()}
+
+
+def load_translation_efficiency(te_path):
+    """
+    {gene_name: TE_score} from a Weinberg/Bartel-style per-gene translation-
+    efficiency table (RPF_RPKM / RNA_RPKM), keyed by the same SGD gene_name
+    parse_gtf uses (e.g. "RPL17A"), not systematic_name ("YKL180W") -- so it
+    joins directly against shadow_gene / rates_by_lib's gene keys with no
+    extra ID-mapping step.
+
+    Accepts either a parquet with gene_name/TE_score columns (e.g.
+    260508_translationEfficiency_histogram.parquet, which also carries
+    decile_rank/quartile_rank -- not used here, but there if a caller wants
+    quartile-level grouping instead of the continuous score) or a flat
+    newline-delimited gene-list .txt (e.g. top_decile.txt) -- the latter
+    carries no actual score, so every listed gene maps to TE_score=1.0 and
+    genes not listed are simply absent from the returned dict, i.e. this
+    degrades to a binary membership set rather than a real correlate.
+    """
+    te_path = str(te_path)
+    if te_path.endswith(".parquet"):
+        te_df = pd.read_parquet(te_path, columns=["gene_name", "TE_score"])
+        te_df = te_df.dropna(subset=["gene_name", "TE_score"])
+        return dict(zip(te_df["gene_name"], te_df["TE_score"].astype(float)))
+
+    with open(te_path) as f:
+        genes = {line.strip() for line in f if line.strip()}
+    print(f"load_translation_efficiency: {te_path} has no TE_score column "
+          f"(not a .parquet) -- treating its {len(genes)} genes as a binary "
+          f"membership set (TE_score=1.0), not a real correlate", file=sys.stderr)
+    return {g: 1.0 for g in genes}
 
 
 def his_codon_pb_observations(df, his_gpos_by_gene):
@@ -847,6 +887,166 @@ def plot_gene_call_rates(rates_by_lib, pdf_path, cutoff=FIXED_CUTOFF,
     print(f"Wrote gene call-rate plot to {pdf_path}", file=sys.stderr)
 
 
+def plot_gene_change_ranking(rates_by_lib, pdf_path, top_k=TOP_K_CHANGE,
+                             title="Per-gene change across libraries",
+                             xlabel=None):
+    """
+    Companion to plot_gene_call_rates: ranks genes by how much they change
+    across libraries rather than showing every gene's value at once. The
+    box+spaghetti plot answers "is there a shift on average" but is
+    illegible past a handful of genes -- dozens of overlapping thin grey
+    lines -- so it can't point at which specific genes moved the most, or
+    which barely moved at all. This does the opposite: one horizontal bar
+    per gene, sorted by range (max value - min value across every library
+    shown, so it generalizes past just two libraries), with the two
+    libraries that set that range annotated on the label so you know where
+    to go look further (e.g. back at individual reads for that gene).
+
+    rates_by_lib: {libraryID: {gene: value}} -- same shape as
+    plot_gene_call_rates takes (gene_call_rates, his_codon_pb_per_gene, or
+    any of the His-shadow-rate dicts main() builds). Common genes are
+    recomputed here as the intersection of every library's own keys rather
+    than trusted from the caller -- not every rates_by_lib this module
+    builds is guaranteed pre-restricted to the same gene set per library
+    (e.g. the His-shadow ratios drop a gene per-library on zero qualifying
+    reads), so this mirrors plot_gene_call_rates' own connect_matched
+    pairing rule instead of assuming it already happened upstream.
+
+    top_k: genes shown at each end (biggest range / smallest range). If
+    2*top_k >= the number of common genes, every common gene is shown once
+    instead (sorted by range, no split) rather than a redundant double
+    listing of the same short gene set.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    libIDs = sorted(rates_by_lib)
+    common_genes = (set.intersection(*(set(rates_by_lib[lib]) for lib in libIDs))
+                     if libIDs else set())
+    if not common_genes:
+        print(f"plot_gene_change_ranking: no genes common to all {len(libIDs)} "
+              f"libraries, skipping ({pdf_path})", file=sys.stderr)
+        return
+
+    ranked = []
+    for g in common_genes:
+        vals = {lib: rates_by_lib[lib][g] for lib in libIDs}
+        lo_lib = min(vals, key=vals.get)
+        hi_lib = max(vals, key=vals.get)
+        ranked.append({"gene": g, "range": vals[hi_lib] - vals[lo_lib],
+                       "lo_lib": lo_lib, "hi_lib": hi_lib,
+                       "lo_val": vals[lo_lib], "hi_val": vals[hi_lib]})
+    ranked.sort(key=lambda r: r["range"], reverse=True)
+
+    n = len(ranked)
+    split_at = None if 2 * top_k >= n else top_k
+    shown = ranked if split_at is None else ranked[:top_k] + ranked[-top_k:]
+
+    fig, ax = plt.subplots(figsize=(9, 0.35 * len(shown) + 1.5))
+    y = np.arange(len(shown))[::-1]                    # biggest range at top
+    colors = ["tab:red" if split_at is None or i < split_at else "tab:blue"
+             for i in range(len(shown))]
+    ax.barh(y, [r["range"] for r in shown], color=colors)
+    ax.set_yticks(y)
+    ax.set_yticklabels(
+        ["%s  (%s=%.3g→%s=%.3g)" % (r["gene"], r["lo_lib"], r["lo_val"],
+                                        r["hi_lib"], r["hi_val"]) for r in shown],
+        fontsize=8)
+    if split_at is not None:
+        ax.axhline(y[split_at - 1] - 0.5, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xlabel(xlabel or "range across libraries (max - min)")
+    n_note = (f"top/bottom {top_k} of {n} genes common to all {len(libIDs)} libraries"
+             if split_at is not None else
+             f"all {n} genes common to all {len(libIDs)} libraries")
+    ax.set_title(f"{title}\n({n_note}, sorted by range)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(pdf_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote gene change-ranking plot to {pdf_path}", file=sys.stderr)
+
+
+def plot_te_correlation(rates_by_lib, te_by_gene, pdf_path, cutoff=FIXED_CUTOFF,
+                        ylabel=None, min_n=3, max_labeled=60):
+    """
+    One scatter panel per library: per-gene shadow call rate (from
+    rates_by_lib, e.g. gene_call_rates -- the same per-gene metric
+    plot_gene_call_rates' box+spaghetti view shows) against translation
+    efficiency (te_by_gene, from load_translation_efficiency), with
+    Spearman rank correlation annotated per panel -- rank-based rather than
+    Pearson since TE_score is right-skewed (RPF/RNA ratios) and the
+    question here is "does more TE track with more/less shadow", a
+    monotonic relationship, not specifically a linear one.
+
+    Every library plotted on its own panel, all sharing the same TE axis,
+    rather than pooling libraries into one scatter -- a real difference
+    between a ribosome-containing library and the ribosome-less control
+    (which shouldn't correlate with TE at all, since it has no ribosomes
+    to leave a TE-dependent footprint) is exactly the kind of thing pooling
+    would wash out.
+
+    rates_by_lib: {libraryID: {gene: rate}}. te_by_gene: {gene: TE_score}.
+    Only genes present in BOTH dicts for a given library are plotted; a
+    library needs at least min_n such genes to get a correlation computed
+    at all (Spearman on <3 points is not meaningful).
+
+    Every point is labeled with its gene name (small offset text) as long
+    as a panel has <= max_labeled genes -- the whole point of asking "does
+    THIS gene's call rate track its TE" rather than just "is there a trend
+    overall" is to be able to read off which specific genes are high/high,
+    low/low, or a mismatch between the two; the Spearman rho alone can't
+    answer that. Above max_labeled the text would just overlap into an
+    unreadable smear, so labeling is skipped there (silently past a certain
+    density it stops helping) -- the aggregate rho/p/n in the title is still
+    shown regardless.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.stats import spearmanr
+
+    libIDs = sorted(rates_by_lib)
+    n_libs = len(libIDs)
+    fig, axes = plt.subplots(1, n_libs, figsize=(5.2 * n_libs, 5.2), squeeze=False)
+    axes = axes[0]
+
+    for ax, lib in zip(axes, libIDs):
+        genes = sorted(set(rates_by_lib[lib]) & set(te_by_gene))
+        te_vals   = [te_by_gene[g] for g in genes]
+        rate_vals = [rates_by_lib[lib][g] for g in genes]
+
+        ax.scatter(te_vals, rate_vals, s=14, alpha=0.6, color="tab:blue", zorder=2)
+
+        if len(genes) <= max_labeled:
+            for g, x, y in zip(genes, te_vals, rate_vals):
+                ax.annotate(g, (x, y), fontsize=6, xytext=(3, 2),
+                           textcoords="offset points", alpha=0.85)
+        elif genes:
+            print(f"plot_te_correlation: {lib} has {len(genes)} genes "
+                  f"(> max_labeled={max_labeled}), skipping gene-name labels",
+                  file=sys.stderr)
+
+        if len(genes) >= min_n:
+            rho, pval = spearmanr(te_vals, rate_vals)
+            stat_txt = f"Spearman ρ={rho:.2f}, p={pval:.2g}, n={len(genes)}"
+        else:
+            stat_txt = f"n={len(genes)} (< {min_n}, no correlation computed)"
+
+        ax.set_title(f"{lib}\n{stat_txt}", fontsize=9)
+        ax.set_xlabel("translation efficiency (TE_score)")
+        ax.set_ylabel(ylabel or f"per-gene call rate (P$_B$ > {cutoff})")
+
+    all_rate_genes = set().union(*(set(rates_by_lib[lib]) for lib in libIDs)) if libIDs else set()
+    n_missing = len(all_rate_genes - set(te_by_gene))
+    fig.suptitle("Shadow call rate vs. translation efficiency"
+                 + (f" ({n_missing} genes with no TE match, dropped)" if n_missing else ""),
+                 fontsize=10)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(pdf_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote TE correlation plot to {pdf_path}", file=sys.stderr)
+
+
 def plot_region_density_grouped_bars(region_density_mean, region_density_n, pdf_path,
                                      libIDs, region_names=("UTR5", "CDS", "UTR3"),
                                      ylabel="mean shadows / nt / read"):
@@ -968,7 +1168,13 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     divides over so a gene with no qualifying run still counts as a true 0,
     "his_centered_run_counts": {gene: n} -- count of qualifying runs
     CENTERED on a His codon (see _gene_his_centered_run_counts), the
-    numerator for View 8's stricter His-codon rate}.
+    numerator for View 8's stricter His-codon rate, "run_rate_counts":
+    {gene: (n_qualifying_runs, n_reads)} at FIXED_CUTOFF (see
+    _gene_run_counts_by_reads) -- the footprint/shadow-run-level counterpart
+    to "site_counts": a qualifying run is an actual footprint-sized
+    (>=MIN_RUN_NT nt) protected stretch, not a bare scored site, so this is
+    what "shadow rate" means when the site-level rate isn't specific
+    enough (e.g. for View 3-TE's TE correlation).}.
     """
     print("Loading %s (%s)..." % (parquetFile, libraryID), file=sys.stderr)
     df = pd.read_parquet(parquetFile)          # native columns, no JSON decode
@@ -997,6 +1203,8 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     # MIN_RUN_NT still contributes a true 0 rather than being silently
     # dropped (region_run_counts only lists genes with >=1 qualifying run).
     genes_observed = set(df["shadow_gene"].unique())
+    run_rate_counts = _gene_run_counts_by_reads(df, runs_by_cut.get(FIXED_CUTOFF, []),
+                                                MIN_RUN_NT)
 
     return {"runs_by_cut": runs_by_cut, "site_counts": site_counts,
             "his_obs": his_obs, "his_shadow_counts": his_shadow_counts,
@@ -1005,7 +1213,8 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
             "his_read_totals": his_read_totals,
             "region_run_counts": region_run_counts,
             "genes_observed": genes_observed,
-            "his_centered_run_counts": his_centered_run_counts}
+            "his_centered_run_counts": his_centered_run_counts,
+            "run_rate_counts": run_rate_counts}
 
 
 def main(args):
@@ -1017,9 +1226,15 @@ def main(args):
                    color.cmyk(0, 0, 0, 0.7), color.cmyk(0.3, 0, 1, 0.2)]
 
     parquetList, outPrefix, hisPicklePath, gtfPath = args[0], args[1], args[2], args[3]
+    tePath = args[4] if len(args) > 4 else None
     his_gpos_by_gene = load_his_codon_gpos(hisPicklePath)
     print("Loaded His codon positions for %d genes." % len(his_gpos_by_gene),
           file=sys.stderr)
+
+    te_by_gene = load_translation_efficiency(tePath) if tePath else None
+    if te_by_gene is not None:
+        print("Loaded translation efficiency for %d genes." % len(te_by_gene),
+              file=sys.stderr)
 
     genes = parse_gtf(gtfPath)
     region_len_by_gene = {g: region_lengths(gene) for g, gene in genes.items()}
@@ -1075,6 +1290,26 @@ def main(args):
     rates_by_lib = {
         lib: {g: raw_by_lib[lib]["site_counts"][g][0] / raw_by_lib[lib]["site_counts"][g][1]
               for g in common_sites}
+        for lib in libIDs
+    }
+
+    # ---- View 3-TE: per-gene footprint/shadow-RUN rate, paired ----
+    # Deliberately NOT the same rate as rates_by_lib above: rates_by_lib is a
+    # per-NUCLEOTIDE rate (fraction of individual scored A sites with
+    # P_B>cutoff, no size requirement -- a lone 1nt blip counts the same as
+    # a site in the middle of a real footprint). For a TE correlation the
+    # more meaningful "shadow" is an actual footprint-sized (>=MIN_RUN_NT nt)
+    # protected RUN, same definition View 7's shadow density uses.
+    run_read_totals_by_lib = {
+        lib: {g: n_reads for g, (_n_runs, n_reads) in raw_by_lib[lib]["run_rate_counts"].items()}
+        for lib in libIDs
+    }
+    common_run_rate_genes = _common_genes(run_read_totals_by_lib, MIN_READS_FOR_RUN_RATE)
+    print("    footprint-run rate: %d genes common to all %d libraries (>=%d reads each)"
+          % (len(common_run_rate_genes), len(libIDs), MIN_READS_FOR_RUN_RATE), file=sys.stderr)
+    run_rates_by_lib = {
+        lib: {g: raw_by_lib[lib]["run_rate_counts"][g][0] / raw_by_lib[lib]["run_rate_counts"][g][1]
+              for g in common_run_rate_genes}
         for lib in libIDs
     }
 
@@ -1207,6 +1442,20 @@ def main(args):
     # View 3: per-gene call rate, magnitude comparison across libraries
     plot_gene_call_rates(rates_by_lib, "%s.gene_call_rates.png" % outPrefix,
                          connect_matched=True)
+    # View 3-supplement: same data, ranked by per-gene range across
+    # libraries so the biggest movers and the most stable genes are each
+    # readable by name (see plot_gene_change_ranking's docstring).
+    plot_gene_change_ranking(rates_by_lib, "%s.gene_call_rates.ranking.png" % outPrefix,
+                             title="Per-gene call-rate change across libraries",
+                             xlabel=f"range in per-gene call rate (P$_B$ > {FIXED_CUTOFF})")
+    # View 3-TE: per-gene footprint/shadow-RUN rate (run_rates_by_lib, NOT
+    # the nucleotide-level rates_by_lib -- see its construction above) against
+    # translation efficiency (Weinberg/Bartel RPF/RNA data), one panel per
+    # library -- only produced if a TE file was passed on the CLI (args[4]).
+    if te_by_gene is not None:
+        plot_te_correlation(run_rates_by_lib, te_by_gene,
+                            "%s.gene_run_rates.te_correlation.png" % outPrefix,
+                            ylabel=f"n(footprint runs ≥{MIN_RUN_NT}nt) / n(reads)")
     # View 4: P_B distribution at His-codon sites, not collapsed to one cutoff
     plot_his_codon_pb_distribution(his_hist_by_lib, his_edges,
                                    "%s.his_codon_pb_distribution" % outPrefix)
@@ -1218,6 +1467,9 @@ def main(args):
                          title="Mean His-codon P$_B$ by library (paired per gene)",
                          min_n=MIN_HIS_OBS_PER_GENE, min_n_label="His-codon sites",
                          ylabel="mean P$_B$ at His-codon sites", connect_matched=True)
+    plot_gene_change_ranking(his_gene_by_lib, "%s.his_codon_mean_pb_paired.ranking.png" % outPrefix,
+                             title="Per-gene mean His-codon P$_B$ change across libraries",
+                             xlabel="range in mean P$_B$ at His-codon sites")
     # View 6: n_his_shadows / n_reads_with_a_His_site, per-gene rate, paired
     # across libraries -- normalized by reads that had the opportunity to
     # show a His-codon shadow, not by n(other shadows), so a library with
@@ -1227,6 +1479,9 @@ def main(args):
                          title="His-shadow-count / reads-with-His-site by library",
                          min_n=MIN_HIS_READS_PER_GENE, min_n_label="qualifying reads",
                          ylabel="n(His shadows) / n(reads with His site)", connect_matched=True)
+    plot_gene_change_ranking(his_vs_other_ratio_by_lib, "%s.his_codon_enrichment.ranking.png" % outPrefix,
+                             title="Per-gene His-shadow-rate change across libraries",
+                             xlabel="range in n(His shadows) / n(reads with His site)")
     # View 8: same as View 6, but the numerator only counts qualifying runs
     # CENTERED on a His codon rather than any His-codon site -- a stricter,
     # additional test of whether the His codon itself is driving the
@@ -1235,6 +1490,10 @@ def main(args):
                          title="His-CENTERED-run-count / reads-with-His-site by library",
                          min_n=MIN_HIS_READS_PER_GENE, min_n_label="qualifying reads",
                          ylabel="n(His-centered runs) / n(reads with His site)", connect_matched=True)
+    plot_gene_change_ranking(his_centered_ratio_by_lib,
+                             "%s.his_codon_centered_enrichment.ranking.png" % outPrefix,
+                             title="Per-gene His-centered-run-rate change across libraries",
+                             xlabel="range in n(His-centered runs) / n(reads with His site)")
     # View 7: shadow density (shadows/nt/read) by region -- one grouped barplot,
     # all regions and libraries together, not gene-paired across libraries.
     plot_region_density_grouped_bars(region_density_mean, region_density_n,

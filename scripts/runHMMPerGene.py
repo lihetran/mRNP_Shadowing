@@ -227,6 +227,50 @@ def _gene_introns(gene: dict) -> list:
     return introns
 
 
+def _gene_splice_junctions_tx(gene: dict) -> list:
+    """
+    tx-coordinate position of every splice junction (intron) in this gene's
+    CDS-relative transcript coordinate frame, one float per junction --
+    placed exactly halfway between the last transcript base before the
+    intron and the first transcript base after it (e.g. 308.5, not 308 or
+    309), so it sits visually between two adjacent integer tx positions
+    rather than on top of either one's data. Uses the exact same
+    per-segment-list tx numbering _full_tx_map / _gpos_to_tx_map use (cds
+    starts at tx=0, utr3 starts at tx=cds_length(gene), utr5 walked from 0
+    then shifted to end at -1), so a junction here lines up with those
+    functions' own tx values for the same gene.
+
+    Transcript space is spliced by construction -- an intron's genomic
+    positions are simply absent from gpos_to_tx, so a real intron produces
+    no gap or artifact in the scored data itself (confirmed end to end on
+    RPL17A: GTF parsing, BAM alignment, parquet position-calling, and
+    gpos_to_tx all correctly exclude/handle its intron already). What's
+    missing without this is a way to tell "no signal here because this is a
+    splice junction" apart from "no signal here for some other reason" on
+    plot_pb_by_tx_pyx / plot_signed_log_pyx, the way his_positions already
+    lets a real dip be told apart from a coincidental one at a His codon.
+    """
+    cds_len = cds_length(gene)
+
+    def _junctions_within(segments, tx_start):
+        tx = tx_start
+        out = []
+        for i, (s, e) in enumerate(segments):
+            if i > 0:
+                out.append(tx - 0.5)          # midpoint of the gap before this segment
+            tx += e - s
+        return out
+
+    junctions = _junctions_within(gene["cds"], 0)
+    junctions += _junctions_within(gene.get("utr3", []), cds_len)
+
+    u5 = gene.get("utr5", [])
+    n5 = sum(e - s for s, e in u5)
+    junctions += [j - n5 for j in _junctions_within(u5, 0)]
+
+    return junctions
+
+
 def _read_has_unexplained_gap(absolute_indices, edit_string, introns: list, max_gap_nt: int) -> bool:
     """
     True if this read's alignment contains a reference-skipped stretch
@@ -949,17 +993,18 @@ def write_shadow_calls_to_df(gene, df_qry, records, read_edits,
 def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                       label1="A", label2="B", ref_cov=None,
                       tx_col="tx", pb_col="P_B", edit_col="edits",
-                      pct=(5, 95), num_reads=10):
+                      pct=(5, 95), num_reads=10, splice_positions=()):
     from pyx import canvas, graph, color, style, text as pyx_text
     from collections import defaultdict
     import numpy as np
 
-    col_qry  = color.cmyk(1, 0.5, 0, 0)
-    col_his  = color.cmyk(0, 1, 1, 0)
-    col_sig  = color.cmyk(0, 0, 0, 0.4)
-    col_edit = color.cmyk(0, 0, 0, 1)
-    col_no   = color.cmyk(0, 0.8, 1, 0)
-    col_cov  = color.cmyk(0.7, 0, 0.7, 0.1)   # green — background coverage
+    col_qry    = color.cmyk(1, 0.5, 0, 0)
+    col_his    = color.cmyk(0, 1, 1, 0)
+    col_sig    = color.cmyk(0, 0, 0, 0.4)
+    col_edit   = color.cmyk(0, 0, 0, 1)
+    col_no     = color.cmyk(0, 0.8, 1, 0)
+    col_cov    = color.cmyk(0.7, 0, 0.7, 0.1)   # green — background coverage
+    col_splice = color.cmyk(0, 0, 0, 0.5)       # grey dashed — splice junction
 
     pdf_path = str(pdf_path)
 
@@ -996,6 +1041,11 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
             graph.data.function(f"x(y)={hp}", min=0, max=1),
             [graph.style.line([col_his, style.linewidth.thin,
                                style.linestyle.solid])])
+    for sp in splice_positions:
+        g_meta.plot(
+            graph.data.function(f"x(y)={sp}", min=0, max=1),
+            [graph.style.line([col_splice, style.linewidth.thin,
+                               style.linestyle.dashed])])
     g_meta.plot(
         graph.data.function("y(x)=0.5", min=x_min, max=x_max),
         [graph.style.line([col_sig, style.linewidth.thin,
@@ -1034,6 +1084,11 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                 graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                 [graph.style.line([col_his, style.linewidth.thin,
                                    style.linestyle.solid])])
+        for sp in splice_positions:
+            g_cov.plot(
+                graph.data.function(f"x(y)={sp}", min=0, max=cov_y_max),
+                [graph.style.line([col_splice, style.linewidth.thin,
+                                   style.linestyle.dashed])])
         if len(cov_items) > 0:
             g_cov.plot(
                 graph.data.points(list(zip(cov_x, cov_y)), x=1, y=2),
@@ -1067,6 +1122,11 @@ def plot_pb_by_tx_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                 graph.data.function(f"x(y)={hp}", min=0, max=1),
                 [graph.style.line([col_his, style.linewidth.thin,
                                    style.linestyle.solid])])
+        for sp in splice_positions:
+            g_read.plot(
+                graph.data.function(f"x(y)={sp}", min=0, max=1),
+                [graph.style.line([col_splice, style.linewidth.thin,
+                                   style.linestyle.dashed])])
         g_read.plot(
             graph.data.function("y(x)=0.5", min=x_min, max=x_max),
             [graph.style.line([col_sig, style.linewidth.thin,
@@ -1103,7 +1163,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
                         label1="A", label2="B", label3="sample",
                         ref_cov_A=None, ref_cov_B=None,
                         tx_col="tx", pa_col="P_A", pb_col="P_B", edit_col="edits",
-                        pct=(5, 95), num_reads=10, eps=1e-6):
+                        pct=(5, 95), num_reads=10, eps=1e-6, splice_positions=()):
     from pyx import canvas, graph, color, style, text as pyx_text
     from collections import defaultdict
     import numpy as np, math
@@ -1132,14 +1192,15 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
             return floor
         return max(v, floor)
 
-    col_qry  = color.cmyk(1, 0.5, 0, 0)       # blue  — P_A trace (flipped, +)
-    col_pb   = color.cmyk(0.4, 1, 0, 0)       # purple — P_B trace (unflipped, -)
-    col_his  = color.cmyk(0, 1, 1, 0)
-    col_sig  = color.cmyk(0, 0, 0, 0.4)
-    col_edit = color.cmyk(0, 0, 0, 1)
-    col_no   = color.cmyk(0, 0.8, 1, 0)
-    col_covA = color.cmyk(0.7, 0, 0.7, 0.1)   # green — ref A coverage
-    col_covB = color.cmyk(0, 0.5, 1, 0.1)     # orange — ref B coverage
+    col_qry    = color.cmyk(1, 0.5, 0, 0)       # blue  — P_A trace (flipped, +)
+    col_pb     = color.cmyk(0.4, 1, 0, 0)       # purple — P_B trace (unflipped, -)
+    col_his    = color.cmyk(0, 1, 1, 0)
+    col_sig    = color.cmyk(0, 0, 0, 0.4)
+    col_edit   = color.cmyk(0, 0, 0, 1)
+    col_no     = color.cmyk(0, 0.8, 1, 0)
+    col_covA   = color.cmyk(0.7, 0, 0.7, 0.1)   # green — ref A coverage
+    col_covB   = color.cmyk(0, 0.5, 1, 0.1)     # orange — ref B coverage
+    col_splice = color.cmyk(0, 0, 0, 0.5)       # grey dashed — splice junction
 
     pdf_path = str(pdf_path)
     x_min, x_max = tx_lo, tx_hi
@@ -1176,6 +1237,12 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         for hp in his_positions:
             g.plot(graph.data.function(f"x(y)={hp}", min=-y_lim_lo, max=y_lim_hi),
                    [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+    def draw_splice(g, ymin=None, ymax=None):
+        lo = -y_lim_lo if ymin is None else ymin
+        hi = y_lim_hi if ymax is None else ymax
+        for sp in splice_positions:
+            g.plot(graph.data.function(f"x(y)={sp}", min=lo, max=hi),
+                   [graph.style.line([col_splice, style.linewidth.thin, style.linestyle.dashed])])
     def draw_zero(g):
         g.plot(graph.data.function("y(x)=0", min=x_min, max=x_max),
                [graph.style.line([col_sig, style.linewidth.thin, style.linestyle.dashed])])
@@ -1190,7 +1257,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         y=graph.axis.linear(min=-y_lim_lo, max=y_lim_hi, title="log10 P(Protection)",
                             parter=nice_parter(y_lim_lo + y_lim_hi)),
     )
-    draw_his(g_meta); draw_zero(g_meta)
+    draw_his(g_meta); draw_splice(g_meta); draw_zero(g_meta)
     if xs:
         for yb in (ya_lo, ya_hi):
             g_meta.plot(graph.data.points(list(zip(xs, yb)), x=1, y=2),
@@ -1233,6 +1300,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         for hp in his_positions:
             g_cov.plot(graph.data.function(f"x(y)={hp}", min=0, max=cov_y_max),
                        [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        draw_splice(g_cov, ymin=0, ymax=cov_y_max)
         for d, col, _lab in cov_tracks:
             g_cov.plot(graph.data.points(sorted(d.items()), x=1, y=2),
                        [graph.style.line([col, style.linewidth.normal, style.linestyle.solid])])
@@ -1271,6 +1339,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         for hp in his_positions:
             g_lo.plot(graph.data.function(f"x(y)={hp}", min=-y_lim_lo, max=0),
                       [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        draw_splice(g_lo, ymin=-y_lim_lo, ymax=0)
         g_lo.plot(graph.data.points(list(zip(tx_s, ybS)), x=1, y=2),
                   [graph.style.line([col_pb, style.linewidth.thin, style.linestyle.solid])])
         c.insert(g_lo)
@@ -1284,6 +1353,7 @@ def plot_signed_log_pyx(gene_name, df, his_positions, tx_lo, tx_hi, pdf_path,
         for hp in his_positions:
             g_hi.plot(graph.data.function(f"x(y)={hp}", min=0, max=y_lim_hi),
                       [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+        draw_splice(g_hi, ymin=0, ymax=y_lim_hi)
         g_hi.plot(graph.data.points(list(zip(tx_s, yaS)), x=1, y=2),
                   [graph.style.line([col_qry, style.linewidth.thin, style.linestyle.solid])])
         c.insert(g_hi)
@@ -1411,6 +1481,7 @@ def main():
         his_positions = find_his_codon_tx_positions(ref_fasta, gene)
         if args.require_his_codon and len(his_positions) == 0:
             continue
+        splice_positions = _gene_splice_junctions_tx(gene)
 
         # Query: the reads we make protection calls on.
         df_qry = get_gene_df(query_df, gene, cds_spanning=args.cds_spanning,
@@ -1451,7 +1522,8 @@ def main():
             gname, df, his_positions, tx_lo, tx_hi,
             pdf_path=pdf_dir / f"{gname}.pdf",
             label1="P(Shadow)", label2=args.label,
-            ref_cov=model_dict[gname]["covA"]
+            ref_cov=model_dict[gname]["covA"],
+            splice_positions=splice_positions
         )
         plot_signed_log_pyx(
             gname, df, his_positions, tx_lo, tx_hi,
@@ -1459,7 +1531,8 @@ def main():
             label1="ribosome-less", label2="Mock TadA",
             label3=args.label,
             ref_cov_A=model_dict[gname]["covA"],
-            ref_cov_B=model_dict[gname]["covB"]
+            ref_cov_B=model_dict[gname]["covB"],
+            splice_positions=splice_positions
         )
         gene_calls = write_shadow_calls_to_df(
             gname, df_qry, rows,  # `rows` = the classify records
