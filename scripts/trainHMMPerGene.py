@@ -171,6 +171,53 @@ def parse_gtf(gtf_path: str) -> dict:
 def cds_length(gene: dict) -> int:
     return sum(ce - cs for cs, ce in gene["cds"])
 
+def compute_flank_caps(genes: dict, flank_nt: int) -> dict:
+    """
+    {gene_name: (flank_5p, flank_3p)} -- usable flank nt on the
+    start-codon side and stop-codon side of each gene, capped at flank_nt
+    by the gap to its nearest neighboring gene on that side (never
+    crossing into another gene's own annotated span).
+
+    Why this exists: this GTF has essentially no annotated UTRs (4/5106
+    genes have any 5'UTR at all; every "3'UTR" is exactly the stop
+    codon's own 3nt), so _gpos_to_tx_map/_full_tx_map's old
+    include_utrs=True behavior scored almost nothing past the CDS for
+    almost every gene. The fix (mirroring metaStartStop.py's parseGTF,
+    a colleague's script with the same problem) is to pad the CDS's own
+    first/last exon by a fixed nt window instead of trusting UTR
+    annotations -- but yeast genes are packed close enough that a flat
+    flank_nt would regularly blend a NEIGHBORING gene's own CDS signal
+    into this gene's flank (~15.6% of adjacent gene pairs are closer than
+    100nt apart, 10.4% already overlap/adjacent at a 0nt gap -- checked
+    directly against this GTF). Capping each side at the real gap to the
+    nearest neighbor eliminates that risk with one O(N log N) pass here,
+    rather than a per-position uniqueness check.
+
+    Kept as its own copy rather than imported from runHMMPerGene.py, same
+    convention as _gpos_to_tx_map (see polysomeShadowHMMQC.py's note on
+    this) -- small enough that the duplication cost is low.
+    """
+    by_chrom = collections.defaultdict(list)
+    for gname, g in genes.items():
+        by_chrom[g["chrom"]].append((g["gene_start"], g["gene_end"], gname))
+
+    caps = {}
+    for chrom, entries in by_chrom.items():
+        entries.sort(key=lambda e: e[0])
+        for i, (gs, ge, gname) in enumerate(entries):
+            left_gap  = (gs - entries[i - 1][1]) if i > 0 else flank_nt
+            right_gap = (entries[i + 1][0] - ge) if i + 1 < len(entries) else flank_nt
+            left_avail  = max(0, min(flank_nt, left_gap))
+            right_avail = max(0, min(flank_nt, right_gap))
+            # left/right are genomic order; map onto 5'/3' by strand --
+            # minus-strand genes have their 5' end at the HIGHER
+            # genomic coordinate (the right side).
+            if genes[gname]["strand"] == "+":
+                caps[gname] = (left_avail, right_avail)
+            else:
+                caps[gname] = (right_avail, left_avail)
+    return caps
+
 def _subtract_intervals(exons, cds):
     """
     exons, cds: lists of (start, end) genomic half-open intervals, unsorted.
@@ -249,7 +296,8 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
                 cds_spanning: bool = False,
                 min_edit_freq: float = 0.0,
                 drop_unexplained_gaps: bool = False,
-                max_gap_nt: int = 20) -> pd.DataFrame:
+                max_gap_nt: int = 20,
+                flank_5p: int = 0, flank_3p: int = 0) -> pd.DataFrame:
     """
     Built with Claude
     Fast vectorised pre-filter to reads overlapping this gene.
@@ -257,6 +305,15 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
     If cds_spanning is True, only keep reads whose alignment spans the full
     CDS (read_start <= cds_genomic_start and read_end >= cds_genomic_end),
     so every read had the opportunity to be edited at every position.
+    flank_5p/flank_3p don't apply here -- cds_spanning is intentionally
+    about the CDS itself, not the flank.
+
+    Otherwise, the overlap window is gene_start/gene_end widened by
+    flank_5p/flank_3p (a gene's own compute_flank_caps entry, oriented by
+    strand to genomic left/right) -- so a read that only covers the
+    padded flank region (e.g. a degraded read capturing just the poly-A +
+    a bit of 3'UTR) isn't dropped before its flank-region positions ever
+    reach _gpos_to_tx_map/_full_tx_map's now-widened scoring window.
 
     If min_edit_freq > 0, only keep reads whose global_edit_freq column
     (per-read A->G edit fraction) is >= min_edit_freq. Reads below this
@@ -278,7 +335,9 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
             cds_end = gene.get("cds_genomic_end",   gene["gene_end"])
             mask &= ((df_all["read_start"] <= cds_start) & (df_all["read_end"]   >= cds_end))
         else:
-            mask &= ((df_all["read_start"] < gene["gene_end"]) & (df_all["read_end"] > gene["gene_start"]))
+            left_pad, right_pad = (flank_5p, flank_3p) if gene["strand"] == "+" else (flank_3p, flank_5p)
+            mask &= ((df_all["read_start"] < gene["gene_end"] + right_pad) &
+                     (df_all["read_end"] > gene["gene_start"] - left_pad))
     if min_edit_freq > 0.0 and "global_edit_freq" in df_all.columns:
         mask &= (df_all["global_edit_freq"] >= min_edit_freq)
 
@@ -293,81 +352,89 @@ def get_gene_df(df_all: pd.DataFrame, gene: dict,
         sub = sub[keep]
     return sub
 
+def _padded_cds_segments(gene: dict, flank_5p: int, flank_3p: int, chrom_len: int) -> list:
+    """
+    A copy of gene["cds"] with its first/last (in transcript order)
+    interval's outer boundary padded by flank_5p (before the start
+    codon)/flank_3p (after the stop codon) nt -- single-exon genes pad
+    both ends of the sole interval. Clipped to [0, chrom_len) on both
+    ends (real cases in this genome need both: e.g. RPM1 on Mito has only
+    2nt of headroom before the chromosome end). Shared by _full_tx_map and
+    _gpos_to_tx_map -- see compute_flank_caps for why this padding exists
+    instead of trusting GTF-annotated UTR features.
+    """
+    cds = list(gene["cds"])
+    if len(cds) == 1:
+        s, e = cds[0]
+        lo_pad, hi_pad = (flank_5p, flank_3p) if gene["strand"] == "+" else (flank_3p, flank_5p)
+        cds[0] = (max(0, s - lo_pad), min(chrom_len, e + hi_pad))
+    else:
+        first_s, first_e = cds[0]
+        last_s, last_e = cds[-1]
+        if gene["strand"] == "+":
+            cds[0]  = (max(0, first_s - flank_5p), first_e)
+            cds[-1] = (last_s, min(chrom_len, last_e + flank_3p))
+        else:
+            cds[0]  = (first_s, min(chrom_len, first_e + flank_5p))
+            cds[-1] = (max(0, last_s - flank_3p), last_e)
+    return cds
+
 def _full_tx_map(gene: dict, ref_fasta: pysam.FastaFile,
-                 include_utrs: bool = True) -> dict:
+                 flank_5p: int = 0, flank_3p: int = 0) -> dict:
     """
     Built with Claude
     Map tx_pos -> (gpos, ref_base_sense) for EVERY transcript position (all
     bases, not just A). ref_base_sense is the transcript-sense reference base
     (complemented for minus-strand genes), so 'A' marks editable sites.
 
-    Coordinates are CDS-relative: the first CDS base is tx_pos 0, 5'UTR
-    positions are negative, 3'UTR positions are >= cds_length(gene).
+    Coordinates are CDS-relative: the first CDS base is tx_pos 0, negative
+    before it, >= cds_length(gene) after it. Does NOT rely on GTF-annotated
+    UTR features (gene["utr5"]/["utr3"]) -- see compute_flank_caps -- pads
+    the CDS's own first/last exon by flank_5p/flank_3p genomic nt instead
+    (typically a gene's own compute_flank_caps entry) and walks that
+    padded interval list, same technique as shadowMetagene.py's
+    gene_tx_to_gpos_map (sequence-free there; this one keeps the real
+    base-identity lookup this function's callers need).
     """
     chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
     strand    = gene["strand"]
-
-    def _walk(segments, tx_start):
-        """Yield (tx_pos, gpos, sense_base) in transcript order."""
-        tx = tx_start
-        for (cs, ce) in segments:
-            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
-            for gpos in rng:
-                base = chrom_seq[gpos]
-                if strand == "-":
-                    base = complement_base(base)
-                yield tx, gpos, base
-                tx += 1
+    cds = _padded_cds_segments(gene, flank_5p, flank_3p, len(chrom_seq))
 
     full = {}
-    for tx, gpos, base in _walk(gene["cds"], 0):
-        full[tx] = (gpos, base)
-
-    if include_utrs:
-        cds_len = cds_length(gene)
-        for tx, gpos, base in _walk(gene.get("utr3", []), cds_len):
+    tx = -flank_5p
+    for (cs, ce) in cds:
+        rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
+        for gpos in rng:
+            base = chrom_seq[gpos]
+            if strand == "-":
+                base = complement_base(base)
             full[tx] = (gpos, base)
-
-        # 5'UTR: walk from 0 in transcript order, then shift so it ends at -1
-        u5 = list(_walk(gene.get("utr5", []), 0))
-        n5 = len(u5)
-        for tx, gpos, base in u5:
-            full[tx - n5] = (gpos, base)
-
+            tx += 1
     return full
 
 
-def _gpos_to_tx_map(gene, ref_fasta, include_utrs=True):
+def _gpos_to_tx_map(gene, ref_fasta, flank_5p=0, flank_3p=0):
+    """
+    {gpos: tx} restricted to ref=A (transcript-sense) positions -- the
+    core function defining which genomic positions get scored at all.
+    Coordinates: first CDS base is tx_pos 0, negative before it, >=
+    cds_length(gene) after it. See _full_tx_map/compute_flank_caps for why
+    this pads the CDS's own first/last exon by flank_5p/flank_3p genomic
+    nt instead of trusting GTF-annotated UTR features.
+    """
     chrom_seq = ref_fasta.fetch(gene["chrom"]).upper()
     strand    = gene["strand"]
     want      = "A" if strand == "+" else "T"
-
-    def _walk(segments, tx_start):
-        """Yield (gpos, tx_pos) in transcript order, starting at tx_start."""
-        tx = tx_start
-        for (cs, ce) in segments:
-            rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
-            for gpos in rng:
-                yield gpos, tx
-                tx += 1
+    cds = _padded_cds_segments(gene, flank_5p, flank_3p, len(chrom_seq))
 
     out = {}
-    for gpos, tx in _walk(gene["cds"], 0):
-        if chrom_seq[gpos] == want:
-            out[gpos] = tx
-
-    if include_utrs:
-        cds_len = cds_length(gene)
-        for gpos, tx in _walk(gene["utr3"], cds_len):
+    tx = -flank_5p
+    for (cs, ce) in cds:
+        rng = range(cs, ce) if strand == "+" else range(ce - 1, cs - 1, -1)
+        for gpos in rng:
             if chrom_seq[gpos] == want:
                 out[gpos] = tx
-        # 5'UTR: walk in transcript order, then offset so it ends at -1
-        u5 = list(_walk(gene["utr5"], 0))
-        n5 = len(u5)
-        for gpos, tx in u5:
-            if chrom_seq[gpos] == want:
-                out[gpos] = tx - n5
-
+            tx += 1
     return out
 
 def classify_tx(tx_pos, cds_len):
@@ -603,7 +670,7 @@ def train(A_df, B_df, alpha=1, beta=1, gpos_to_tx=None, block = 30):
 # ─────────────────────────────────────────────────────────────────────────
 
 def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
-                                 min_sites=2):
+                                 min_sites=2, flank_caps=None):
     """
     Generator: for every gene with an already-trained model (pA/pB, from
     train()), stream that gene's query reads and yield each read's (coords,
@@ -626,6 +693,11 @@ def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
     min_sites: skip reads with fewer than this many scored sites -- a read
     with 0-1 sites carries no information about how state changes with
     position, and just adds noise/cost to the E-step.
+
+    flank_caps: {gene_name: (flank_5p, flank_3p)} from compute_flank_caps
+    -- (0, 0) per gene if not given, i.e. CDS-only, matching this
+    function's previous behavior (not currently invoked from main(); kept
+    consistent for whenever it is).
     """
     needed_cols = ["chrom", "gene_strand", "read_start", "read_end",
                    "edit_string", "absolute_indices"]
@@ -637,12 +709,14 @@ def collect_hsmm_training_reads(query_df, model_dict, genes, ref_fasta,
         gene = genes.get(gname)
         if gene is None:
             continue
+        flank_5p, flank_3p = (flank_caps or {}).get(gname, (0, 0))
 
-        df_g = get_gene_df(query_df, gene, cds_spanning=False, drop_unexplained_gaps=True)
+        df_g = get_gene_df(query_df, gene, cds_spanning=False, drop_unexplained_gaps=True,
+                           flank_5p=flank_5p, flank_3p=flank_3p)
         if df_g.empty:
             continue
 
-        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta, flank_5p=flank_5p, flank_3p=flank_3p)
 
         for row in df_g.itertuples():
             edit_str = row.edit_string
@@ -761,6 +835,16 @@ def parse_args():
     p.add_argument("--gtf", required=True)
     p.add_argument("--min_coverage", type=float, default=100.0)
     p.add_argument("--output", default="gene_models.pickle")
+    p.add_argument("--flank_nt", type=int, default=150,
+                   help="Train on this many nt of genomic flank past the CDS's "
+                        "own first/last exon on each side, instead of relying "
+                        "on (often absent) GTF-annotated UTR features -- same "
+                        "technique as metaStartStop.py's parseGTF. Capped per "
+                        "gene at the gap to its nearest neighboring gene "
+                        "(see compute_flank_caps), so padding never crosses "
+                        "into another gene's own annotated span. Must match "
+                        "what runHMMPerGene.py's own --flank_nt uses when "
+                        "scoring with this model (default: 150).")
 
     return p.parse_args()
 
@@ -794,6 +878,7 @@ def main():
     print("\nParsing GTF...", file=sys.stderr)
     genes = parse_gtf(args.gtf)
     print(f"{len(genes):,} genes.", file=sys.stderr)
+    flank_caps = compute_flank_caps(genes, args.flank_nt)
 
     ref_fasta = pysam.FastaFile(args.ref)
     gene_names = list(genes.keys())
@@ -809,17 +894,20 @@ def main():
 
         gene = genes[gname]
         gene_len = cds_length(gene)
+        flank_5p, flank_3p = flank_caps[gname]
 
         # Background: ALWAYS all overlapping reference reads (never spanning),
         # never edit-freq filtered — maximum per-position support.
-        t1 = get_gene_df(train_df1, gene, cds_spanning=False, drop_unexplained_gaps=True)
-        t2 = get_gene_df(train_df2, gene, cds_spanning=False, drop_unexplained_gaps=True)
+        t1 = get_gene_df(train_df1, gene, cds_spanning=False, drop_unexplained_gaps=True,
+                         flank_5p=flank_5p, flank_3p=flank_3p)
+        t2 = get_gene_df(train_df2, gene, cds_spanning=False, drop_unexplained_gaps=True,
+                         flank_5p=flank_5p, flank_3p=flank_3p)
 
         # Two independent coverage thresholds
         if len(t1) < args.min_coverage or len(t2) < args.min_coverage:  # both need to pass
             continue
 
-        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta)
+        gpos_to_tx = _gpos_to_tx_map(gene, ref_fasta, flank_5p=flank_5p, flank_3p=flank_3p)
         tx_to_gpos = {tx: gp for gp, tx in gpos_to_tx.items()}
 
         # Train the model on the first two libraries
@@ -828,7 +916,11 @@ def main():
 
         n_pass += 1
 
-    # write to pickle
+    # write to pickle -- __meta__ is a reserved key, not a gene name, so
+    # runHMMPerGene.py's gname-keyed lookups (model_dict.get(gname)/`gname
+    # not in model_dict`) never match it; lets a later run warn if its own
+    # --flank_nt doesn't match what this model was actually trained with.
+    model_dict["__meta__"] = {"flank_nt": args.flank_nt}
     with open(args.output, "wb") as f:
         pickle.dump(model_dict, f)
     print(f"stored model in {args.output}")

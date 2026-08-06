@@ -29,20 +29,28 @@ Input parquet columns used per read:
   or FIXED_CUTOFF.)
 
 Run:
-  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile [tePath]
+  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile [tePath] [flank_nt]
 where inFilesParquet.txt is line-delimited:  fileName  rep  parquetFile,
 hisCodonPositions.pickle is findHisCodonPositions.py's output, gtfFile
-is the GTF used to derive each gene's UTR5/CDS/UTR3 lengths for View 7, and
-the optional tePath is a per-gene translation-efficiency table (a .parquet
-with gene_name/TE_score columns, e.g. Weinberg/Bartel RPF-vs-RNA data --
-see load_translation_efficiency) enabling View 3-TE.
+is the GTF used to derive each gene's CDS length for View 7 (UTR5/UTR3
+lengths come from flank_nt instead -- see region_lengths), the optional
+tePath is a per-gene translation-efficiency table (a .parquet with
+gene_name/TE_score columns, e.g. Weinberg/Bartel RPF-vs-RNA data -- see
+load_translation_efficiency) enabling View 3-TE, and the optional
+flank_nt (default 150) MUST match whatever --flank_nt
+runHMMPerGene.py/trainHMMPerGene.py actually scored these parquets with,
+since UTR5/UTR3 "length" for View 7's density normalization is now that
+scored flank width (capped per gene at the nearest-neighbor gap via
+compute_flank_caps), not a GTF-annotated UTR span -- this GTF barely
+annotates any (every "UTR3" is exactly the stop codon's own 3nt), so
+using that instead would wildly distort View 7's UTR density.
 """
 
 import sys, math, collections, pickle
 import numpy as np
 import pandas as pd
 
-from runHMMPerGene import parse_gtf, cds_length
+from runHMMPerGene import parse_gtf, cds_length, compute_flank_caps
 # NOTE: parse_gtf/cds_length are imported rather than duplicated a third
 # time (trainHMMPerGene.py already imports _forward_backward_hsmm/
 # _duration_pmf_default from runHMMPerGene.py the same way) -- these are
@@ -82,6 +90,10 @@ MIN_READS_FOR_RUN_RATE = 20                   # View 9: drop a gene from the run
 TOP_K_CHANGE   = 15                           # plot_gene_change_ranking: how many genes to
                                                # show at each end (biggest movers / most
                                                # stable) of the paired per-gene rankings
+FLANK_NT       = 150                          # View 7: UTR5/UTR3 region length -- must match
+                                               # whatever --flank_nt runHMMPerGene.py/
+                                               # trainHMMPerGene.py actually scored this
+                                               # parquet with (see region_lengths)
 MIN_RUN_NT     = 25                           # View 7: a "shadow" is a protected run of at
                                                # least this many genomic nt (footprint-sized),
                                                # not a bare scored site -- an isolated 1-3nt
@@ -325,16 +337,26 @@ def _gene_site_counts_his_split(df, his_gpos_by_gene, cutoff=FIXED_CUTOFF):
     return his_counts, oth_counts, dict(his_read_tot)
 
 
-def region_lengths(gene):
+def region_lengths(gene, flank_5p, flank_3p):
     """
     (utr5_len, cds_len, utr3_len) in nt, from a parse_gtf gene dict.
-    cds_length() already exists in runHMMPerGene.py; UTR lengths are the
-    same sum-of-interval-spans, just no dedicated helper existed yet.
+
+    utr5_len/utr3_len are NOT the GTF-annotated gene["utr5"]/["utr3"]
+    interval spans -- this GTF barely annotates any (every "UTR3" is
+    exactly the stop codon's own 3nt; almost no gene has any UTR5 at
+    all), so that would either wildly inflate View 7's UTR3 density
+    (dividing real shadow calls, now correctly scored ~150nt into the
+    flank, by a 3nt denominator) or silently exclude UTR5 entirely (the
+    region_len_by_gene[g][ri] > 0 guard at the call site). flank_5p/
+    flank_3p are the gene's own compute_flank_caps entry instead -- the
+    ACTUAL flank width runHMMPerGene.py/trainHMMPerGene.py scored for
+    this gene (capped at the gap to its nearest neighbor), so the
+    denominator here matches what was truly scored, not an annotation
+    artifact. cds_length() already exists in runHMMPerGene.py; that part
+    was never wrong.
     """
-    utr5_len = sum(e - s for s, e in gene.get("utr5", []))
-    cds_len  = cds_length(gene)
-    utr3_len = sum(e - s for s, e in gene.get("utr3", []))
-    return utr5_len, cds_len, utr3_len
+    cds_len = cds_length(gene)
+    return flank_5p, cds_len, flank_3p
 
 
 def _gene_region_run_counts(runs, min_genomic_nt=MIN_RUN_NT):
@@ -1227,6 +1249,7 @@ def main(args):
 
     parquetList, outPrefix, hisPicklePath, gtfPath = args[0], args[1], args[2], args[3]
     tePath = args[4] if len(args) > 4 else None
+    flank_nt = int(args[5]) if len(args) > 5 else FLANK_NT
     his_gpos_by_gene = load_his_codon_gpos(hisPicklePath)
     print("Loaded His codon positions for %d genes." % len(his_gpos_by_gene),
           file=sys.stderr)
@@ -1237,8 +1260,10 @@ def main(args):
               file=sys.stderr)
 
     genes = parse_gtf(gtfPath)
-    region_len_by_gene = {g: region_lengths(gene) for g, gene in genes.items()}
-    print("Loaded region lengths for %d genes from GTF." % len(region_len_by_gene),
+    flank_caps = compute_flank_caps(genes, flank_nt)
+    region_len_by_gene = {g: region_lengths(gene, *flank_caps[g]) for g, gene in genes.items()}
+    print("Loaded region lengths for %d genes from GTF (UTR5/UTR3 = flank_nt=%d, "
+          "capped per gene at nearest-neighbor distance)." % (len(region_len_by_gene), flank_nt),
           file=sys.stderr)
 
     raw_by_lib = {}

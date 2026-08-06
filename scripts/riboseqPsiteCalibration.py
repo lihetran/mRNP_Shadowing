@@ -89,8 +89,18 @@ MIN_CDS_LEN    = 150         # skip very short CDSs -- not enough room for a cle
 def _gpos_to_tx_full(gene, ref_fasta):
     """{gpos: tx} for EVERY transcript base (not just A/T) -- inverse of
     _full_tx_map, reused as-is from runHMMPerGene.py so tx=0 means the same
-    thing (first nt of the start codon) everywhere in this codebase."""
-    full = _full_tx_map(gene, ref_fasta, include_utrs=True)
+    thing (first nt of the start codon) everywhere in this codebase.
+
+    _full_tx_map's UTR-annotation-based extension (gene["utr5"]/["utr3"])
+    was replaced with a flank_5p/flank_3p CDS-padding scheme (see
+    runHMMPerGene.py's compute_flank_caps) to work around this GTF having
+    essentially no annotated UTRs -- flank_5p=0, flank_3p=0 here
+    reproduces this script's own prior include_utrs=True behavior (this
+    GTF's annotated UTRs are themselves negligible, so the difference is
+    tiny), left as a minimal call-site fix rather than adopting the deeper
+    fix, even though this script's own WINDOW needs real data up to +15nt
+    past the stop codon that today's ~3nt-wide annotation can't supply."""
+    full = _full_tx_map(gene, ref_fasta, flank_5p=0, flank_3p=0)
     return {gpos: tx for tx, (gpos, _base) in full.items()}
 
 

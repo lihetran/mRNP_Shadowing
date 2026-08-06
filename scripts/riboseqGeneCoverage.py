@@ -62,7 +62,7 @@ the average confidence_score of the calls covering each position instead
 of one flat color.
 
 Run:
-  python3 riboseqGeneCoverage.py shadowCallsParquet riboBamList.txt condition gtfFile hisPicklePath outPrefix [geneNames] [shadow_cutoff] [min_run_nt]
+  python3 riboseqGeneCoverage.py shadowCallsParquet riboBamList.txt condition gtfFile hisPicklePath outPrefix [geneNames] [shadow_cutoff] [min_run_nt] [flank_nt]
 where shadowCallsParquet is ONE library's shadow_calls.parquet (its
 shadow_gene column defines which genes to look at), riboBamList.txt is
 e.g. /data16/liam/working/260804_riboSeq_vs_PS/riboSeqBam.txt --
@@ -74,15 +74,21 @@ Nanopore library shadowCallsParquet came from, gtfFile is the yeast GTF
 findHisCodonPositions.py's output (e.g.
 210524_sacCer_HisCodonPositions.pickle), outPrefix names the output
 plots, geneNames (optional) is a comma-separated list of genes to draw a
-track for (default: every gene), and shadow_cutoff/min_run_nt (optional)
+track for (default: every gene), shadow_cutoff/min_run_nt (optional)
 override the P_B cutoff (default 0.5) and run-length floor (default
-25nt) for what counts as a shadow call.
+25nt) for what counts as a shadow call, and flank_nt (optional, default
+150) MUST match whatever --flank_nt runHMMPerGene.py actually scored
+shadowCallsParquet with -- the per-gene track/pileup figures widen past
+the CDS by this much (capped per gene at the nearest-neighbor gap via
+compute_flank_caps) so real shadow calls out there (this GTF barely
+annotates any UTR, so runHMMPerGene.py pads the CDS instead -- see that
+script's own docstring) aren't cut off the plotted range.
 """
 import sys, os, math, collections
 import pandas as pd
 import pysam
 
-from runHMMPerGene import parse_gtf, tex_escape
+from runHMMPerGene import parse_gtf, tex_escape, compute_flank_caps
 from polysomeShadowHMMQC import extract_shadow_runs, load_his_codon_gpos
 
 SHADOW_CUTOFF  = 0.5
@@ -90,6 +96,11 @@ MIN_RUN_NT     = 30
 TARGET_LENGTHS = (21, 22, 28, 29)   # same footprint-length convention as riboseqShadowCorrelation.py
 RIBO_SHORT_LENGTHS = (21, 22)       # plot_gene_track/plot_gene_shadow_pileup's ribo panel: split
 RIBO_LONG_LENGTHS  = (28, 29)       # TARGET_LENGTHS into its two length classes, plotted separately
+FLANK_NT       = 150                # per-gene plots: widen past the CDS by this many nt (capped per
+                                     # gene at the nearest-neighbor gap via compute_flank_caps) --
+                                     # MUST match whatever --flank_nt runHMMPerGene.py actually
+                                     # scored shadowCallsParquet with, same convention as
+                                     # polysomeShadowHMMQC.py's own flank_nt
 NUM_READS      = 10                 # plot_gene_track: how many individual reads to show per gene
 MAX_PILEUP_ROWS = 60                # plot_gene_shadow_pileup: row cap -- some genes are short and
                                      # densely covered enough (e.g. CCW12: 727 reads with calls) that
@@ -266,7 +277,39 @@ def ribo_coverage_track(bam_paths, gene, target_lengths=TARGET_LENGTHS,
     return depth
 
 
-def shadow_coverage_track(shadow_df, gene_name, gene, cutoff=SHADOW_CUTOFF, min_run_nt=MIN_RUN_NT):
+def _padded_cds_segments(gene, flank_5p, flank_3p):
+    """
+    A copy of gene["cds"] with its first/last (in transcript order)
+    interval's outer boundary padded by flank_5p (before the start
+    codon)/flank_3p (after the stop codon) nt -- single-exon genes pad
+    both ends of the sole interval. Same technique (and the same
+    duplicated-per-file convention) as runHMMPerGene.py's
+    _padded_cds_segments/compute_flank_caps: shadow_calls.parquet's
+    shadow_gpos can now include real positions out here (the HMM scoring
+    pipeline was fixed to pad the CDS the same way instead of relying on
+    GTF-annotated UTR features, which this GTF barely has), so
+    shadow_coverage_track's own exon clipping needs to allow this region
+    too, not just gene["exons"].
+    """
+    cds = list(gene["cds"])
+    if len(cds) == 1:
+        s, e = cds[0]
+        lo_pad, hi_pad = (flank_5p, flank_3p) if gene["strand"] == "+" else (flank_3p, flank_5p)
+        cds[0] = (max(0, s - lo_pad), e + hi_pad)
+    else:
+        first_s, first_e = cds[0]
+        last_s, last_e = cds[-1]
+        if gene["strand"] == "+":
+            cds[0]  = (max(0, first_s - flank_5p), first_e)
+            cds[-1] = (last_s, last_e + flank_3p)
+        else:
+            cds[0]  = (first_s, first_e + flank_5p)
+            cds[-1] = (max(0, last_s - flank_3p), last_e)
+    return cds
+
+
+def shadow_coverage_track(shadow_df, gene_name, gene, cutoff=SHADOW_CUTOFF, min_run_nt=MIN_RUN_NT,
+                          flank_5p=0, flank_3p=0):
     """
     {gpos: depth} -- per-position count of qualifying shadow-call runs
     (extract_shadow_runs, P_B>=cutoff, >=min_run_nt) covering that gpos,
@@ -281,9 +324,14 @@ def shadow_coverage_track(shadow_df, gene_name, gene, cutoff=SHADOW_CUTOFF, min_
     it. Naively filling every position in that range would wrongly mark
     the intron itself as "covered" by the run, when no scored site (and
     no real mRNA sequence) is actually there. Positions are clipped to
-    the gene's own annotated exon intervals (gene["exons"]) so only
-    genuine (spliced-in) sequence gets a depth value -- the intron shows
-    as a true gap, same as ribo_coverage_track's CIGAR-aware fix.
+    the gene's own annotated exon intervals (gene["exons"]), UNIONED with
+    a flank_5p/flank_3p-padded CDS region if given (see
+    _padded_cds_segments) -- default flank_5p=flank_3p=0 reproduces the
+    original exons-only behavior exactly, so existing callers
+    (plot_gene_track/plot_gene_shadow_pileup) are unaffected; callers
+    that DO pass a flank (e.g. shadowMetagene.py, working with a
+    shadow_calls.parquet scored by a flank-padded runHMMPerGene.py) get
+    real per-position depth out there instead of a silently-clipped wall.
 
     shadow_df should already be restricted to this gene (a caller with a
     multi-gene df pays for run-extraction on every OTHER gene too
@@ -292,13 +340,15 @@ def shadow_coverage_track(shadow_df, gene_name, gene, cutoff=SHADOW_CUTOFF, min_
     does.
     """
     exons = gene.get("exons", [])
+    padded_cds = _padded_cds_segments(gene, flank_5p, flank_3p) if (flank_5p or flank_3p) else []
     runs = extract_shadow_runs(shadow_df, cutoff)
     depth = collections.Counter()
     for r in runs:
         if r["gene"] != gene_name or r["genomic_nt"] < min_run_nt:
             continue
         for gpos in range(r["gpos_lo"], r["gpos_hi"] + 1):
-            if any(s <= gpos < e for s, e in exons):
+            if (any(s <= gpos < e for s, e in exons) or
+                    any(s <= gpos < e for s, e in padded_cds)):
                 depth[gpos] += 1
     return depth
 
@@ -360,6 +410,37 @@ def confidence_color(score, conf_range=CONF_RANGE):
     return color.rgb(*CONF_COLORS[confidence_bin(score, conf_range)])
 
 
+def draw_confidence_colorbar(c, x0, y_bottom, y_top, score_hi):
+    """
+    Vertical color bar, to the side of the plot -- replaces a horizontal
+    row of swatches above it, which got hard to read once the row grew to
+    4 items plus adjacent legends. Shows the same 4 confidence quartile
+    colors confidence_color uses, stacked bottom (background, P_A~1) to
+    top (very confident, P_A around 0.1 or less), each with its P_A range
+    labeled alongside it. Shared by plot_gene_track and
+    plot_gene_shadow_pileup so both figures' confidence-colored bands/
+    dots mean the same thing at a glance.
+    """
+    from pyx import style, text as pyx_text, path
+
+    bar_w = 0.35
+    quartile_labels = [
+        "background (P_A 0.56-1)",
+        "weak call (P_A 0.32-0.56)",
+        "moderate call (P_A 0.18-0.32)",
+        "very confident call (P_A around 0.1 or less)",
+    ]
+    n = len(quartile_labels)
+    seg_h = (y_top - y_bottom) / n
+    for i, lab in enumerate(quartile_labels):
+        sc = (i + 0.5) * (score_hi / n)
+        y = y_bottom + i * seg_h
+        c.fill(path.rect(x0, y, bar_w, seg_h), [confidence_color(sc, score_hi)])
+        c.text(x0 + bar_w + 0.15, y + seg_h / 2.,
+              tex_escape(lab), [pyx_text.valign.middle, pyx_text.size.tiny])
+    c.stroke(path.rect(x0, y_bottom, bar_w, y_top - y_bottom), [style.linewidth.thin])
+
+
 def read_site_scores(row):
     """
     Per-scored-site RAW confidence_score for one read (a row from
@@ -393,6 +474,14 @@ def draw_gene_model_strip(c, gene, lo, hi, his_in_range, panel_w, model_h):
     minus-strand genes). Returns (g_model, col_his) -- g_model so callers
     link their own panels' x-axis to it (graph.axis.linkedaxis), col_his
     so callers can draw the same His-codon color in their own panels.
+
+    lo/hi are the PANEL's axis bounds -- callers now widen these past the
+    gene's own gene_start/gene_end to fit the flank_5p/flank_3p region
+    runHMMPerGene.py's flank fix scores (see plot_gene_track/
+    plot_gene_shadow_pileup), so the "5'"/"3'" labels below are placed at
+    gene["gene_start"]/["gene_end"] specifically (the TRUE gene boundary),
+    not lo/hi -- otherwise they'd drift out to the flank edge instead of
+    marking the real start/stop codon.
     """
     from pyx import graph, color, style, text as pyx_text, path
 
@@ -414,10 +503,11 @@ def draw_gene_model_strip(c, gene, lo, hi, his_in_range, panel_w, model_h):
     for hg in his_in_range:
         g_model.plot(graph.data.function(f"x(y)={hg}", min=0, max=1),
                     [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
+    gene_lo, gene_hi = gene["gene_start"], gene["gene_end"]
     if gene["strand"] == "+":
-        five_x, five_ha, three_x, three_ha = lo, pyx_text.halign.left, hi, pyx_text.halign.right
+        five_x, five_ha, three_x, three_ha = gene_lo, pyx_text.halign.left, gene_hi, pyx_text.halign.right
     else:
-        five_x, five_ha, three_x, three_ha = hi, pyx_text.halign.right, lo, pyx_text.halign.left
+        five_x, five_ha, three_x, three_ha = gene_hi, pyx_text.halign.right, gene_lo, pyx_text.halign.left
     fx, fy = g_model.pos(five_x, 0.5)
     tx, ty = g_model.pos(three_x, 0.5)
     c.text(fx, fy, "5'", [five_ha, pyx_text.valign.middle, pyx_text.size.scriptsize])
@@ -505,7 +595,7 @@ def pack_rows(spans):
 
 def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_depth,
                             gene_df, pdf_path, his_gpos=None, shadow_cutoff=SHADOW_CUTOFF,
-                            min_run_nt=MIN_RUN_NT):
+                            min_run_nt=MIN_RUN_NT, flank_5p=0, flank_3p=0):
     """
     A second per-gene figure, complementary to plot_gene_track's
     individual-reads panels (which only show the first NUM_READS reads,
@@ -539,13 +629,32 @@ def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, 
     RIBO_SHORT_LENGTHS (21/22nt) footprints, dark grey for
     RIBO_LONG_LENGTHS (28/29nt) -- so the two figures can be read side
     by side.
+
+    flank_5p/flank_3p (typically a gene's own compute_flank_caps entry,
+    same convention as runHMMPerGene.py) widen the panel's own axis range
+    past gene["gene_start"]/["gene_end"] -- shadow_calls.parquet's
+    shadow_gpos can now include real positions out there (the HMM
+    scoring pipeline pads the CDS the same way instead of relying on
+    GTF-annotated UTR features, which this GTF barely has), and without
+    this the flank-region calls/coverage ribo_depth_*/shadow_depth
+    already carry (see main()'s padded ribo_coverage_track fetch and
+    shadow_coverage_track's own flank_5p/flank_3p) would just fall
+    outside this panel's plotted range and never be drawn.
     """
     from pyx import canvas, graph, color, style, text as pyx_text, path
 
     col_ribo_short = color.grey(0.75)
     col_ribo_long  = color.grey(0.3)
 
-    lo, hi = gene["gene_start"], gene["gene_end"]
+    # widen past the true gene span by the flank on the appropriate
+    # genomic side (strand-aware, same mapping as get_gene_df/
+    # _padded_cds_segments) -- draw_gene_model_strip still uses
+    # gene["gene_start"]/["gene_end"] directly for the 5'/3' labels, so
+    # widening lo/hi here doesn't move those.
+    if gene["strand"] == "+":
+        lo, hi = gene["gene_start"] - flank_5p, gene["gene_end"] + flank_3p
+    else:
+        lo, hi = gene["gene_start"] - flank_3p, gene["gene_end"] + flank_5p
     xs = list(range(lo, hi))
     ribo_short_ys = [ribo_depth_short.get(x, 0) for x in xs]
     ribo_long_ys  = [ribo_depth_long.get(x, 0) for x in xs]
@@ -663,19 +772,8 @@ def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, 
           f"len$>${min_run_nt}nt, {len(read_ids)} reads with qualifying calls, "
           f"{n_rows} pileup rows{omitted_note}",
           [pyx_text.halign.center, pyx_text.size.scriptsize])
-    quartile_labels = [
-        "background (P_A 0.56-1)",
-        "weak call (P_A 0.32-0.56)",
-        "moderate call (P_A 0.18-0.32)",
-        "very confident call (P_A around 0.1 or less)",
-    ]
-    leg_y = top_ypos - 0.3
-    for i, lab in enumerate(quartile_labels):
-        sc = (i + 0.5) * (score_hi / N_CONF_BINS)
-        x0 = 0.2 + i * 3.65
-        c.fill(path.rect(x0, leg_y - 0.08, 0.16, 0.16), [confidence_color(sc, score_hi)])
-        c.text(x0 + 0.25, leg_y, tex_escape(lab), [pyx_text.valign.middle, pyx_text.size.tiny])
-    ribo_leg_y = leg_y - 0.3
+    draw_confidence_colorbar(c, panel_w + 2.5, pileup_ypos, top_ypos, score_hi)
+    ribo_leg_y = top_ypos - 0.3
     c.stroke(path.line(0.2, ribo_leg_y, 0.85, ribo_leg_y), [col_ribo_short, style.linewidth.Thick])
     c.text(1.05, ribo_leg_y, f"ribo-seq {RIBO_SHORT_LENGTHS[0]}/{RIBO_SHORT_LENGTHS[1]}nt",
           [pyx_text.valign.middle, pyx_text.size.tiny])
@@ -689,7 +787,7 @@ def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, 
 
 def plot_gene_track(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_depth, gene_df,
                     pdf_path, his_gpos=None, shadow_cutoff=SHADOW_CUTOFF, min_run_nt=MIN_RUN_NT,
-                    num_reads=NUM_READS):
+                    num_reads=NUM_READS, flank_5p=0, flank_3p=0):
     """
     Combined per-gene figure, PyX/PDF (see runHMMPerGene.py's
     plot_pb_by_tx_pyx for the house style this follows: canvas + stacked
@@ -723,6 +821,12 @@ def plot_gene_track(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_d
     polysomeShadowHMMQC.load_his_codon_gpos) -- drawn as thin vertical
     lines through the depth panels and the gene model, same color as
     runHMMPerGene.py's own His-codon marker (col_his = cmyk(0,1,1,0)).
+
+    flank_5p/flank_3p (typically a gene's own compute_flank_caps entry,
+    same convention as runHMMPerGene.py) widen the panel's own axis range
+    past gene["gene_start"]/["gene_end"] -- see plot_gene_shadow_pileup's
+    docstring for why (shadow_calls.parquet can now have real positions
+    out there, and without this they'd fall outside the plotted range).
     """
     from pyx import canvas, graph, color, style, text as pyx_text, path
 
@@ -730,7 +834,10 @@ def plot_gene_track(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_d
     col_ribo_long  = color.grey(0.3)
     col_shadow = color.cmyk(0, 0.5, 1, 0)
 
-    lo, hi = gene["gene_start"], gene["gene_end"]
+    if gene["strand"] == "+":
+        lo, hi = gene["gene_start"] - flank_5p, gene["gene_end"] + flank_3p
+    else:
+        lo, hi = gene["gene_start"] - flank_3p, gene["gene_end"] + flank_5p
     xs = list(range(lo, hi))
     ribo_short_ys = [ribo_depth_short.get(x, 0) for x in xs]
     ribo_long_ys  = [ribo_depth_long.get(x, 0) for x in xs]
@@ -848,31 +955,21 @@ def plot_gene_track(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_d
           f"len$>${min_run_nt}nt, {n_reads} reads shown",
           [pyx_text.halign.center, pyx_text.size.scriptsize])
 
-    # confidence-score legend for the footprint-call run blocks -- one
-    # swatch per quartile bin (see confidence_bin), labeled with the
-    # P_A range each bin covers
+    # confidence-score legend for the footprint-call run blocks -- a
+    # vertical color bar to the side (see draw_confidence_colorbar),
+    # spanning from the reads section up to the title, rather than a
+    # horizontal swatch row competing for space above the plot
     if n_reads:
-        leg_y = top_ypos - 0.05
-        quartile_labels = [
-            "background (P_A 0.56-1)",
-            "weak call (P_A 0.32-0.56)",
-            "moderate call (P_A 0.18-0.32)",
-            "very confident call (P_A around 0.1 or less)",
-        ]
-        for i, lab in enumerate(quartile_labels):
-            sc = (i + 0.5) * (score_hi / N_CONF_BINS)
-            x0 = 0.2 + i * 3.65
-            c.fill(path.rect(x0, leg_y - 0.08, 0.16, 0.16), [confidence_color(sc, score_hi)])
-            c.text(x0 + 0.25, leg_y, tex_escape(lab), [pyx_text.valign.middle, pyx_text.size.tiny])
-        # second row: the grey dotted reference line drawn in the read
-        # panels (only when the axis actually stretches past score_hi)
-        thresh_y = leg_y - 0.3
+        draw_confidence_colorbar(c, panel_w + 2.5, reads_base_ypos, top_ypos, score_hi)
+        # the grey dotted reference line drawn in the read panels (only
+        # when the axis actually stretches past score_hi)
+        thresh_y = top_ypos - 0.05
         c.stroke(path.line(0.2, thresh_y, 0.85, thresh_y),
                 [color.grey(0.6), style.linewidth.thin, style.linestyle.dotted])
         c.text(1.05, thresh_y, tex_escape("P_A=0.1 threshold (shown when the axis stretches past it)"),
               [pyx_text.valign.middle, pyx_text.size.tiny])
 
-    ribo_leg_y = top_ypos - 0.65
+    ribo_leg_y = top_ypos - 0.35
     c.stroke(path.line(0.2, ribo_leg_y, 0.85, ribo_leg_y), [col_ribo_short, style.linewidth.Thick])
     c.text(1.05, ribo_leg_y, f"ribo-seq {RIBO_SHORT_LENGTHS[0]}/{RIBO_SHORT_LENGTHS[1]}nt",
           [pyx_text.valign.middle, pyx_text.size.tiny])
@@ -969,6 +1066,7 @@ def main(args):
     gene_names_arg = args[6] if len(args) > 6 and args[6] else None
     shadow_cutoff = float(args[7]) if len(args) > 7 else SHADOW_CUTOFF
     min_run_nt    = int(args[8])   if len(args) > 8 else MIN_RUN_NT
+    flank_nt      = int(args[9])   if len(args) > 9 else FLANK_NT
 
     out_dir = os.path.dirname(outPrefix)
     if out_dir:
@@ -981,6 +1079,7 @@ def main(args):
     print(f"{len(gene_list)} genes in {shadowPath}.", file=sys.stderr)
 
     genes = parse_gtf(gtfPath)
+    flank_caps = compute_flank_caps(genes, flank_nt)
     missing = [g for g in gene_list if g not in genes]
     if missing:
         print(f"  {len(missing)} genes not found in GTF, skipped: "
@@ -1036,18 +1135,32 @@ def main(args):
           f"into {track_dir}/ ...", file=sys.stderr)
     for gname in track_genes:
         gene = genes[gname]
-        ribo_depth_short = ribo_coverage_track(bam_paths, gene, target_lengths=RIBO_SHORT_LENGTHS)
-        ribo_depth_long  = ribo_coverage_track(bam_paths, gene, target_lengths=RIBO_LONG_LENGTHS)
+        flank_5p, flank_3p = flank_caps[gname]
+        # ribo_coverage_track fetches reads within gene["gene_start"]/["gene_end"]
+        # only -- widen that fetch window the same way shadowMetagene.py does,
+        # else it'd never even look at the flank region the plots below now show.
+        padded_gene = dict(gene)
+        if gene["strand"] == "+":
+            padded_gene["gene_start"] = max(0, gene["gene_start"] - flank_5p)
+            padded_gene["gene_end"]   = gene["gene_end"] + flank_3p
+        else:
+            padded_gene["gene_start"] = max(0, gene["gene_start"] - flank_3p)
+            padded_gene["gene_end"]   = gene["gene_end"] + flank_5p
+        ribo_depth_short = ribo_coverage_track(bam_paths, padded_gene, target_lengths=RIBO_SHORT_LENGTHS)
+        ribo_depth_long  = ribo_coverage_track(bam_paths, padded_gene, target_lengths=RIBO_LONG_LENGTHS)
         gene_df      = shadow_df[shadow_df["shadow_gene"] == gname]
-        shadow_depth = shadow_coverage_track(gene_df, gname, gene, shadow_cutoff, min_run_nt)
+        shadow_depth = shadow_coverage_track(gene_df, gname, gene, shadow_cutoff, min_run_nt,
+                                             flank_5p=flank_5p, flank_3p=flank_3p)
         plot_gene_track(gname, gene, ribo_depth_short, ribo_depth_long, shadow_depth, gene_df,
                         os.path.join(track_dir, f"{gname}.pdf"),
                         his_gpos=his_gpos_by_gene.get(gname),
-                        shadow_cutoff=shadow_cutoff, min_run_nt=min_run_nt)
+                        shadow_cutoff=shadow_cutoff, min_run_nt=min_run_nt,
+                        flank_5p=flank_5p, flank_3p=flank_3p)
         plot_gene_shadow_pileup(gname, gene, ribo_depth_short, ribo_depth_long, shadow_depth, gene_df,
                                 os.path.join(track_dir, f"{gname}.pileup.pdf"),
                                 his_gpos=his_gpos_by_gene.get(gname),
-                                shadow_cutoff=shadow_cutoff, min_run_nt=min_run_nt)
+                                shadow_cutoff=shadow_cutoff, min_run_nt=min_run_nt,
+                                flank_5p=flank_5p, flank_3p=flank_3p)
 
 
 if __name__ == "__main__":

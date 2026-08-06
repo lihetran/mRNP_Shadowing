@@ -411,7 +411,12 @@ def main(args):
     for gname in gene_names:
         gene = genes[gname]
         gdf = shadow_df[shadow_df["shadow_gene"] == gname]
-        shadow_gpos_depth = shadow_coverage_track(gdf, gname, gene, shadow_cutoff, min_run_nt)
+        # shadow_coverage_track's own default clips to gene["exons"] only --
+        # widen it the same way ribo_coverage_track's fetch window is widened
+        # below, else the real flank-region shadow calls the HMM fix now
+        # scores would get silently clipped away right back to a wall here.
+        shadow_gpos_depth = shadow_coverage_track(gdf, gname, gene, shadow_cutoff, min_run_nt,
+                                                  flank_5p=window_nt, flank_3p=window_nt)
         shadow_tx_depth[gname] = gene_depth_to_tx(shadow_gpos_depth, gene, flank_nt=window_nt)
         # ribo_coverage_track fetches reads within gene["gene_start"]/["gene_end"]
         # only -- those bounds are themselves ~3nt past the CDS in this GTF (same
