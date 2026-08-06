@@ -64,6 +64,21 @@ stop codon is tx_pos - cds_length(gene) (0 = the first nt past the last
 CDS base) -- both imported/derived read-only from runHMMPerGene.py's
 parse_gtf/cds_length, no reimplementation.
 
+Two MORE figures ("outPrefix.his_metagene_bypos.pdf",
+"outPrefix.startstop_metagene_bypos.pdf") give the same two anchors a
+"by position" alternative to the shadow-call signal above: raw per-site
+P_B (gene_bypos_scores), no P_B>=shadow_cutoff/run>=min_run_nt
+thresholding at all -- every scored ("A") site contributes, not just
+ones already part of a qualifying run. Unlike the run-depth metagenes,
+this is NOT per-gene-fraction-normalized -- P_B is already a bounded
+[0,1] probability, directly comparable across genes as-is, so pooling
+raw sites across every gene/read (build_his_bypos_metagene/
+build_startstop_bypos_metagene) is the more direct measurement, not an
+approximation that needs correcting for gene-to-gene expression/call-
+volume differences the way a raw depth COUNT would. No ribo-seq overlay
+on these -- ribo-seq depth has no run/no-run distinction to begin with,
+so there's nothing for a "by position" version to contrast against.
+
 Run:
   python3 shadowMetagene.py shadowCallsParquet riboBamList.txt condition gtfFile hisPicklePath outPrefix [window_nt] [shadow_cutoff] [min_run_nt]
 where shadowCallsParquet is ONE library's shadow_calls.parquet,
@@ -190,6 +205,29 @@ def gene_depth_to_tx(depth_by_gpos, gene, flank_nt=WINDOW_NT):
     return counts
 
 
+def gene_bypos_scores(gene_df, gene, flank_nt=WINDOW_NT):
+    """
+    [(tx_pos, P_B), ...] for EVERY scored site of EVERY read of one gene
+    -- the "by position" counterpart to shadow_coverage_track's
+    run-thresholded depth (see build_his_bypos_metagene). No P_B>=cutoff
+    or run-length filtering at all here: this is the raw per-site signal
+    write_shadow_calls_to_df produced before any downstream consumer
+    thresholds it, same "un-thresholded at the source" design
+    write_shadow_calls_to_df's own docstring describes. Converts each
+    site's shadow_gpos via gene_tx_to_gpos_map's reverse, same
+    flank-padded coordinate frame as the run-depth signal, so both are
+    directly comparable position-for-position.
+    """
+    gpos_to_tx = {gpos: tx for tx, gpos in gene_tx_to_gpos_map(gene, flank_nt).items()}
+    out = []
+    for row in gene_df.itertuples(index=False):
+        for gpos, pb in zip(row.shadow_gpos, row.shadow_P_B):
+            tx = gpos_to_tx.get(int(gpos))
+            if tx is not None:
+                out.append((tx, float(pb)))
+    return out
+
+
 def build_his_density_metagene(tx_depth_by_gene, his_tx_by_gene, window_nt=WINDOW_NT):
     """
     {relpos: [sum_frac, n_genes]} -- pools each gene's own depth-fraction
@@ -242,6 +280,55 @@ def build_startstop_density_metagene(tx_depth_by_gene, gene_cds_len, window_nt=W
             if -window_nt <= stop_rel <= window_nt:
                 entry = stop_acc[stop_rel]
                 entry[0] += frac
+                entry[1] += 1
+    return start_acc, stop_acc
+
+
+def build_his_bypos_metagene(sites_by_gene, his_tx_by_gene, window_nt=WINDOW_NT):
+    """
+    {relpos: [sum_P_B, n_sites]} -- the "by position" counterpart to
+    build_his_density_metagene: pools EVERY scored site's raw P_B
+    directly (gene_bypos_scores, no run thresholding) at signed
+    transcript-nt distance to the nearest His codon. NOT per-gene-
+    fraction-normalized like the run-depth metagenes -- P_B is already a
+    bounded [0,1] probability, directly comparable across genes as-is,
+    unlike a raw depth count (which scales with a gene's own expression/
+    call volume and would need that normalization to avoid a few
+    highly-called genes dominating the average).
+    """
+    acc = collections.defaultdict(lambda: [0.0, 0])
+    for gname, sites in sites_by_gene.items():
+        his_tx = his_tx_by_gene.get(gname)
+        if not his_tx or not sites:
+            continue
+        for tx, pb in sites:
+            rel = nearest_his_distance(tx, his_tx)
+            if -window_nt <= rel <= window_nt:
+                entry = acc[rel]
+                entry[0] += pb
+                entry[1] += 1
+    return acc
+
+
+def build_startstop_bypos_metagene(sites_by_gene, gene_cds_len, window_nt=WINDOW_NT):
+    """By-position counterpart to build_startstop_density_metagene -- see
+    build_his_bypos_metagene for why this pools raw P_B directly instead
+    of per-gene-normalized fractions."""
+    start_acc = collections.defaultdict(lambda: [0.0, 0])
+    stop_acc  = collections.defaultdict(lambda: [0.0, 0])
+    for gname, sites in sites_by_gene.items():
+        cds_len = gene_cds_len.get(gname)
+        if cds_len is None or not sites:
+            continue
+        for tx, pb in sites:
+            if -window_nt <= tx <= window_nt:
+                entry = start_acc[tx]
+                entry[0] += pb
+                entry[1] += 1
+            stop_rel = tx - cds_len
+            if -window_nt <= stop_rel <= window_nt:
+                entry = stop_acc[stop_rel]
+                entry[0] += pb
                 entry[1] += 1
     return start_acc, stop_acc
 
@@ -376,6 +463,118 @@ def plot_startstop_metagene(start_shadow_acc, stop_shadow_acc, start_ribo_acc, s
     print(f"Wrote {pdf_path}", file=sys.stderr)
 
 
+def _plot_bypos_anchor(c, graph, style, color, pyx_text, path, xpos, ypos,
+                       panel_w, sig_h, dep_h, gap, xs, means, depths, depth_max,
+                       x_title, anchor_label):
+    """
+    One anchor's raw by-position panels: n_sites depth (bottom), mean
+    P_B (top) -- the "by position" counterpart to _plot_anchor_panels'
+    per-gene-fraction run-depth signal. A dotted P_B=0.5 reference (this
+    codebase's own shadow-call P_B cutoff convention) marks where the
+    run-depth figures' threshold sits, so the two are visually
+    comparable despite plotting different quantities.
+    """
+    col_sig = color.cmyk(1, 0.3, 0, 0.1)
+    g_dep = graph.graphxy(
+        width=panel_w, height=dep_h, xpos=xpos, ypos=ypos,
+        x=graph.axis.linear(min=xs[0], max=xs[-1], title=x_title),
+        y=graph.axis.linear(min=0, max=max(1, depth_max), title="n sites"))
+    c.insert(g_dep)
+    g_dep.plot(graph.data.points(list(zip(xs, depths)), x=1, y=2),
+              [graph.style.line([color.grey(0.4), style.linewidth.Thick])])
+    g_dep.plot(graph.data.function("x(y)=0", min=0, max=max(1, depth_max)),
+              [graph.style.line([color.grey(0.6), style.linewidth.thin, style.linestyle.dashed])])
+
+    sig_ypos = ypos + dep_h + gap
+    pts = [(x, m) for x, m in zip(xs, means) if m is not None]
+    sig_max = max((m for _x, m in pts), default=1.0) * 1.1 if pts else 1.0
+    g_sig = graph.graphxy(
+        width=panel_w, height=sig_h, xpos=xpos, ypos=sig_ypos,
+        x=graph.axis.linkedaxis(g_dep.axes["x"], painter=graph.axis.painter.linked()),
+        y=graph.axis.linear(min=0, max=max(sig_max, 0.55), title="mean P$_B$"))
+    c.insert(g_sig)
+    if pts:
+        g_sig.plot(graph.data.points(pts, x=1, y=2),
+                  [graph.style.line([col_sig, style.linewidth.Thick])])
+    g_sig.plot(graph.data.function("x(y)=0", min=0, max=max(sig_max, 0.55)),
+              [graph.style.line([color.grey(0.6), style.linewidth.thin, style.linestyle.dashed])])
+    g_sig.plot(graph.data.function("y(x)=0.5", min=xs[0], max=xs[-1]),
+              [graph.style.line([color.grey(0.6), style.linewidth.thin, style.linestyle.dotted])])
+
+    top_ypos = sig_ypos + sig_h
+    c.text(xpos + panel_w / 2., top_ypos + 0.3,
+          anchor_label, [pyx_text.halign.center, pyx_text.size.normalsize])
+    return top_ypos
+
+
+def plot_his_bypos_metagene(acc, pdf_path, window_nt=WINDOW_NT, n_genes=0, n_sites=0):
+    """
+    One figure: mean raw per-site P_B (no run thresholding) vs. signed
+    transcript-nt distance to the nearest His codon, plus its n_sites
+    depth-of-support panel. The "by position" counterpart to
+    plot_his_metagene -- see build_his_bypos_metagene.
+    """
+    from pyx import canvas, graph, color, style, text as pyx_text, path
+
+    xs, means = _means(acc, window_nt)
+    depths = [acc.get(x, (0.0, 0))[1] for x in xs]
+
+    c = canvas.canvas()
+    panel_w, sig_h, dep_h, gap = 12, 3.5, 2.0, 0.8
+    top_ypos = _plot_bypos_anchor(
+        c, graph, style, color, pyx_text, path, 0, 0, panel_w, sig_h, dep_h, gap,
+        xs, means, depths, max(depths, default=1),
+        "nt from nearest His codon (transcript-relative)",
+        "By-position metagene: raw shadow-call P$_B$ around His codons")
+
+    c.text(panel_w / 2., top_ypos + 0.7,
+          f"{n_genes} gene(s), {n_sites} scored site(s) within $\\pm${window_nt}nt of a His "
+          f"codon (every scored site, no P$_B$ cutoff or run-length filtering)",
+          [pyx_text.halign.center, pyx_text.size.scriptsize])
+
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote {pdf_path}", file=sys.stderr)
+
+
+def plot_startstop_bypos_metagene(start_acc, stop_acc, pdf_path, window_nt=WINDOW_NT,
+                                  n_genes=0, n_sites_start=0, n_sites_stop=0):
+    """
+    One figure, two side-by-side panel pairs: mean raw per-site P_B (no
+    run thresholding) vs. transcript-nt distance from the start codon
+    (left) and from the stop codon (right). The "by position" counterpart
+    to plot_startstop_metagene -- see build_startstop_bypos_metagene.
+    """
+    from pyx import canvas, graph, color, style, text as pyx_text, path
+
+    start_xs, start_means = _means(start_acc, window_nt)
+    stop_xs, stop_means   = _means(stop_acc, window_nt)
+    start_depths = [start_acc.get(x, (0.0, 0))[1] for x in start_xs]
+    stop_depths  = [stop_acc.get(x, (0.0, 0))[1] for x in stop_xs]
+
+    c = canvas.canvas()
+    panel_w, sig_h, dep_h, gap, panel_gap = 8, 3.5, 2.0, 0.8, 1.5
+
+    top1 = _plot_bypos_anchor(
+        c, graph, style, color, pyx_text, path, 0, 0, panel_w, sig_h, dep_h, gap,
+        start_xs, start_means, start_depths, max(start_depths, default=1),
+        "nt from start codon", "Start codon")
+    _top2 = _plot_bypos_anchor(
+        c, graph, style, color, pyx_text, path, panel_w + panel_gap, 0, panel_w, sig_h, dep_h, gap,
+        stop_xs, stop_means, stop_depths, max(stop_depths, default=1),
+        "nt from stop codon", "Stop codon")
+
+    c.text((2 * panel_w + panel_gap) / 2., top1 + 0.9,
+          "By-position metagene: raw shadow-call P$_B$ around start/stop codons",
+          [pyx_text.halign.center, pyx_text.size.normalsize])
+    c.text((2 * panel_w + panel_gap) / 2., top1 + 0.5,
+          f"{n_genes} gene(s) -- {n_sites_start} site(s) near start, {n_sites_stop} near stop "
+          f"(every scored site, no P$_B$ cutoff or run-length filtering)",
+          [pyx_text.halign.center, pyx_text.size.scriptsize])
+
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote {pdf_path}", file=sys.stderr)
+
+
 def main(args):
     shadowPath, riboBamListPath, condition, gtfPath, hisPicklePath, outPrefix = args[:6]
     window_nt     = int(args[6])   if len(args) > 6 else WINDOW_NT
@@ -408,6 +607,7 @@ def main(args):
           f"({len(bam_paths)} ribo-seq BAM(s), condition={condition}) ...", file=sys.stderr)
     shadow_tx_depth = {}
     ribo_tx_depth = {}
+    sites_by_gene = {}
     for gname in gene_names:
         gene = genes[gname]
         gdf = shadow_df[shadow_df["shadow_gene"] == gname]
@@ -428,6 +628,9 @@ def main(args):
         padded_gene["gene_end"]   = gene["gene_end"] + window_nt
         ribo_gpos_depth = ribo_coverage_track(bam_paths, padded_gene, target_lengths=TARGET_LENGTHS)
         ribo_tx_depth[gname] = gene_depth_to_tx(ribo_gpos_depth, gene, flank_nt=window_nt)
+        # raw per-site P_B, no run thresholding -- the "by position" figures'
+        # own data source, independent of shadow_cutoff/min_run_nt entirely
+        sites_by_gene[gname] = gene_bypos_scores(gdf, gene, flank_nt=window_nt)
 
     print(f"Building His-codon metagene (window=+/-{window_nt}nt) ...", file=sys.stderr)
     his_shadow_acc = build_his_density_metagene(shadow_tx_depth, his_tx_by_gene, window_nt)
@@ -447,6 +650,24 @@ def main(args):
     plot_startstop_metagene(start_shadow_acc, stop_shadow_acc, start_ribo_acc, stop_ribo_acc,
                             f"{outPrefix}.startstop_metagene.pdf", window_nt,
                             n_genes_shadow=n_genes_shadow, n_genes_ribo=n_genes_ribo)
+
+    print(f"Building by-position (raw P_B, no run thresholding) metagenes "
+          f"(window=+/-{window_nt}nt) ...", file=sys.stderr)
+    his_bypos_acc = build_his_bypos_metagene(sites_by_gene, his_tx_by_gene, window_nt)
+    n_sites_his_bypos = sum(n for _s, n in his_bypos_acc.values())
+    n_genes_his_bypos = sum(1 for g in gene_names if his_tx_by_gene.get(g) and sites_by_gene.get(g))
+    plot_his_bypos_metagene(his_bypos_acc, f"{outPrefix}.his_metagene_bypos.pdf", window_nt,
+                            n_genes=n_genes_his_bypos, n_sites=n_sites_his_bypos)
+
+    start_bypos_acc, stop_bypos_acc = build_startstop_bypos_metagene(
+        sites_by_gene, gene_cds_len, window_nt)
+    n_sites_start_bypos = sum(n for _s, n in start_bypos_acc.values())
+    n_sites_stop_bypos  = sum(n for _s, n in stop_bypos_acc.values())
+    n_genes_bypos = sum(1 for g in gene_names if sites_by_gene.get(g))
+    plot_startstop_bypos_metagene(start_bypos_acc, stop_bypos_acc,
+                                  f"{outPrefix}.startstop_metagene_bypos.pdf", window_nt,
+                                  n_genes=n_genes_bypos,
+                                  n_sites_start=n_sites_start_bypos, n_sites_stop=n_sites_stop_bypos)
 
 
 if __name__ == "__main__":

@@ -516,7 +516,7 @@ def draw_gene_model_strip(c, gene, lo, hi, his_in_range, panel_w, model_h):
 
 
 def gene_shadow_pileup_data(gene_df, gene_name, gene, cutoff=SHADOW_CUTOFF,
-                            min_run_nt=MIN_RUN_NT, center_nt=10):
+                            min_run_nt=MIN_RUN_NT, center_nt=10, flank_5p=0, flank_3p=0):
     """
     Everything plot_gene_shadow_pileup needs, computed in one pass over
     gene_df so read_site_scores (an array copy + sort per read) doesn't
@@ -528,15 +528,38 @@ def gene_shadow_pileup_data(gene_df, gene_name, gene, cutoff=SHADOW_CUTOFF,
         run's own midpoint, NOT a whole-run average -- a run's ramp-up/
         ramp-down edges are lower-confidence transition zones that would
         dilute that, the same reasoning that kept read_site_scores itself
-        from averaging across a run.
-      - pos_scores: {gpos: [score, ...]} -- every qualifying run's own
-        per-site raw confidence_score at each genomic position it covers
-        (clipped to the gene's annotated exons, same intron handling as
-        shadow_coverage_track), for coloring the depth panel by average
-        confidence at that position rather than a single flat color.
+        from averaging across a run. A run whose own center_nt window
+        happens to have no scored site is left out of runs_by_read (no
+        center score to give it), but -- see pos_scores below -- that
+        exclusion is scoped to THIS dict only.
+      - pos_scores: {gpos: [score, ...]} -- for coloring the depth panel
+        by confidence at each position rather than a single flat color.
+        NOT a per-site average -- a scored ("A") site is only ~1/4 of any
+        given nt, but shadow_coverage_track's depth fills EVERY nt across
+        a run's span (a protected footprint covers contiguous sequence,
+        not just its A's), so a per-site-only average leaves ~3/4 of
+        real depth positions with no entry at all -- defaulting those to
+        score 0 ("background") would be actively wrong, not just sparse:
+        a C/G/T in the middle of a well-established run isn't
+        "confidently unprotected," it just has no site of its own to
+        score. Instead, each qualifying run broadcasts ONE representative
+        score across its ENTIRE span (every nt it covers, not just its
+        A's) -- the same center_nt-window average used for that run's
+        own runs_by_read entry above, so the depth panel's color and the
+        pileup panel's per-run segment color agree; falling back to that
+        run's own full-length average (its own A-sites only, still) if
+        the center_nt window specifically has none, so a run that missed
+        runs_by_read for that reason still contributes its own real
+        confidence to the depth panel rather than nothing. Positions are
+        clipped to the gene's annotated exons, unioned with a
+        flank_5p/flank_3p-padded CDS region if given (see
+        _padded_cds_segments) -- same convention as shadow_coverage_track,
+        so this dict's positions cover the same range as that function's
+        depth values instead of silently defaulting past the true exons.
     Reads with zero qualifying runs contribute to neither dict.
     """
     exons = gene.get("exons", [])
+    padded_cds = _padded_cds_segments(gene, flank_5p, flank_3p) if (flank_5p or flank_3p) else []
     runs = [r for r in extract_shadow_runs(gene_df, cutoff)
            if r["gene"] == gene_name and r["genomic_nt"] >= min_run_nt]
     runs_by_read_id = collections.defaultdict(list)
@@ -556,12 +579,18 @@ def gene_shadow_pileup_data(gene_df, gene_name, gene, cutoff=SHADOW_CUTOFF,
             center = (r["gpos_lo"] + r["gpos_hi"]) // 2
             window = [sites[g] for g in range(center - half, center + half)
                      if g in sites]
-            if not window:
-                continue
-            scored_runs.append({**r, "score": sum(window) / len(window)})
-            for gpos in range(r["gpos_lo"], r["gpos_hi"] + 1):
-                if gpos in sites and any(s <= gpos < e for s, e in exons):
-                    pos_scores[gpos].append(sites[gpos])
+            if window:
+                run_score = sum(window) / len(window)
+                scored_runs.append({**r, "score": run_score})
+            else:
+                all_sites = [sites[g] for g in range(r["gpos_lo"], r["gpos_hi"] + 1)
+                            if g in sites]
+                run_score = sum(all_sites) / len(all_sites) if all_sites else None
+            if run_score is not None:
+                for gpos in range(r["gpos_lo"], r["gpos_hi"] + 1):
+                    if (any(s <= gpos < e for s, e in exons) or
+                            any(s <= gpos < e for s, e in padded_cds)):
+                        pos_scores[gpos].append(run_score)
         if scored_runs:
             runs_by_read[row.read_id] = scored_runs
     return runs_by_read, pos_scores
@@ -662,7 +691,8 @@ def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, 
     his_in_range = sorted(g for g in (his_gpos or ()) if lo <= g < hi)
 
     runs_by_read, pos_scores = gene_shadow_pileup_data(
-        gene_df, gene_name, gene, shadow_cutoff, min_run_nt)
+        gene_df, gene_name, gene, shadow_cutoff, min_run_nt,
+        flank_5p=flank_5p, flank_3p=flank_3p)
 
     read_ids = list(runs_by_read)
     spans = [(min(r["gpos_lo"] for r in runs_by_read[rid]),
