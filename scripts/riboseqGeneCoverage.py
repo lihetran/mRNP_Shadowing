@@ -475,6 +475,22 @@ def draw_gene_model_strip(c, gene, lo, hi, his_in_range, panel_w, model_h):
     link their own panels' x-axis to it (graph.axis.linkedaxis), col_his
     so callers can draw the same His-codon color in their own panels.
 
+    The panel's x-axis always reads 5'->3' left-to-right, regardless of
+    strand -- for a "-" strand gene that means the axis itself is
+    REVERSED (min=hi, max=lo; PyX handles min>max natively -- ticks and
+    every plotted point mirror correctly, confirmed directly). Every
+    other panel in plot_gene_track/plot_gene_shadow_pileup links its own
+    x-axis to this one (graph.axis.linkedaxis), so reversing it here is
+    the ONLY place that needs to change -- data is still built/plotted at
+    genuine ascending genomic coordinates throughout, PyX's axis mapping
+    does the mirroring. The one thing that does NOT follow for free: any
+    place that manually turns two independent .pos() calls into a
+    path.rect() (this function's own UTR/CDS fill below, and
+    plot_gene_shadow_pileup's run-segment rects) -- .pos() of the
+    genomically-later coordinate now returns the SMALLER canvas x on a
+    reversed axis, so the rect's x0/width has to come from min/max of the
+    two canvas x's, not from which genomic coordinate was "first".
+
     lo/hi are the PANEL's axis bounds -- callers now widen these past the
     gene's own gene_start/gene_end to fit the flank_5p/flank_3p region
     runHMMPerGene.py's flank fix scores (see plot_gene_track/
@@ -489,29 +505,33 @@ def draw_gene_model_strip(c, gene, lo, hi, his_in_range, panel_w, model_h):
     col_cds = color.cmyk(0, 0, 0, 0.75)
     col_utr = color.cmyk(0, 0, 0, 0.25)
 
+    axis_lo, axis_hi = (hi, lo) if gene["strand"] == "-" else (lo, hi)
     g_model = graph.graphxy(
         width=panel_w, height=model_h, xpos=0, ypos=0,
-        x=graph.axis.linear(min=lo, max=hi, title=f"genomic position ({tex_escape(gene['chrom'])})"),
+        x=graph.axis.linear(min=axis_lo, max=axis_hi,
+                           title=f"genomic position ({tex_escape(gene['chrom'])}), 5' $\\to$ 3'"),
         y=graph.axis.linear(min=0, max=1, parter=None))
     c.insert(g_model)
     for seg, col in ((gene.get("utr5", []), col_utr), (gene.get("utr3", []), col_utr),
                     (gene.get("cds", []), col_cds)):
         for s, e in seg:
-            x0, y0 = g_model.pos(max(s, lo), 0.25)
-            x1, y1 = g_model.pos(min(e, hi), 0.75)
+            xa, y0 = g_model.pos(max(s, lo), 0.25)
+            xb, y1 = g_model.pos(min(e, hi), 0.75)
+            x0, x1 = min(xa, xb), max(xa, xb)
             c.fill(path.rect(x0, y0, x1 - x0, y1 - y0), [col])
     for hg in his_in_range:
         g_model.plot(graph.data.function(f"x(y)={hg}", min=0, max=1),
                     [graph.style.line([col_his, style.linewidth.thin, style.linestyle.solid])])
     gene_lo, gene_hi = gene["gene_start"], gene["gene_end"]
-    if gene["strand"] == "+":
-        five_x, five_ha, three_x, three_ha = gene_lo, pyx_text.halign.left, gene_hi, pyx_text.halign.right
-    else:
-        five_x, five_ha, three_x, three_ha = gene_hi, pyx_text.halign.right, gene_lo, pyx_text.halign.left
+    # axis now always runs 5'->3' left-to-right, so 5' sits at whichever
+    # genomic coordinate is the gene's own start-codon end, and always
+    # renders on the visual left -- halign is fixed (left/right), not
+    # strand-dependent, unlike before this axis reversal existed.
+    five_x, three_x = (gene_lo, gene_hi) if gene["strand"] == "+" else (gene_hi, gene_lo)
     fx, fy = g_model.pos(five_x, 0.5)
     tx, ty = g_model.pos(three_x, 0.5)
-    c.text(fx, fy, "5'", [five_ha, pyx_text.valign.middle, pyx_text.size.scriptsize])
-    c.text(tx, ty, "3'", [three_ha, pyx_text.valign.middle, pyx_text.size.scriptsize])
+    c.text(fx, fy, "5'", [pyx_text.halign.left, pyx_text.valign.middle, pyx_text.size.scriptsize])
+    c.text(tx, ty, "3'", [pyx_text.halign.right, pyx_text.valign.middle, pyx_text.size.scriptsize])
     return g_model, col_his
 
 
@@ -740,8 +760,9 @@ def plot_gene_shadow_pileup(gene_name, gene, ribo_depth_short, ribo_depth_long, 
             x1, y1 = g_pileup.pos(span_hi, row + 0.5)
             c.stroke(path.line(x0, y0, x1, y1), [color.grey(0.6), style.linewidth.thin])
         for r in runs:
-            x0, y0 = g_pileup.pos(r["gpos_lo"], row + 0.15)
-            x1, y1 = g_pileup.pos(r["gpos_hi"], row + 0.85)
+            xa, y0 = g_pileup.pos(r["gpos_lo"], row + 0.15)
+            xb, y1 = g_pileup.pos(r["gpos_hi"], row + 0.85)
+            x0, x1 = min(xa, xb), max(xa, xb)
             c.fill(path.rect(x0, y0, max(x1 - x0, 0.01), y1 - y0),
                   [confidence_color(r["score"], score_hi)])
 
@@ -824,8 +845,10 @@ def plot_gene_track(gene_name, gene, ribo_depth_short, ribo_depth_long, shadow_d
     graphxy panels at manually-set ypos, graph.axis.linkedaxis to share
     one x-axis without repainting it on every panel, graph.data.function's
     "x(y)=CONST" trick for vertical reference lines, cmyk colors). All
-    panels share ONE genomic-position x-axis (IGV-style, left-to-right
-    regardless of gene strand), bottom to top:
+    panels share ONE genomic-position x-axis, always reading 5'->3'
+    left-to-right (draw_gene_model_strip reverses the axis itself for a
+    "-" strand gene; every other panel here just links to that axis, so
+    the mirroring is automatic), bottom to top:
       - gene-model strip (UTR5/CDS/UTR3 as filled rects via graphxy.pos()
         + canvas.fill(path.rect(...)), "5'"/"3'" text at the gene's own
         start/end -- not a single arrow glyph, which would sit on top of
