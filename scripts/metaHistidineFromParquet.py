@@ -44,6 +44,19 @@ def complement_base(b: str) -> str:
     return b.translate(str.maketrans("ACGTacgt", "TGCAtgca"))
 
 
+_TEX_SPECIAL = {
+    '\\': r'\textbackslash{}', '&': r'\&', '%': r'\%', '$': r'\$',
+    '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}',
+    '~': r'\textasciitilde{}', '^': r'\textasciicircum{}',
+}
+
+def tex_escape(s):
+    """Escape characters (e.g. '_') that PyX's TeX text engine treats as
+    special, so library labels (--label1/--label2, manuscript sample names
+    like '+3AT_rep1') render literally instead of erroring."""
+    return ''.join(_TEX_SPECIAL.get(ch, ch) for ch in str(s))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Parquet loading
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,6 +512,67 @@ def compute_summaries(df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 7b. Manuscript color map
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_color_map(path: str) -> dict:
+    """
+    Parse a manuscript color-map TSV with columns:
+        sample_name, rep, path, hex_color (no leading '#')
+    Returns a dict keyed by both "name_rep" (e.g. "+3AT_rep1") and bare
+    "name" (first match wins for the bare key) mapping to "#RRGGBB".
+    """
+    color_map = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            name, rep, _path, hexcol = fields[0], fields[1], fields[2], fields[3]
+            hexcol = "#" + hexcol.strip().lstrip("#")
+            color_map.setdefault(f"{name}_{rep}" if rep else name, hexcol)
+            color_map.setdefault(name, hexcol)
+    return color_map
+
+
+def lookup_color(color_map: dict, label: str):
+    """Return the hex color for label, or None if absent/no map given."""
+    if not color_map:
+        return None
+    return color_map.get(label)
+
+
+def hex_to_pyx_color(hexcol: str):
+    from pyx import color
+    hexcol = hexcol.lstrip("#")
+    r = int(hexcol[0:2], 16) / 255.0
+    g = int(hexcol[2:4], 16) / 255.0
+    b = int(hexcol[4:6], 16) / 255.0
+    return color.rgb(r, g, b)
+
+
+def resolve_color(hexcol, fallback_cmyk: tuple):
+    """hexcol (e.g. '#1F78B4') -> pyx color, or fallback_cmyk if hexcol is None."""
+    from pyx import color
+    if hexcol:
+        return hex_to_pyx_color(hexcol)
+    return color.cmyk(*fallback_cmyk)
+
+
+def grey_shades(n: int, lo: float = 0.25, hi: float = 0.7) -> list:
+    """n evenly spaced pyx.color.gray values from dark (lo) to light (hi)."""
+    from pyx import color
+    if n <= 0:
+        return []
+    if n == 1:
+        return [color.gray((lo + hi) / 2)]
+    return [color.gray(lo + (hi - lo) * i / (n - 1)) for i in range(n)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8. Pyx plotting helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -588,7 +662,7 @@ def _pyx_log2fc_graph(c, xpos, ypos, log2fc_agg, label1, label2, window,
         xpos=xpos, ypos=ypos,
         x=x_axis,
         y=graph.axis.linear(min=y_min, max=y_max,
-                            title=f"log2FC ({label2}/{label1})"),
+                            title=f"log2FC ({tex_escape(label2)}/{tex_escape(label1)})"),
     )
 
     g.plot(graph.data.function("y(x)=0", min=-window, max=window),
@@ -642,15 +716,16 @@ def _pyx_cdf_graph(c, xpos, ypos, s1, s2, label1, label2,
 
 def plot_cdf_pyx(s1: dict, s2: dict,
                   label1: str, label2: str,
-                  output_prefix: str):
+                  output_prefix: str,
+                  color1: str = None, color2: str = None):
     """
     Standalone CDF figure of per-read global A->G editing efficiency.
     One panel with both libraries overlaid and a legend.
     """
     from pyx import canvas, graph, color, style, path, text as pyx_text
 
-    col1    = color.cmyk(0, 0, 0, 1)
-    col2    = color.cmyk(1, 0.5, 0, 0)
+    col1    = resolve_color(color1, (0, 0, 0, 1))
+    col2    = resolve_color(color2, (1, 0.5, 0, 0))
     panel_w = 7
     panel_h = 5
     leg_lw  = 0.8
@@ -661,7 +736,7 @@ def plot_cdf_pyx(s1: dict, s2: dict,
     g = graph.graphxy(
         width=panel_w, height=panel_h,
         xpos=0, ypos=0,
-        x=graph.axis.linear(min=0, max=1, title="A->G edit freq per read"),
+        x=graph.axis.linear(min=0, max=1, title="A{$\\to$}G edit freq per read"),
         y=graph.axis.linear(min=0, max=1, title="Cumulative fraction"),
     )
 
@@ -692,7 +767,7 @@ def plot_cdf_pyx(s1: dict, s2: dict,
         ly = leg_y_top - j * leg_dy
         c.stroke(path.line(leg_x, ly, leg_x + leg_lw, ly),
                  [col, style.linewidth.normal, style.linestyle.solid])
-        c.text(leg_x + leg_lw + 0.15, ly, label,
+        c.text(leg_x + leg_lw + 0.15, ly, tex_escape(label),
                [pyx_text.valign.middle, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_editing_efficiency_cdf_pyx"
@@ -706,12 +781,13 @@ def plot_cdf_pyx(s1: dict, s2: dict,
 
 def plot_comparison_pyx(s1: dict, s2: dict,
                          label1: str, label2: str,
-                         output_prefix: str, window: int):
+                         output_prefix: str, window: int,
+                         color1: str = None, color2: str = None):
     """2x2 comparison figure: meta BAM1, meta BAM2, log2FC, CDF."""
     from pyx import canvas, color, style, text as pyx_text
 
-    col1    = color.cmyk(0, 0, 0, 1)
-    col2    = color.cmyk(1, 0.5, 0, 0)
+    col1    = resolve_color(color1, (0, 0, 0, 1))
+    col2    = resolve_color(color2, (1, 0.5, 0, 0))
     panel_w = 5
     panel_h = 3
     gap     = 2.0
@@ -723,7 +799,7 @@ def plot_comparison_pyx(s1: dict, s2: dict,
                                      style.linestyle.solid)],
                           y_title="Edit Frac",
                           window=window, panel_w=panel_w, panel_h=panel_h)
-    c.text(g1.xpos + g1.width / 2., g1.ypos + g1.height + 0.4, label1,
+    c.text(g1.xpos + g1.width / 2., g1.ypos + g1.height + 0.4, tex_escape(label1),
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     g2 = _pyx_meta_graph(c, xpos=panel_w + gap, ypos=panel_h + gap,
@@ -731,7 +807,7 @@ def plot_comparison_pyx(s1: dict, s2: dict,
                                      style.linestyle.solid)],
                           y_title="Edit Frac",
                           window=window, panel_w=panel_w, panel_h=panel_h)
-    c.text(g2.xpos + g2.width / 2., g2.ypos + g2.height + 0.4, label2,
+    c.text(g2.xpos + g2.width / 2., g2.ypos + g2.height + 0.4, tex_escape(label2),
            [pyx_text.halign.center, pyx_text.size.normalsize])
 
     _pyx_log2fc_graph(c, xpos=0, ypos=0,
@@ -751,12 +827,13 @@ def plot_comparison_pyx(s1: dict, s2: dict,
 
 def plot_rank_comparison_pyx(s1: dict, s2: dict,
                               label1: str, label2: str,
-                              output_prefix: str, window: int):
+                              output_prefix: str, window: int,
+                              color1: str = None, color2: str = None):
     """3-column rank figure: 1st/2nd/3rd His codon, meta overlay + log2FC."""
     from pyx import canvas, color, style, text as pyx_text
 
-    col1    = color.cmyk(0, 0, 0, 1)
-    col2    = color.cmyk(1, 0.5, 0, 0)
+    col1    = resolve_color(color1, (0, 0, 0, 1))
+    col2    = resolve_color(color2, (1, 0.5, 0, 0))
     panel_w = 4
     panel_h = 3
     gap     = 2.0
@@ -843,7 +920,7 @@ def plot_codon_type_comparison_pyx(s1: dict, s2: dict,
         c.text(g_ov.xpos + g_ov.width / 2., g_ov.ypos + g_ov.height + 0.3,
                "CAT vs CAC",
                [pyx_text.halign.center, pyx_text.size.small])
-        c.text(-0.2, ypos + panel_h / 2., bam_label,
+        c.text(-0.2, ypos + panel_h / 2., tex_escape(bam_label),
                [pyx_text.halign.boxright, pyx_text.valign.middle,
                 pyx_text.size.small])
 
@@ -871,20 +948,19 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
                                         his_agg_bam2: pd.DataFrame,
                                         control_aggs: dict,
                                         label1: str, label2: str,
-                                        output_prefix: str, window: int):
-    """Overlay of His + control codons, one panel per BAM."""
+                                        output_prefix: str, window: int,
+                                        color1: str = None, color2: str = None):
+    """Overlay of His + control codons, one panel per BAM. His is colored
+    per-sample (matching the other comparison plots); control codons are
+    shades of grey so they read as background/specificity controls."""
     from pyx import canvas, color, style, path, text as pyx_text
 
-    codon_names = ["His"] + list(control_aggs.keys())
-    codon_colors_cmyk = [
-        color.cmyk(0, 1, 1, 0),
-        color.cmyk(1, 0.5, 0, 0),
-        color.cmyk(0.1, 0.05, 0.9, 0),
-        color.cmyk(0.97, 0, 0.75, 0),
-        color.cmyk(0, 0.6, 0.3, 0),
-    ]
-    codon_color_map = {name: codon_colors_cmyk[i]
-                       for i, name in enumerate(codon_names)}
+    control_names      = list(control_aggs.keys())
+    control_color_map  = dict(zip(control_names, grey_shades(len(control_names))))
+    his_color_by_label = {
+        label1: resolve_color(color1, (0, 0, 0, 1)),
+        label2: resolve_color(color2, (1, 0.5, 0, 0)),
+    }
 
     panel_w = 7
     panel_h = 3.5
@@ -900,14 +976,13 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
     ]):
         ypos    = (1 - row_idx) * (panel_h + gap)
         x_title = "Relative Position" if row_idx == 1 else ""
+        his_col = his_color_by_label[bam_label]
 
-        overlay_datasets = []
-        for codon_name in codon_names:
-            agg = his_agg if codon_name == "His" \
-                  else control_aggs[codon_name].get(bam_label, pd.DataFrame())
-            ls  = style.linestyle.solid if codon_name == "His" \
-                  else style.linestyle.dashed
-            overlay_datasets.append((agg, codon_color_map[codon_name], ls))
+        overlay_datasets = [(his_agg, his_col, style.linestyle.solid)]
+        for codon_name in control_names:
+            agg = control_aggs[codon_name].get(bam_label, pd.DataFrame())
+            overlay_datasets.append(
+                (agg, control_color_map[codon_name], style.linestyle.dashed))
 
         g = _pyx_meta_graph(
             c, xpos=0, ypos=ypos,
@@ -915,17 +990,18 @@ def plot_codon_specificity_overlay_pyx(his_agg_bam1: pd.DataFrame,
             y_title="Edit Frac", x_title=x_title,
             window=window, panel_w=panel_w, panel_h=panel_h,
         )
-        c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.4, bam_label,
+        c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.4, tex_escape(bam_label),
                [pyx_text.halign.center, pyx_text.size.normalsize])
 
         if row_idx == 0:
             leg_x_start = g.xpos + g.width + 0.4
             leg_y_start = g.ypos + g.height - 0.2
-            for j, codon_name in enumerate(codon_names):
-                col = codon_color_map[codon_name]
-                ls  = style.linestyle.solid if codon_name == "His" \
-                      else style.linestyle.dashed
-                ly  = leg_y_start - j * leg_dy
+            legend_entries = [("His", his_col, style.linestyle.solid)] + [
+                (name, control_color_map[name], style.linestyle.dashed)
+                for name in control_names
+            ]
+            for j, (codon_name, col, ls) in enumerate(legend_entries):
+                ly = leg_y_start - j * leg_dy
                 c.stroke(path.line(leg_x_start, ly, leg_x_start + leg_lw, ly),
                          [col, style.linewidth.normal, ls])
                 c.text(leg_x_start + leg_lw + 0.15, ly, codon_name,
@@ -947,25 +1023,24 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
                                 his_agg_bam2: pd.DataFrame,
                                 control_aggs: dict,
                                 label1: str, label2: str,
-                                output_prefix: str, window: int):
+                                output_prefix: str, window: int,
+                                color1: str = None, color2: str = None):
     """
     2 rows (BAM1 top, BAM2 bottom) x (n_codons + 1) columns.
     Individual codon panels + overlay column.
     y-title on leftmost column only, x-title on bottom row only.
-    Codon name titles above each panel.
+    Codon name titles above each panel. His is colored per-sample; control
+    codons are shades of grey.
     """
     from pyx import canvas, color, style, text as pyx_text
 
-    codon_names = ["His"] + list(control_aggs.keys())
-    codon_colors_cmyk = [
-        color.cmyk(0, 1, 1, 0),
-        color.cmyk(1, 0.5, 0, 0),
-        color.cmyk(0.1, 0.05, 0.9, 0),
-        color.cmyk(0.97, 0, 0.75, 0),
-        color.cmyk(0, 0.6, 0.3, 0),
-    ]
-    codon_color_map = {name: codon_colors_cmyk[i]
-                       for i, name in enumerate(codon_names)}
+    codon_names        = ["His"] + list(control_aggs.keys())
+    control_names      = codon_names[1:]
+    control_color_map  = dict(zip(control_names, grey_shades(len(control_names))))
+    his_color_by_label = {
+        label1: resolve_color(color1, (0, 0, 0, 1)),
+        label2: resolve_color(color2, (1, 0.5, 0, 0)),
+    }
 
     panel_w = 3
     panel_h = 2.5
@@ -980,13 +1055,15 @@ def plot_codon_specificity_pyx(his_agg_bam1: pd.DataFrame,
     ]):
         ypos    = (1 - row_idx) * (panel_h + row_gap)
         x_title = "Relative Position" if row_idx == 1 else ""
+        his_col = his_color_by_label[bam_label]
+        codon_color_map = {"His": his_col, **control_color_map}
 
         for col_idx, codon_name in enumerate(codon_names):
             xpos    = col_idx * (panel_w + gap)
             agg     = his_agg if codon_name == "His" \
                       else control_aggs[codon_name].get(bam_label, pd.DataFrame())
             col     = codon_color_map[codon_name]
-            y_title = f"{bam_label} edit frac" if col_idx == 0 else ""
+            y_title = f"{tex_escape(bam_label)} edit frac" if col_idx == 0 else ""
 
             g = _pyx_meta_graph(
                 c, xpos=xpos, ypos=ypos,
@@ -1043,13 +1120,20 @@ def parse_args():
     p.add_argument("--ref",          required=True)
     p.add_argument("--gtf",          required=True)
     p.add_argument("--output",       default="his_meta")
-    p.add_argument("--window",       type=int, default=50)
+    p.add_argument("--window",       type=int, default=100)
     p.add_argument("--min_coverage", type=int, default=10)
     p.add_argument("--min_edit_frac", type=float, default=0.01)
     p.add_argument("--control_codons", nargs="*", default=None,
                    help="Control codon names for specificity analysis. "
                         f"Default: {list(CONTROL_CODONS.keys())}. "
                         "Pass none to skip.")
+    p.add_argument("--color_map", default=None,
+                   help="Optional TSV file mapping sample name/rep to a hex "
+                        "color (columns: name, rep, path, hex_color, no '#'). "
+                        "Colors for --label1/--label2 are looked up as "
+                        "'name_rep' or bare 'name'; unmatched labels fall "
+                        "back to the default black/red scheme. Control "
+                        "codons are always plotted as shades of grey.")
     return p.parse_args()
 
 
@@ -1059,6 +1143,16 @@ def main():
     Path(out).parent.mkdir(parents=True, exist_ok=True)
 
     print("=== Histidine Meta Analysis (parquet) ===", file=sys.stderr)
+
+    # ── Resolve manuscript colors ─────────────────────────────────────────────
+    color_map = load_color_map(args.color_map) if args.color_map else {}
+    color1    = lookup_color(color_map, args.label1)
+    color2    = lookup_color(color_map, args.label2)
+    if args.color_map:
+        for lbl, col in [(args.label1, color1), (args.label2, color2)]:
+            if col is None:
+                print(f"  WARNING: no color found for label '{lbl}' in "
+                      f"{args.color_map}; using default.", file=sys.stderr)
 
     # ── Parse GTF and find His sites ──────────────────────────────────────────
     print("\nParsing GTF...", file=sys.stderr)
@@ -1162,12 +1256,13 @@ def main():
     print("\nGenerating plots...", file=sys.stderr)
     try:
         plot_comparison_pyx(s1, s2, args.label1, args.label2,
-                            out, args.window)
+                            out, args.window, color1=color1, color2=color2)
         plot_rank_comparison_pyx(s1, s2, args.label1, args.label2,
-                                  out, args.window)
+                                  out, args.window, color1=color1, color2=color2)
         plot_codon_type_comparison_pyx(s1, s2, args.label1, args.label2,
                                         out, args.window)
-        plot_cdf_pyx(s1, s2, args.label1, args.label2, out)
+        plot_cdf_pyx(s1, s2, args.label1, args.label2, out,
+                     color1=color1, color2=color2)
         if control_aggs:
             plot_codon_specificity_pyx(
                 his_agg_bam1=s1["rel_position_agg"],
@@ -1175,6 +1270,7 @@ def main():
                 control_aggs=control_aggs,
                 label1=args.label1, label2=args.label2,
                 output_prefix=out, window=args.window,
+                color1=color1, color2=color2,
             )
             plot_codon_specificity_overlay_pyx(
                 his_agg_bam1=s1["rel_position_agg"],
@@ -1182,6 +1278,7 @@ def main():
                 control_aggs=control_aggs,
                 label1=args.label1, label2=args.label2,
                 output_prefix=out, window=args.window,
+                color1=color1, color2=color2,
             )
     except Exception as e:
         print(f"  WARNING: pyx plotting failed: {e}", file=sys.stderr)

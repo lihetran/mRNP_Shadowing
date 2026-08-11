@@ -15,9 +15,11 @@ Two complementary views:
           CDS vs UTR3 -- so regions/genes of different sizes AND different
           sequencing depth are directly comparable, and so is one region
           across libraries.
-  VIEW 3-TE  per-gene call rate (View 3) against translation EFFICIENCY
-          from an external RPF/RNA table, one scatter panel per library --
-          only produced if a TE file is passed (optional 5th CLI arg).
+  VIEW 3-TE  per-gene log2FC in footprint/shadow-run rate (relative to the
+          phenol library) against translation EFFICIENCY from an external
+          RPF/RNA table, one scatter panel per library -- no statistics
+          yet, just the raw points -- only produced if a TE file is
+          passed (optional 5th CLI arg) AND a phenol library is present.
 
 Input parquet columns used per read:
   read_id, shadow_gene, absolute_indices, shadow_gpos, shadow_P_B,
@@ -29,21 +31,27 @@ Input parquet columns used per read:
   or FIXED_CUTOFF.)
 
 Run:
-  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile [tePath] [flank_nt]
+  python3 shadowSizeQC.py inFilesParquet.txt outPrefix hisCodonPositions.pickle gtfFile [tePath] [flank_nt] [colorMapPath]
 where inFilesParquet.txt is line-delimited:  fileName  rep  parquetFile,
 hisCodonPositions.pickle is findHisCodonPositions.py's output, gtfFile
 is the GTF used to derive each gene's CDS length for View 7 (UTR5/UTR3
 lengths come from flank_nt instead -- see region_lengths), the optional
 tePath is a per-gene translation-efficiency table (a .parquet with
 gene_name/TE_score columns, e.g. Weinberg/Bartel RPF-vs-RNA data -- see
-load_translation_efficiency) enabling View 3-TE, and the optional
-flank_nt (default 150) MUST match whatever --flank_nt
-runHMMPerGene.py/trainHMMPerGene.py actually scored these parquets with,
-since UTR5/UTR3 "length" for View 7's density normalization is now that
-scored flank width (capped per gene at the nearest-neighbor gap via
+load_translation_efficiency) enabling View 3-TE, the optional flank_nt
+(default 150) MUST match whatever --flank_nt runHMMPerGene.py/
+trainHMMPerGene.py actually scored these parquets with, since UTR5/UTR3
+"length" for View 7's density normalization is now that scored flank
+width (capped per gene at the nearest-neighbor gap via
 compute_flank_caps), not a GTF-annotated UTR span -- this GTF barely
 annotates any (every "UTR3" is exactly the stop codon's own 3nt), so
-using that instead would wildly distort View 7's UTR density.
+using that instead would wildly distort View 7's UTR density -- and the
+optional colorMapPath is a manuscript color-map TSV (name, rep, path,
+hex_color, no leading '#' -- the same convention/file used across the
+other scripts' --color_map options) matched against libraryID
+("fileName-rep") to keep a given library the same color across every
+plot in this module AND consistent with every other script's figures;
+libraries with no match fall back to the built-in PALETTE cycle.
 """
 
 import sys, math, collections, pickle
@@ -59,7 +67,7 @@ from runHMMPerGene import parse_gtf, cds_length, compute_flank_caps
 # its own copy of because it differs slightly per use case.
 
 try:
-    from pyx import canvas, graph, color, style, text as pyx_text
+    from pyx import canvas, graph, color, style, path, deco, trafo, text as pyx_text
 except ImportError:
     canvas = None   # plotting optional; extraction still works without pyx
 
@@ -83,13 +91,10 @@ MIN_HIS_OBS_PER_GENE = 1                      # drop a gene from the His-codon
                                                # P_B distribution below this many His sites
 MIN_HIS_READS_PER_GENE = 5                    # drop a gene from the His-shadow-rate (View 6)
                                                # below this many reads with >=1 His-codon site
-MIN_READS_FOR_RUN_RATE = 20                   # View 9: drop a gene from the runs-per-read
+MIN_READS_FOR_RUN_RATE = 10                   # View 9: drop a gene from the runs-per-read
                                                # rate below this many reads (see caveat in
                                                # _gene_run_counts_by_reads about what "reads"
                                                # means here)
-TOP_K_CHANGE   = 15                           # plot_gene_change_ranking: how many genes to
-                                               # show at each end (biggest movers / most
-                                               # stable) of the paired per-gene rankings
 FLANK_NT       = 150                          # View 7: UTR5/UTR3 region length -- must match
                                                # whatever --flank_nt runHMMPerGene.py/
                                                # trainHMMPerGene.py actually scored this
@@ -105,15 +110,56 @@ HIS_CENTER_FRAC = 0.5                          # View 8: a His codon counts as "
                                                # (0.5 = middle half of the run) -- scales with
                                                # run length rather than a fixed nt tolerance, so
                                                # a longer run gets proportionally more slack
-HIS_PB_BIN     = 0.05                          # bin width for the His-codon P_B distribution
-HIS_PB_RANGE   = (0.0, 1.0)                   # full P_B range -- shadow_P_B is no longer
-                                               # pre-filtered at the source (see
-                                               # write_shadow_calls_to_df), so values below
-                                               # 0.5 are real and would be clipped by a
-                                               # narrower range here
 PALETTE        = None                         # list of pyx colors, set after import
+COLOR_MAP      = {}                           # {libraryID: "#RRGGBB"}, set in main() if
+                                               # a colorMapPath was given -- takes priority
+                                               # over PALETTE's index-based fallback so a
+                                               # given library keeps the same color across
+                                               # every plot in this module and every other
+                                               # script sharing the same manuscript color file
 
-def _libcolor(i):
+
+def load_color_map(path: str) -> dict:
+    """
+    Parse a manuscript color-map TSV with columns:
+        sample_name, rep, path, hex_color (no leading '#')
+    Returns a dict keyed by "name_rep", "name-rep" (this module's own
+    libraryID convention -- see main()'s "%s-%s" % (fileName, rep)), and
+    bare "name" (first match wins for the bare key) mapping to "#RRGGBB".
+    """
+    color_map = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            name, rep, _path, hexcol = fields[0], fields[1], fields[2], fields[3]
+            hexcol = "#" + hexcol.strip().lstrip("#")
+            if rep:
+                color_map.setdefault(f"{name}_{rep}", hexcol)
+                color_map.setdefault(f"{name}-{rep}", hexcol)
+            color_map.setdefault(name, hexcol)
+    return color_map
+
+
+def hex_to_pyx_color(hexcol: str):
+    hexcol = hexcol.lstrip("#")
+    r = int(hexcol[0:2], 16) / 255.0
+    g = int(hexcol[2:4], 16) / 255.0
+    b = int(hexcol[4:6], 16) / 255.0
+    return color.rgb(r, g, b)
+
+
+def _libcolor(libID, i):
+    """Manuscript color for libID if COLOR_MAP has one, else the i'th
+    PALETTE color (index-based fallback, same as before colorMapPath
+    existed)."""
+    hexcol = COLOR_MAP.get(libID)
+    if hexcol:
+        return hex_to_pyx_color(hexcol)
     return PALETTE[i % len(PALETTE)]
 
 
@@ -239,16 +285,15 @@ def load_translation_efficiency(te_path):
 def his_codon_pb_observations(df, his_gpos_by_gene):
     """
     Every (read, His-codon site) observation's raw P_B value, tagged by
-    gene -- no cutoff applied. Feed into _gene_weighted_freq_float for a
-    per-gene-then-aggregated P_B DISTRIBUTION at His codons.
+    gene -- no cutoff applied. Averaged per gene (see main()'s View 5
+    construction of his_gene_by_lib) into a per-gene mean His-codon P_B.
 
     This replaces an earlier version (his_codon_call_rates) that collapsed
     this to a single P_B>0.7 rate. Confirmed on real data that a fixed
     cutoff can sit awkwardly relative to one specific site's own achievable
     range: one gene's His-codon site never exceeded P_B=0.64 in ANY
     library, reading as "0% protected" even though that's a meaningfully
-    elevated value for that site. The full distribution shows that shape
-    instead of hiding it behind one line.
+    elevated value for that site.
 
     Returns a list of {"gene": gene, "pb": p} dicts.
     """
@@ -533,60 +578,6 @@ def _gene_weighted_freq(runs, measure, lo, hi, bin_width,
     return {e: v / n_used for e, v in freq_sum.items()}, edges, n_used, n_dropped
 
 
-def _bin_float(values, lo, hi, bin_width):
-    """
-    Like _bin, but for float-valued data (P_B) -- keyed by integer bin
-    INDEX rather than the float left-edge. range()/repeated-addition on
-    floats can produce edge values that don't hash-equal themselves later
-    (0.5 + 0.05*3 isn't guaranteed to == 0.65), which would silently break
-    dict lookups downstream; integer indices sidestep that entirely.
-    """
-    n_bins = int(round((hi - lo) / bin_width))
-    counts = collections.defaultdict(int)
-    for v in values:
-        if lo <= v <= hi:
-            idx = min(int((v - lo) / bin_width), n_bins - 1)
-            counts[idx] += 1
-    edges = [lo + i * bin_width for i in range(n_bins + 1)]
-    return dict(counts), edges
-
-
-def _gene_weighted_freq_float(obs, measure, lo, hi, bin_width,
-                              min_obs_per_gene=MIN_HIS_OBS_PER_GENE):
-    """
-    Float-valued counterpart to _gene_weighted_freq (same per-gene-then-
-    aggregate rationale -- every gene one equal vote regardless of depth),
-    for continuous measures like raw P_B rather than integer-nt sizes.
-
-    obs: list of {"gene": ..., measure: float_value}.
-    Returns (freq_by_bin_index, edges, n_genes_used, n_genes_dropped).
-    """
-    by_gene = collections.defaultdict(list)
-    for o in obs:
-        by_gene[o["gene"]].append(o[measure])
-
-    n_bins = int(round((hi - lo) / bin_width))
-    freq_sum = {i: 0.0 for i in range(n_bins)}
-
-    n_used = 0
-    for gene, vals in by_gene.items():
-        if len(vals) < min_obs_per_gene:
-            continue
-        counts, edges = _bin_float(vals, lo, hi, bin_width)
-        tot = sum(counts.values())
-        if tot == 0:
-            continue
-        n_used += 1
-        for i in range(n_bins):
-            freq_sum[i] += counts.get(i, 0) / tot
-
-    n_dropped = len(by_gene) - n_used
-    edges = [lo + i * bin_width for i in range(n_bins + 1)]
-    if n_used == 0:
-        return {i: 0.0 for i in range(n_bins)}, edges, 0, n_dropped
-    return {i: v / n_used for i, v in freq_sum.items()}, edges, n_used, n_dropped
-
-
 def _count_by_gene(items):
     """{gene: count} -- generic counter over any list of dicts with a
     "gene" key (shadow runs, His-codon observations, ...). Used to decide
@@ -777,7 +768,7 @@ def plot_footprint_sizes(lib_hists_by_cut, edges, pdf_path,
             g.plot(graph.data.points([(ctr, vals.get(e, 0))
                                       for ctr, e in zip(centers, lefts)],
                                      x=1, y=2, title=title),
-                   [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                   [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
         c.insert(g)
         if bottom is None:
             bottom = g
@@ -832,7 +823,7 @@ def plot_stringency_sweep(lib_hists, edges, pdf_path, bin_width=SWEEP_BIN):
             g.plot(graph.data.points([(ctr, freq.get(e, 0))
                                       for ctr, e in zip(centers, lefts)],
                                      x=1, y=2, title=title),
-                   [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                   [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
         c.insert(g)
         if bottom is None:
             bottom = g
@@ -844,319 +835,313 @@ def plot_gene_call_rates(rates_by_lib, pdf_path, cutoff=FIXED_CUTOFF,
                          min_n=MIN_SITES_PER_GENE, min_n_label="scored sites",
                          ylabel=None, connect_matched=False):
     """
-    Per-gene metric, one box+strip per library. This is the MAGNITUDE
-    counterpart to the size histograms above, which equal-weight every gene
-    on purpose and so wash out exactly the kind of library-to-library
-    difference (e.g. ribosome-containing vs. a ribosome-less control) this
-    plot is meant to show. Matplotlib rather than PyX -- a quick
-    diagnostic, not a per-gene report figure.
+    Per-gene metric, one box (unfilled, Tukey whiskers -- matching
+    matplotlib's own default boxplot convention) + jittered strip per
+    library, PyX -- matching this module's other library-colored figures.
+    This is the MAGNITUDE counterpart to the size histograms above, which
+    equal-weight every gene on purpose and so wash out exactly the kind of
+    library-to-library difference (e.g. ribosome-containing vs. a
+    ribosome-less control) this plot is meant to show.
 
     rates_by_lib: {libraryID: {gene: value}} -- from gene_call_rates (every
     scored A site) or his_codon_pb_per_gene (mean P_B at His-codon sites);
     title/min_n/min_n_label/ylabel just describe the plot itself.
 
+    Strip points (and the box outline) are colored by _libcolor(libID, i)
+    -- COLOR_MAP's manuscript hex color if libID has one, else the
+    PALETTE index fallback, same mechanism as every other library-colored
+    plot in this module.
+
     connect_matched: restrict EVERY library's box+strip to only the genes
-    common to all libraries shown, and draw a thin line through each gene's
-    point across libraries (a paired/spaghetti overlay). Comparing full
-    per-library gene sets box-to-box is misleading here -- a library with
-    many more passing genes than another can shift its whole box off a
-    baseline-level difference in WHICH genes it includes, not a real
+    common to all libraries shown, and draw a thin grey line through each
+    gene's point across libraries (a paired/spaghetti overlay). Comparing
+    full per-library gene sets box-to-box is misleading here -- a library
+    with many more passing genes than another can shift its whole box off
+    a baseline-level difference in WHICH genes it includes, not a real
     per-gene effect (confirmed on real data: unrestricted boxes made a
     library with 42 genes look higher overall than one with only 11, but
     the 11 genes actually shared between them mostly moved the other way).
     Restricting to the shared set makes both the box and the lines honest
     paired comparisons of the same genes.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
 
     libIDs = sorted(rates_by_lib)
+    n_libs = len(libIDs)
 
     if connect_matched:
         common_genes = sorted(set.intersection(*(set(rates_by_lib[lib]) for lib in libIDs))) \
                        if libIDs else []
-        data = [[rates_by_lib[lib][g] for g in common_genes] for lib in libIDs]
+        data = {lib: [rates_by_lib[lib][g] for g in common_genes] for lib in libIDs}
     else:
-        data = [list(rates_by_lib[lib].values()) for lib in libIDs]
+        common_genes = None
+        data = {lib: list(rates_by_lib[lib].values()) for lib in libIDs}
 
-    fig, ax = plt.subplots(figsize=(1.2 * max(len(libIDs), 3) + 1, 5))
-    ax.boxplot(data, labels=libIDs, showfliers=False, zorder=3)
+    all_vals = [v for lib in libIDs for v in data[lib]]
+    if not all_vals:
+        print(f"plot_gene_call_rates: no data to plot, skipping ({pdf_path})",
+              file=sys.stderr)
+        return
+    y_lo = min(0.0, min(all_vals))
+    y_hi = max(all_vals) * 1.1 if max(all_vals) > 0 else 1.0
+
+    panel_w, panel_h = max(1.4 * n_libs, 4), 6
+    g = graph.graphxy(
+        width=panel_w, height=panel_h, xpos=0, ypos=0,
+        x=graph.axis.linear(min=0.3, max=n_libs + 0.7, parter=None),
+        y=graph.axis.linear(min=y_lo, max=y_hi,
+                            title=ylabel or f"per-gene call rate (P$_B>${cutoff})"),
+    )
+    c = canvas.canvas()
+    c.insert(g)
+
     rng = np.random.default_rng(0)
 
-    if connect_matched:
+    # spaghetti lines (unjittered x, one per common gene) -- drawn first
+    if connect_matched and common_genes:
         for gi in range(len(common_genes)):
-            ys = [data[li][gi] for li in range(len(libIDs))]
-            ax.plot(range(1, len(libIDs) + 1), ys, color="grey",
-                    linewidth=0.6, alpha=0.5, zorder=1)
+            pts = [(i + 1, data[lib][gi]) for i, lib in enumerate(libIDs)]
+            g.plot(graph.data.points(pts, x=1, y=2),
+                   [graph.style.line([color.gray(0.6), style.linewidth.thin])])
 
-    for i, vals in enumerate(data, start=1):
-        jitter = rng.normal(0, 0.05, size=len(vals))
-        ax.scatter([i + j for j in jitter], vals, s=10, alpha=0.5,
-                   color="tab:blue", zorder=2)
-        ax.text(i, ax.get_ylim()[0], f"n={len(vals)}", ha="center", va="top",
-                fontsize=8)
-    ax.set_ylabel(ylabel or f"per-gene call rate (P$_B$ > {cutoff})")
+    box_hw = 0.18   # box/whisker-cap half-width, in x-axis units
+    for i, lib in enumerate(libIDs):
+        xi  = i + 1
+        vals = np.asarray(data[lib])
+        col = _libcolor(lib, i)
+
+        if len(vals):
+            q1, med, q3 = np.percentile(vals, [25, 50, 75])
+            iqr = q3 - q1
+            lo_fence, hi_fence = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            in_range = vals[(vals >= lo_fence) & (vals <= hi_fence)]
+            whisk_lo = in_range.min() if len(in_range) else q1
+            whisk_hi = in_range.max() if len(in_range) else q3
+
+            for y0v, y1v in [(whisk_lo, q1), (q3, whisk_hi)]:
+                x0, y0 = g.pos(xi, y0v)
+                x1, y1 = g.pos(xi, y1v)
+                c.stroke(path.line(x0, y0, x1, y1), [style.linewidth.thin, color.gray(0.3)])
+            for wv in (whisk_lo, whisk_hi):
+                xa, ya = g.pos(xi - box_hw / 2, wv)
+                xb, yb = g.pos(xi + box_hw / 2, wv)
+                c.stroke(path.line(xa, ya, xb, yb), [style.linewidth.thin, color.gray(0.3)])
+
+            xa, ya = g.pos(xi - box_hw, q1)
+            xb, yb = g.pos(xi + box_hw, q3)
+            c.stroke(path.rect(xa, ya, xb - xa, yb - ya), [style.linewidth.thin, color.gray(0.2)])
+            xa2, ya2 = g.pos(xi - box_hw, med)
+            xb2, yb2 = g.pos(xi + box_hw, med)
+            c.stroke(path.line(xa2, ya2, xb2, yb2), [style.linewidth.thick, color.gray(0.2)])
+
+        jitter = rng.normal(0, 0.06, size=len(vals))
+        pts = [(xi + j, v) for j, v in zip(jitter, vals)]
+        if pts:
+            g.plot(graph.data.points(pts, x=1, y=2),
+                   [graph.style.symbol(graph.style.symbol.circle, size=0.07,
+                                       symbolattrs=[deco.filled([col]), deco.stroked([col])])])
+
+        xn, yn = g.pos(xi, y_lo)
+        c.text(xn, yn - 0.2, "%s (n=%d)" % (lib.replace("_", r"\_"), len(vals)),
+              [pyx_text.halign.right, pyx_text.size.small, trafo.rotate(30)])
+
     n_note = (f"{len(common_genes)} genes common to all libraries"
               if connect_matched else
               f"genes with <{min_n} {min_n_label} dropped")
-    ax.set_title(f"{title}\n(one point per gene, {n_note})",
-                  fontsize=10)
-    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-    fig.tight_layout()
-    fig.savefig(pdf_path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote gene call-rate plot to {pdf_path}", file=sys.stderr)
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.5, title,
+          [pyx_text.halign.center, pyx_text.size.normalsize])
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.2,
+          f"(one point per gene, {n_note})",
+          [pyx_text.halign.center, pyx_text.size.scriptsize])
+
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote gene call-rate plot to {pdf_path}.pdf", file=sys.stderr)
 
 
-def plot_gene_change_ranking(rates_by_lib, pdf_path, top_k=TOP_K_CHANGE,
-                             title="Per-gene change across libraries",
-                             xlabel=None):
+def compute_log2fc_vs_reference(rates_by_lib, reference_lib, pseudo=1e-3):
     """
-    Companion to plot_gene_call_rates: ranks genes by how much they change
-    across libraries rather than showing every gene's value at once. The
-    box+spaghetti plot answers "is there a shift on average" but is
-    illegible past a handful of genes -- dozens of overlapping thin grey
-    lines -- so it can't point at which specific genes moved the most, or
-    which barely moved at all. This does the opposite: one horizontal bar
-    per gene, sorted by range (max value - min value across every library
-    shown, so it generalizes past just two libraries), with the two
-    libraries that set that range annotated on the label so you know where
-    to go look further (e.g. back at individual reads for that gene).
+    {libraryID: {gene: log2fc}} -- log2((rate+pseudo) / (ref_rate+pseudo))
+    per gene, for every library EXCEPT reference_lib itself (its own log2FC
+    against itself would be trivially 0 for every gene). pseudo avoids
+    log2(0) the same way metaHistidineFromParquet.py's own
+    transcript_normalised_agg/compute_log2fc_agg add a pseudocount before
+    ratio-ing two possibly-zero rates.
 
-    rates_by_lib: {libraryID: {gene: value}} -- same shape as
-    plot_gene_call_rates takes (gene_call_rates, his_codon_pb_per_gene, or
-    any of the His-shadow-rate dicts main() builds). Common genes are
-    recomputed here as the intersection of every library's own keys rather
-    than trusted from the caller -- not every rates_by_lib this module
-    builds is guaranteed pre-restricted to the same gene set per library
-    (e.g. the His-shadow ratios drop a gene per-library on zero qualifying
-    reads), so this mirrors plot_gene_call_rates' own connect_matched
-    pairing rule instead of assuming it already happened upstream.
-
-    top_k: genes shown at each end (biggest range / smallest range). If
-    2*top_k >= the number of common genes, every common gene is shown once
-    instead (sorted by range, no split) rather than a redundant double
-    listing of the same short gene set.
+    Only genes present in BOTH a library's own rates_by_lib entry AND
+    reference_lib's are included for that library -- not assumed
+    pre-matched, since a caller's rates_by_lib may restrict genes
+    per-library (e.g. a per-library min-reads floor).
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    libIDs = sorted(rates_by_lib)
-    common_genes = (set.intersection(*(set(rates_by_lib[lib]) for lib in libIDs))
-                     if libIDs else set())
-    if not common_genes:
-        print(f"plot_gene_change_ranking: no genes common to all {len(libIDs)} "
-              f"libraries, skipping ({pdf_path})", file=sys.stderr)
-        return
-
-    ranked = []
-    for g in common_genes:
-        vals = {lib: rates_by_lib[lib][g] for lib in libIDs}
-        lo_lib = min(vals, key=vals.get)
-        hi_lib = max(vals, key=vals.get)
-        ranked.append({"gene": g, "range": vals[hi_lib] - vals[lo_lib],
-                       "lo_lib": lo_lib, "hi_lib": hi_lib,
-                       "lo_val": vals[lo_lib], "hi_val": vals[hi_lib]})
-    ranked.sort(key=lambda r: r["range"], reverse=True)
-
-    n = len(ranked)
-    split_at = None if 2 * top_k >= n else top_k
-    shown = ranked if split_at is None else ranked[:top_k] + ranked[-top_k:]
-
-    fig, ax = plt.subplots(figsize=(9, 0.35 * len(shown) + 1.5))
-    y = np.arange(len(shown))[::-1]                    # biggest range at top
-    colors = ["tab:red" if split_at is None or i < split_at else "tab:blue"
-             for i in range(len(shown))]
-    ax.barh(y, [r["range"] for r in shown], color=colors)
-    ax.set_yticks(y)
-    ax.set_yticklabels(
-        ["%s  (%s=%.3g→%s=%.3g)" % (r["gene"], r["lo_lib"], r["lo_val"],
-                                        r["hi_lib"], r["hi_val"]) for r in shown],
-        fontsize=8)
-    if split_at is not None:
-        ax.axhline(y[split_at - 1] - 0.5, color="black", linewidth=0.8, linestyle="--")
-    ax.set_xlabel(xlabel or "range across libraries (max - min)")
-    n_note = (f"top/bottom {top_k} of {n} genes common to all {len(libIDs)} libraries"
-             if split_at is not None else
-             f"all {n} genes common to all {len(libIDs)} libraries")
-    ax.set_title(f"{title}\n({n_note}, sorted by range)", fontsize=10)
-    fig.tight_layout()
-    fig.savefig(pdf_path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote gene change-ranking plot to {pdf_path}", file=sys.stderr)
+    ref_rates = rates_by_lib.get(reference_lib, {})
+    log2fc_by_lib = {}
+    for lib, gene_rates in rates_by_lib.items():
+        if lib == reference_lib:
+            continue
+        genes = sorted(set(gene_rates) & set(ref_rates))
+        log2fc_by_lib[lib] = {
+            g: math.log2((gene_rates[g] + pseudo) / (ref_rates[g] + pseudo))
+            for g in genes
+        }
+    return log2fc_by_lib
 
 
-def plot_te_correlation(rates_by_lib, te_by_gene, pdf_path, cutoff=FIXED_CUTOFF,
-                        ylabel=None, min_n=3, max_labeled=60):
+def plot_shadow_log2fc_vs_te(log2fc_by_lib, te_by_gene, pdf_path,
+                             ylabel="log2FC of Shadow Calls against Phenol",
+                             xlabel="Translation Efficiency"):
     """
-    One scatter panel per library: per-gene shadow call rate (from
-    rates_by_lib, e.g. gene_call_rates -- the same per-gene metric
-    plot_gene_call_rates' box+spaghetti view shows) against translation
-    efficiency (te_by_gene, from load_translation_efficiency), with
-    Spearman rank correlation annotated per panel -- rank-based rather than
-    Pearson since TE_score is right-skewed (RPF/RNA ratios) and the
-    question here is "does more TE track with more/less shadow", a
-    monotonic relationship, not specifically a linear one.
+    One pooled PyX scatter -- every library's genes on the SAME panel
+    (not one panel per library), colored by _libcolor(libID, i) -- COLOR_MAP's
+    manuscript hex color if libID has one, else the PALETTE index fallback,
+    the same mechanism/colors as every other library-colored plot in this
+    module (size/sweep/His-codon/region-density figures).
 
-    Every library plotted on its own panel, all sharing the same TE axis,
-    rather than pooling libraries into one scatter -- a real difference
-    between a ribosome-containing library and the ribosome-less control
-    (which shouldn't correlate with TE at all, since it has no ribosomes
-    to leave a TE-dependent footprint) is exactly the kind of thing pooling
-    would wash out.
+    log2fc_by_lib: {libraryID: {gene: log2fc}}, from
+    compute_log2fc_vs_reference -- already excludes the reference (phenol)
+    library itself. te_by_gene: {gene: TE_score}.
 
-    rates_by_lib: {libraryID: {gene: rate}}. te_by_gene: {gene: TE_score}.
-    Only genes present in BOTH dicts for a given library are plotted; a
-    library needs at least min_n such genes to get a correlation computed
-    at all (Spearman on <3 points is not meaningful).
-
-    Every point is labeled with its gene name (small offset text) as long
-    as a panel has <= max_labeled genes -- the whole point of asking "does
-    THIS gene's call rate track its TE" rather than just "is there a trend
-    overall" is to be able to read off which specific genes are high/high,
-    low/low, or a mismatch between the two; the Spearman rho alone can't
-    answer that. Above max_labeled the text would just overlap into an
-    unreadable smear, so labeling is skipped there (silently past a certain
-    density it stops helping) -- the aggregate rho/p/n in the title is still
-    shown regardless.
+    Deliberately no statistics yet (no regression line, no correlation
+    annotation, no gene-name labels) -- just the raw per-gene points, to
+    look at before deciding what (if anything) is worth annotating.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from scipy.stats import spearmanr
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
 
-    libIDs = sorted(rates_by_lib)
-    n_libs = len(libIDs)
-    fig, axes = plt.subplots(1, n_libs, figsize=(5.2 * n_libs, 5.2), squeeze=False)
-    axes = axes[0]
-
-    for ax, lib in zip(axes, libIDs):
-        genes = sorted(set(rates_by_lib[lib]) & set(te_by_gene))
-        te_vals   = [te_by_gene[g] for g in genes]
-        rate_vals = [rates_by_lib[lib][g] for g in genes]
-
-        ax.scatter(te_vals, rate_vals, s=14, alpha=0.6, color="tab:blue", zorder=2)
-
-        if len(genes) <= max_labeled:
-            for g, x, y in zip(genes, te_vals, rate_vals):
-                ax.annotate(g, (x, y), fontsize=6, xytext=(3, 2),
-                           textcoords="offset points", alpha=0.85)
-        elif genes:
-            print(f"plot_te_correlation: {lib} has {len(genes)} genes "
-                  f"(> max_labeled={max_labeled}), skipping gene-name labels",
+    libIDs = sorted(log2fc_by_lib)
+    genes_by_lib = {lib: sorted(set(log2fc_by_lib[lib]) & set(te_by_gene))
+                    for lib in libIDs}
+    for lib in libIDs:
+        n_have_rate = len(log2fc_by_lib[lib])
+        n_matched   = len(genes_by_lib[lib])
+        if n_have_rate:
+            print(f"  [{lib}] {n_matched}/{n_have_rate} genes have a TE_score "
+                  f"match ({n_have_rate - n_matched} dropped, no TE data)",
                   file=sys.stderr)
 
-        if len(genes) >= min_n:
-            rho, pval = spearmanr(te_vals, rate_vals)
-            stat_txt = f"Spearman ρ={rho:.2f}, p={pval:.2g}, n={len(genes)}"
-        else:
-            stat_txt = f"n={len(genes)} (< {min_n}, no correlation computed)"
+    all_te = [te_by_gene[g] for lib in libIDs for g in genes_by_lib[lib]]
+    all_fc = [log2fc_by_lib[lib][g] for lib in libIDs for g in genes_by_lib[lib]]
+    if not all_te:
+        print("plot_shadow_log2fc_vs_te: no genes with both a log2FC and a "
+              "TE_score; skipping.", file=sys.stderr)
+        return
 
-        ax.set_title(f"{lib}\n{stat_txt}", fontsize=9)
-        ax.set_xlabel("translation efficiency (TE_score)")
-        ax.set_ylabel(ylabel or f"per-gene call rate (P$_B$ > {cutoff})")
+    x_max = max(all_te) * 1.05
+    y_abs = max(max(abs(v) for v in all_fc), 0.5) * 1.15
 
-    all_rate_genes = set().union(*(set(rates_by_lib[lib]) for lib in libIDs)) if libIDs else set()
-    n_missing = len(all_rate_genes - set(te_by_gene))
-    fig.suptitle("Shadow call rate vs. translation efficiency"
-                 + (f" ({n_missing} genes with no TE match, dropped)" if n_missing else ""),
-                 fontsize=10)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
-    fig.savefig(pdf_path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote TE correlation plot to {pdf_path}", file=sys.stderr)
+    g = graph.graphxy(
+        width=8, height=6, xpos=0, ypos=0,
+        x=graph.axis.linear(min=0, max=x_max, title=xlabel),
+        y=graph.axis.linear(min=-y_abs, max=y_abs, title=ylabel),
+        key=graph.key.key(pos="tr", hinside=0))
+
+    g.plot(graph.data.function("y(x)=0", min=0, max=x_max),
+           [graph.style.line([color.gray(0.6), style.linewidth.thin,
+                              style.linestyle.dashed])])
+
+    for i, lib in enumerate(libIDs):
+        genes = genes_by_lib[lib]
+        if not genes:
+            continue
+        pts = [(te_by_gene[g], log2fc_by_lib[lib][g]) for g in genes]
+        col = _libcolor(lib, i)
+        title = r"%s (n=%d)" % (lib.replace("_", r"\_"), len(genes))
+        g.plot(graph.data.points(pts, x=1, y=2, title=title),
+               [graph.style.symbol(graph.style.symbol.circle, size=0.09,
+                                   symbolattrs=[deco.filled([col]), deco.stroked([col])])])
+
+    c = canvas.canvas()
+    c.insert(g)
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote shadow log2FC vs. TE scatter plot to {pdf_path}.pdf", file=sys.stderr)
 
 
 def plot_region_density_grouped_bars(region_density_mean, region_density_n, pdf_path,
                                      libIDs, region_names=("UTR5", "CDS", "UTR3"),
                                      ylabel="mean shadows / nt / read"):
     """
-    Grouped bar chart: one group per region (UTR5/CDS/UTR3), one bar per
-    library within each group -- all libraries and all regions visible on
-    one plot, rather than three separate per-region figures.
+    Grouped bar chart (PyX, matching this module's other library-colored
+    figures): one group per region (UTR5/CDS/UTR3), one bar per library
+    within each group -- all libraries and all regions visible on one
+    plot, rather than three separate per-region figures.
 
     NOT gene-paired across libraries (see View 7 in main()): each bar is
     that library's own mean per-gene density among its own qualifying
     genes, so a different number of genes can back each bar (annotated as
-    n= above it) -- libraries aren't held to the same shared gene set the
-    way plot_gene_call_rates' connect_matched option does.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    a rotated n= label above it) -- libraries aren't held to the same
+    shared gene set the way plot_gene_call_rates' connect_matched option
+    does.
 
-    n_libs    = len(libIDs)
-    n_regions = len(region_names)
-    x     = np.arange(n_regions)
-    width = 0.8 / n_libs
-
-    fig, ax = plt.subplots(figsize=(2.2 * n_regions + 1, 5))
-    for i, lib in enumerate(libIDs):
-        heights = [region_density_mean[region][lib] for region in region_names]
-        ns      = [region_density_n[region][lib] for region in region_names]
-        offset  = (i - (n_libs - 1) / 2) * width
-        ax.bar(x + offset, heights, width, label=lib)
-        for xi, h, n in zip(x + offset, heights, ns):
-            ax.text(xi, h, f"n={n}", ha="center", va="bottom", fontsize=7, rotation=90)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(region_names)
-    ax.set_ylabel(ylabel)
-    ax.set_title("Shadow density by region and library\n"
-                 "(mean per-gene density, not gene-paired across libraries)",
-                 fontsize=10)
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(str(pdf_path), dpi=150)
-    plt.close(fig)
-    print(f"Wrote region shadow-density barplot to {pdf_path}", file=sys.stderr)
-
-
-def plot_his_codon_pb_distribution(lib_hist, edges, pdf_path, bin_width=HIS_PB_BIN):
-    """
-    Per-gene-then-aggregated P_B DISTRIBUTION at His-codon sites, one line
-    per library -- see his_codon_pb_observations for why this replaced a
-    single P_B>cutoff rate. A vertical dashed line at 0.7 is drawn for
-    visual reference only, not as a hard cutoff baked into the data.
-
-    lib_hist: {libraryID: (freq_by_bin_index, n_obs)}.
+    Bar color comes from _libcolor(libID, i) -- COLOR_MAP's manuscript hex
+    color if libID has one, else the PALETTE index fallback -- the same
+    mechanism as every other library-colored plot in this module, so a
+    given library is the same color here as in the size/sweep/His-codon
+    figures.
     """
     if canvas is None:
         print("pyx not available; skipping plot", file=sys.stderr); return
-    libIDs  = sorted(lib_hist)
-    lefts   = edges[:-1]
-    centers = [e + bin_width / 2. for e in lefts]
 
-    ymax = 0.0
-    for freq, _n in lib_hist.values():
-        for i in range(len(lefts)):
-            ymax = max(ymax, freq.get(i, 0))
-    ymax = (ymax or 1) * 1.15
+    n_libs    = len(libIDs)
+    n_regions = len(region_names)
 
-    g = graph.graphxy(
-        width=10, height=6, xpos=0, ypos=0,
-        x=graph.axis.linear(min=edges[0], max=edges[-1], title=r"P$_B$ at His codon"),
-        y=graph.axis.linear(min=0, max=ymax, parter=_nice(ymax),
-                            title="freq (per-gene-then-aggregated)"),
-        key=graph.key.key(pos="tr", hinside=0))
-    g.plot(graph.data.points([(0.7, 0), (0.7, ymax)], x=1, y=2, title=None),
-           [graph.style.line([color.cmyk(0, 0, 0, 0.5), style.linewidth.thin,
-                              style.linestyle.dashed])])
-    for i, libID in enumerate(libIDs):
-        freq, n = lib_hist.get(libID, ({}, 0))
-        title = r"%s (n=%d)" % (libID.replace("_", r"\_"), n)
-        g.plot(graph.data.points([(ctr, freq.get(k, 0))
-                                  for k, ctr in enumerate(centers)],
-                                 x=1, y=2, title=title),
-               [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+    y_max = 0.0
+    for region in region_names:
+        for lib in libIDs:
+            y_max = max(y_max, region_density_mean[region][lib])
+    y_max = (y_max or 1e-9) * 1.2
+
+    group_pad = 0.12
+    usable    = 1.0 - 2 * group_pad
+    bar_w     = usable / n_libs
+    panel_w, panel_h = max(2.5 * n_regions, 6), 6
+
     c = canvas.canvas()
+    g = graph.graphxy(
+        width=panel_w, height=panel_h, xpos=0, ypos=0,
+        x=graph.axis.linear(min=0, max=n_regions, parter=None, title="Gene region"),
+        y=graph.axis.linear(min=0, max=y_max, title=ylabel),
+    )
     c.insert(g)
+
+    for ri, region in enumerate(region_names):
+        for i, lib in enumerate(libIDs):
+            val = region_density_mean[region][lib]
+            n   = region_density_n[region][lib]
+            bx0 = ri + group_pad + i * bar_w
+            bx1 = bx0 + bar_w
+            cx0, cy0 = g.pos(bx0, 0.0)
+            cx1, cy1 = g.pos(bx1, val)
+            col = _libcolor(lib, i)
+            if cy1 > cy0:
+                c.fill(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0), [col])
+                c.stroke(path.rect(cx0, cy0, cx1 - cx0, cy1 - cy0),
+                        [style.linewidth.thin, color.gray(0.3)])
+            c.text(cx0 + (cx1 - cx0) / 2., cy1 + 0.05, "n=%d" % n,
+                  [pyx_text.halign.left, pyx_text.valign.middle,
+                   pyx_text.size.tiny, trafo.rotate(90)])
+        cxm, cym = g.pos(ri + 0.5, 0.0)
+        c.text(cxm, cym - 0.4, region,
+              [pyx_text.halign.center, pyx_text.size.small])
+
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.6,
+          "Shadow density by region and library",
+          [pyx_text.halign.center, pyx_text.size.normalsize])
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.25,
+          "(mean per-gene density, not gene-paired across libraries)",
+          [pyx_text.halign.center, pyx_text.size.scriptsize])
+
+    leg_x, leg_y_top = g.xpos + g.width + 0.4, g.ypos + g.height - 0.3
+    leg_lw, leg_dy    = 0.6, 0.55
+    for i, lib in enumerate(libIDs):
+        ly  = leg_y_top - i * leg_dy
+        col = _libcolor(lib, i)
+        c.fill(path.rect(leg_x, ly - 0.12, leg_lw, 0.24), [col])
+        c.stroke(path.rect(leg_x, ly - 0.12, leg_lw, 0.24),
+                [style.linewidth.thin, color.gray(0.3)])
+        c.text(leg_x + leg_lw + 0.15, ly, lib.replace("_", r"\_"),
+              [pyx_text.valign.middle, pyx_text.size.small])
+
     c.writePDFfile(str(pdf_path))
-    print(f"Wrote His-codon P_B distribution plot to {pdf_path}", file=sys.stderr)
-
-
+    print(f"Wrote region shadow-density barplot to {pdf_path}.pdf", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1196,7 +1181,7 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     to "site_counts": a qualifying run is an actual footprint-sized
     (>=MIN_RUN_NT nt) protected stretch, not a bare scored site, so this is
     what "shadow rate" means when the site-level rate isn't specific
-    enough (e.g. for View 3-TE's TE correlation).}.
+    enough (e.g. for View 3-TE's log2FC-vs-TE scatter).}.
     """
     print("Loading %s (%s)..." % (parquetFile, libraryID), file=sys.stderr)
     df = pd.read_parquet(parquetFile)          # native columns, no JSON decode
@@ -1240,7 +1225,7 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
 
 
 def main(args):
-    global PALETTE
+    global PALETTE, COLOR_MAP
     if canvas is not None:
         PALETTE = [color.cmyk(1, 0.5, 0, 0), color.cmyk(0, 1, 1, 0),
                    color.cmyk(0.4, 1, 0, 0), color.cmyk(1, 0, 1, 0.1),
@@ -1250,6 +1235,11 @@ def main(args):
     parquetList, outPrefix, hisPicklePath, gtfPath = args[0], args[1], args[2], args[3]
     tePath = args[4] if len(args) > 4 else None
     flank_nt = int(args[5]) if len(args) > 5 else FLANK_NT
+    colorMapPath = args[6] if len(args) > 6 else None
+    if colorMapPath:
+        COLOR_MAP = load_color_map(colorMapPath)
+        print("Loaded manuscript colors for %d library key(s) from %s."
+              % (len(COLOR_MAP), colorMapPath), file=sys.stderr)
     his_gpos_by_gene = load_his_codon_gpos(hisPicklePath)
     print("Loaded His codon positions for %d genes." % len(his_gpos_by_gene),
           file=sys.stderr)
@@ -1282,6 +1272,13 @@ def main(args):
     libIDs = sorted(raw_by_lib)
     print("Pairing across %d libraries and building combined figures..." % len(libIDs),
           file=sys.stderr)
+    if colorMapPath:
+        unmatched = [lib for lib in libIDs if lib not in COLOR_MAP]
+        if unmatched:
+            print("  WARNING: no color found in %s for librar%s %s; falling back "
+                  "to the default palette for %s." %
+                  (colorMapPath, "y" if len(unmatched) == 1 else "ies",
+                   unmatched, "it" if len(unmatched) == 1 else "them"), file=sys.stderr)
 
     # ---- View 1 / 1-supplement: footprint size, paired per cutoff ----
     # A gene only contributes to a cutoff's panel if it has >=MIN_RUNS_PER_GENE
@@ -1338,20 +1335,14 @@ def main(args):
         for lib in libIDs
     }
 
-    # ---- View 4 / 5: His-codon P_B distribution + per-gene mean, paired ----
+    # ---- View 5: mean His-codon P_B per gene, paired ----
     his_counts_by_lib = {lib: _count_by_gene(raw_by_lib[lib]["his_obs"]) for lib in libIDs}
     common_his = _common_genes(his_counts_by_lib, MIN_HIS_OBS_PER_GENE)
     print("    His-codon sites: %d genes common to all %d libraries (>=%d His-codon sites each)"
           % (len(common_his), len(libIDs), MIN_HIS_OBS_PER_GENE), file=sys.stderr)
-    his_hist_by_lib = {}
     his_gene_by_lib = {}
-    his_edges = None
     for lib in libIDs:
         filtered = [o for o in raw_by_lib[lib]["his_obs"] if o["gene"] in common_his]
-        his_freq, his_edges, _, _ = _gene_weighted_freq_float(
-            filtered, "pb", HIS_PB_RANGE[0], HIS_PB_RANGE[1], HIS_PB_BIN,
-            min_obs_per_gene=1)        # already restricted to `common_his`, above the real bar
-        his_hist_by_lib[lib] = (his_freq, len(filtered))
         by_gene = collections.defaultdict(list)
         for o in filtered:
             by_gene[o["gene"]].append(o["pb"])
@@ -1465,64 +1456,54 @@ def main(args):
     plot_footprint_sizes(dict(unmerged_counts_by_cut), fp_edges,
                          "%s.footprint_sizes_counts" % outPrefix, ylabel="count")
     # View 3: per-gene call rate, magnitude comparison across libraries
-    plot_gene_call_rates(rates_by_lib, "%s.gene_call_rates.png" % outPrefix,
+    plot_gene_call_rates(rates_by_lib, "%s.gene_call_rates" % outPrefix,
                          connect_matched=True)
-    # View 3-supplement: same data, ranked by per-gene range across
-    # libraries so the biggest movers and the most stable genes are each
-    # readable by name (see plot_gene_change_ranking's docstring).
-    plot_gene_change_ranking(rates_by_lib, "%s.gene_call_rates.ranking.png" % outPrefix,
-                             title="Per-gene call-rate change across libraries",
-                             xlabel=f"range in per-gene call rate (P$_B$ > {FIXED_CUTOFF})")
     # View 3-TE: per-gene footprint/shadow-RUN rate (run_rates_by_lib, NOT
-    # the nucleotide-level rates_by_lib -- see its construction above) against
-    # translation efficiency (Weinberg/Bartel RPF/RNA data), one panel per
-    # library -- only produced if a TE file was passed on the CLI (args[4]).
+    # the nucleotide-level rates_by_lib -- see its construction above),
+    # log2FC relative to the phenol library, against translation efficiency
+    # (Weinberg/Bartel RPF/RNA data), every library pooled onto one scatter,
+    # colored per-library -- only produced if a TE file was passed on the
+    # CLI (args[4]) AND a phenol library is present to serve as the reference.
     if te_by_gene is not None:
-        plot_te_correlation(run_rates_by_lib, te_by_gene,
-                            "%s.gene_run_rates.te_correlation.png" % outPrefix,
-                            ylabel=f"n(footprint runs ≥{MIN_RUN_NT}nt) / n(reads)")
-    # View 4: P_B distribution at His-codon sites, not collapsed to one cutoff
-    plot_his_codon_pb_distribution(his_hist_by_lib, his_edges,
-                                   "%s.his_codon_pb_distribution" % outPrefix)
-    # View 5: mean His-codon P_B per gene, paired across libraries -- the
-    # pooled distribution above can hide a real per-gene shift when
-    # baseline P_B varies a lot gene to gene; connect_matched makes each
-    # gene's own trajectory across libraries visible.
-    plot_gene_call_rates(his_gene_by_lib, "%s.his_codon_mean_pb_paired.png" % outPrefix,
+        phenol_libs = [lib for lib in libIDs if lib.lower().startswith("phenol")]
+        if not phenol_libs:
+            print("  WARNING: no phenol library found (libraryID starting with "
+                  "'phenol'); skipping View 3-TE log2FC-vs-TE scatter.", file=sys.stderr)
+        else:
+            if len(phenol_libs) > 1:
+                print(f"  WARNING: {len(phenol_libs)} phenol libraries found "
+                      f"{phenol_libs}; using {phenol_libs[0]} as the reference.",
+                      file=sys.stderr)
+            reference_lib = phenol_libs[0]
+            run_rate_log2fc_by_lib = compute_log2fc_vs_reference(run_rates_by_lib, reference_lib)
+            plot_shadow_log2fc_vs_te(run_rate_log2fc_by_lib, te_by_gene,
+                                     "%s.gene_run_rates.log2fc_vs_te" % outPrefix)
+    # View 5: mean His-codon P_B per gene, paired across libraries.
+    plot_gene_call_rates(his_gene_by_lib, "%s.his_codon_mean_pb_paired" % outPrefix,
                          title="Mean His-codon P$_B$ by library (paired per gene)",
                          min_n=MIN_HIS_OBS_PER_GENE, min_n_label="His-codon sites",
                          ylabel="mean P$_B$ at His-codon sites", connect_matched=True)
-    plot_gene_change_ranking(his_gene_by_lib, "%s.his_codon_mean_pb_paired.ranking.png" % outPrefix,
-                             title="Per-gene mean His-codon P$_B$ change across libraries",
-                             xlabel="range in mean P$_B$ at His-codon sites")
     # View 6: n_his_shadows / n_reads_with_a_His_site, per-gene rate, paired
     # across libraries -- normalized by reads that had the opportunity to
     # show a His-codon shadow, not by n(other shadows), so a library with
     # little protection overall (e.g. phenol/ribosome-less) doesn't get an
     # inflated ratio just from having a tiny other-shadow denominator.
-    plot_gene_call_rates(his_vs_other_ratio_by_lib, "%s.his_codon_enrichment.png" % outPrefix,
+    plot_gene_call_rates(his_vs_other_ratio_by_lib, "%s.his_codon_enrichment" % outPrefix,
                          title="His-shadow-count / reads-with-His-site by library",
                          min_n=MIN_HIS_READS_PER_GENE, min_n_label="qualifying reads",
                          ylabel="n(His shadows) / n(reads with His site)", connect_matched=True)
-    plot_gene_change_ranking(his_vs_other_ratio_by_lib, "%s.his_codon_enrichment.ranking.png" % outPrefix,
-                             title="Per-gene His-shadow-rate change across libraries",
-                             xlabel="range in n(His shadows) / n(reads with His site)")
     # View 8: same as View 6, but the numerator only counts qualifying runs
     # CENTERED on a His codon rather than any His-codon site -- a stricter,
     # additional test of whether the His codon itself is driving the
     # protection, not a replacement for View 6.
-    plot_gene_call_rates(his_centered_ratio_by_lib, "%s.his_codon_centered_enrichment.png" % outPrefix,
+    plot_gene_call_rates(his_centered_ratio_by_lib, "%s.his_codon_centered_enrichment" % outPrefix,
                          title="His-CENTERED-run-count / reads-with-His-site by library",
                          min_n=MIN_HIS_READS_PER_GENE, min_n_label="qualifying reads",
                          ylabel="n(His-centered runs) / n(reads with His site)", connect_matched=True)
-    plot_gene_change_ranking(his_centered_ratio_by_lib,
-                             "%s.his_codon_centered_enrichment.ranking.png" % outPrefix,
-                             title="Per-gene His-centered-run-rate change across libraries",
-                             xlabel="range in n(His-centered runs) / n(reads with His site)")
     # View 7: shadow density (shadows/nt/read) by region -- one grouped barplot,
     # all regions and libraries together, not gene-paired across libraries.
     plot_region_density_grouped_bars(region_density_mean, region_density_n,
-                                     "%s.shadow_density_by_region.png" % outPrefix,
+                                     "%s.shadow_density_by_region" % outPrefix,
                                      libIDs, region_names=REGION_NAMES,
                                      ylabel="mean shadows / nt / read")
 

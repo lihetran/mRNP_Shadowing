@@ -11,6 +11,48 @@ from logJosh import Tee
 from pyx import *
 from pathlib import Path
 
+def load_color_map(path: str) -> dict:
+    """
+    Parse a manuscript color-map TSV with columns:
+        sample_name, rep, path, hex_color (no leading '#')
+    Returns a dict keyed by "name_rep", "name-rep" (this script's own
+    label convention, see parse_parquet_libs_file), and bare "name" (first
+    match wins for the bare key) mapping to "#RRGGBB".
+    """
+    color_map = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            name, rep, _path, hexcol = fields[0], fields[1], fields[2], fields[3]
+            hexcol = "#" + hexcol.strip().lstrip("#")
+            if rep:
+                color_map.setdefault(f"{name}_{rep}", hexcol)
+                color_map.setdefault(f"{name}-{rep}", hexcol)
+            color_map.setdefault(name, hexcol)
+    return color_map
+
+
+def hex_to_pyx_color(hexcol: str):
+    hexcol = hexcol.lstrip("#")
+    r = int(hexcol[0:2], 16) / 255.0
+    g = int(hexcol[2:4], 16) / 255.0
+    b = int(hexcol[4:6], 16) / 255.0
+    return color.rgb(r, g, b)
+
+
+def resolve_color(color_map: dict, label: str, idx: int):
+    """Look up label's manuscript color; fall back to common.colors(idx)."""
+    hexcol = color_map.get(label) if color_map else None
+    if hexcol:
+        return hex_to_pyx_color(hexcol)
+    return common.colors(idx)
+
+
 def load_all_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
     parquet_dir = Path(parquet_dir)
     chunks = sorted(parquet_dir.glob("*.parquet"))
@@ -202,21 +244,28 @@ def parse_parquet_libs_file(path):
 
 
 def main(args):
-    if len(args) != 2:
+    if len(args) not in (2, 3):
         print("Usage: python3 substitutionProfileFromParquet.py "
-              "inFilesParquet.txt output_prefix", file=sys.stderr)
+              "inFilesParquet.txt output_prefix [color_map.txt]", file=sys.stderr)
         print("  inFilesParquet.txt: line-delimited 'fileName rep directory'",
               file=sys.stderr)
+        print("  color_map.txt (optional): manuscript color TSV "
+              "'name  rep  path  hex_color' -- labels are looked up as "
+              "'name_rep'/'name-rep' or bare 'name'; unmatched labels fall "
+              "back to common.colors(idx).", file=sys.stderr)
         sys.exit(1)
 
     parquet_libs_file = args[0]
     output_prefix     = args[1]
+    color_map_path    = args[2] if len(args) > 2 else None
 
     libs_to_load = parse_parquet_libs_file(parquet_libs_file)
     if not libs_to_load:
         print(f"No libraries found in {parquet_libs_file}; exiting.",
               file=sys.stderr)
         sys.exit(1)
+
+    color_map = load_color_map(color_map_path) if color_map_path else {}
 
     profiles = []
     rows     = []
@@ -229,7 +278,10 @@ def main(args):
             continue
 
         profile = generate_substitution_profile(df)
-        col     = common.colors(idx)
+        if color_map_path and label not in color_map:
+            print(f"  WARNING: no color found for label '{label}' in "
+                  f"{color_map_path}; using default.", file=sys.stderr)
+        col = resolve_color(color_map, label, idx)
         profiles.append((profile, col, label))
 
         total = sum(profile.values())

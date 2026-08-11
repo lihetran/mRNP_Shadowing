@@ -36,6 +36,57 @@ CONTEXTS = [f"{x}A{y}" for x in BASES for y in BASES]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 0. Manuscript color map
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_color_map(path: str) -> dict:
+    """
+    Parse a manuscript color-map TSV with columns:
+        sample_name, rep, path, hex_color (no leading '#')
+    Returns a dict keyed by both "name_rep" (e.g. "+3AT_rep1") and bare
+    "name" (first match wins for the bare key) mapping to "#RRGGBB".
+    """
+    color_map = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            name, rep, _path, hexcol = fields[0], fields[1], fields[2], fields[3]
+            hexcol = "#" + hexcol.strip().lstrip("#")
+            color_map.setdefault(f"{name}_{rep}" if rep else name, hexcol)
+            color_map.setdefault(name, hexcol)
+    return color_map
+
+
+def lookup_color(color_map: dict, label: str):
+    """Return the hex color for label, or None if absent/no map given."""
+    if not color_map:
+        return None
+    return color_map.get(label)
+
+
+def hex_to_pyx_color(hexcol: str):
+    from pyx import color
+    hexcol = hexcol.lstrip("#")
+    r = int(hexcol[0:2], 16) / 255.0
+    g = int(hexcol[2:4], 16) / 255.0
+    b = int(hexcol[4:6], 16) / 255.0
+    return color.rgb(r, g, b)
+
+
+def resolve_color(hexcol, fallback_cmyk: tuple):
+    """hexcol (e.g. '#1F78B4') -> pyx color, or fallback_cmyk if hexcol is None."""
+    from pyx import color
+    if hexcol:
+        return hex_to_pyx_color(hexcol)
+    return color.cmyk(*fallback_cmyk)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1. Load parquets
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -419,6 +470,12 @@ def parse_args():
     p.add_argument("--gene_biotype",    default=None,
                    help="Restrict to reads assigned to this biotype "
                         "(e.g. protein_coding)")
+    p.add_argument("--color_map", default=None,
+                   help="Optional TSV file mapping sample name/rep to a hex "
+                        "color (columns: name, rep, path, hex_color, no '#'). "
+                        "Colors for --label1/--label2/--label3 are looked up "
+                        "as 'name_rep' or bare 'name'; unmatched labels fall "
+                        "back to the default black/blue/red scheme.")
     return p.parse_args()
 
 
@@ -429,27 +486,34 @@ def main():
 
     print("=== Per-read Editing Efficiency from Parquet ===", file=sys.stderr)
 
-    # CMYK colours — one per library
-    from pyx import color as pyx_color
-    colours = [
-        pyx_color.cmyk(0, 0, 0, 1),        # black
-        pyx_color.cmyk(1, 0.5, 0, 0),      # blue
-        pyx_color.cmyk(0, 1, 1, 0)         # red
+    # Default CMYK colours — one per library, used when a label has no
+    # entry in --color_map (or no --color_map was given).
+    default_cmyk = [
+        (0, 0, 0, 1),        # black
+        (1, 0.5, 0, 0),      # blue
+        (0, 1, 1, 0),        # red
     ]
+
+    color_map = load_color_map(args.color_map) if args.color_map else {}
 
     libraries_data = []
     all_stats      = []
     context_data   = []
     context_rows   = []
 
-    for idx, (parquet_dir, label, col) in enumerate([
-        (args.parquet1, args.label1, colours[0]),
-        (args.parquet2, args.label2, colours[1]),
-        (args.parquet3, args.label3, colours[2]),
+    for idx, (parquet_dir, label, fallback_cmyk) in enumerate([
+        (args.parquet1, args.label1, default_cmyk[0]),
+        (args.parquet2, args.label2, default_cmyk[1]),
+        (args.parquet3, args.label3, default_cmyk[2]),
     ]):
         if parquet_dir is None:
             continue
         lbl = label if label is not None else f"Library{idx+1}"
+        hexcol = lookup_color(color_map, lbl)
+        if args.color_map and hexcol is None:
+            print(f"  WARNING: no color found for label '{lbl}' in "
+                  f"{args.color_map}; using default.", file=sys.stderr)
+        col = resolve_color(hexcol, fallback_cmyk)
         print(f"\nLoading {lbl}...", file=sys.stderr)
         df  = load_parquet_chunks(parquet_dir)
         eff, stats, numAs = summarise(df, lbl, args.min_a_positions,
