@@ -57,7 +57,7 @@ been REPLACED by plot_call_ribo_metagene above per your redirect; its
 functions have been removed.)
 
 Run:
-  python3 shadowCallSizeQC.py inFileParquet.txt riboBamList.txt gtfFile outPrefix [shadow_cutoff] [min_run_nt] [read_len_bin_nt] [window_nt]
+  python3 shadowCallSizeQC.py inFileParquet.txt riboBamList.txt gtfFile outPrefix colorMapPath [shadow_cutoff] [min_run_nt] [read_len_bin_nt] [window_nt]
 where inFileParquet.txt is a whitespace-delimited list, one library per
 line: "condition  rep  shadow_calls.parquet" (the same convention as
 riboSeqBam.txt / the training queue's own inFileParquet.txt --
@@ -75,13 +75,18 @@ plot_call_ribo_metagene but still included in the calls_per_read
 figures (which need no ribo-seq data at all). gtfFile is the yeast GTF
 (gene chrom/strand/span). outPrefix is the shared prefix for every
 condition's output plots (see top of module for the per-condition
-filename pattern), and shadow_cutoff/min_run_nt (optional) override the
-P_B cutoff (default
-0.5) and run-length floor (default 30nt) for what counts as a
-qualifying shadow call -- applies to ALL analyses. read_len_bin_nt
-(optional, default 25) is the calls_per_read read-length bin width, and
-window_nt (optional, default 100) is plot_call_ribo_metagene's
-+/-window around each call's own midpoint.
+filename pattern). colorMapPath is REQUIRED -- a manuscript color-map TSV
+(name, rep, path, hex_color, no leading '#' -- the same convention/file
+used by --color_map in the other scripts in this codebase) matched
+against libraryID ("condition-rep") so a given library is the same color
+here as in every other script's figures; libraries with no match fall
+back to the built-in PALETTE cycle (with a warning), but the file itself
+must be given every run. shadow_cutoff/min_run_nt (optional) override the
+P_B cutoff (default 0.5) and run-length floor (default 30nt) for what
+counts as a qualifying shadow call -- applies to ALL analyses.
+read_len_bin_nt (optional, default 25) is the calls_per_read read-length
+bin width, and window_nt (optional, default 100) is
+plot_call_ribo_metagene's +/-window around each call's own midpoint.
 """
 import sys, os, collections
 import pandas as pd
@@ -95,12 +100,55 @@ from runHMMPerGene import parse_gtf, compute_flank_caps
 READ_LEN_BIN_NT  = 25    # calls-per-read analyses' read-length bin width
 CALL_WINDOW_NT   = 100   # plot_call_ribo_metagene's +/-window around each call's own midpoint
 
-PALETTE = [(1, 0.5, 0, 0), (0, 1, 1, 0), (0.4, 1, 0, 0), (1, 0, 1, 0.1),
-          (0, 0.5, 1, 0), (0.7, 0, 0, 0), (0, 0, 0, 0.7), (0.3, 0, 1, 0.2)]
+PALETTE   = [(1, 0.5, 0, 0), (0, 1, 1, 0), (0.4, 1, 0, 0), (1, 0, 1, 0.1),
+            (0, 0.5, 1, 0), (0.7, 0, 0, 0), (0, 0, 0, 0.7), (0.3, 0, 1, 0.2)]
+COLOR_MAP = {}   # {libraryID: "#RRGGBB"}, set in main() if a colorMapPath was given --
+                 # takes priority over PALETTE's index-based fallback so a library
+                 # keeps the same color here as in every other script's figures.
 
 
-def _libcolor(i):
+def load_color_map(path: str) -> dict:
+    """
+    Parse a manuscript color-map TSV with columns:
+        sample_name, rep, path, hex_color (no leading '#')
+    Returns a dict keyed by "name_rep", "name-rep" (this script's own
+    libraryID convention -- "condition-rep"), and bare "name" (first
+    match wins for the bare key) mapping to "#RRGGBB".
+    """
+    color_map = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 4:
+                continue
+            name, rep, _path, hexcol = fields[0], fields[1], fields[2], fields[3]
+            hexcol = "#" + hexcol.strip().lstrip("#")
+            if rep:
+                color_map.setdefault(f"{name}_{rep}", hexcol)
+                color_map.setdefault(f"{name}-{rep}", hexcol)
+            color_map.setdefault(name, hexcol)
+    return color_map
+
+
+def hex_to_pyx_color(hexcol: str):
     from pyx import color
+    hexcol = hexcol.lstrip("#")
+    r = int(hexcol[0:2], 16) / 255.0
+    g = int(hexcol[2:4], 16) / 255.0
+    b = int(hexcol[4:6], 16) / 255.0
+    return color.rgb(r, g, b)
+
+
+def _libcolor(libID, i):
+    """COLOR_MAP's manuscript hex color for libID if present, else the
+    i'th color from the built-in PALETTE cycle."""
+    from pyx import color
+    hexcol = COLOR_MAP.get(libID)
+    if hexcol:
+        return hex_to_pyx_color(hexcol)
     return color.cmyk(*PALETTE[i % len(PALETTE)])
 
 
@@ -298,7 +346,7 @@ def plot_calls_per_read(stats_by_lib, pdf_path, bin_width=READ_LEN_BIN_NT, min_r
     for i, libID in enumerate(libIDs):
         xs, n_reads, _means = series[libID]
         g_dep.plot(graph.data.points(list(zip(xs, n_reads)), x=1, y=2, title=None),
-                  [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                  [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
 
     sig_ypos = dep_h + gap
     g_sig = graph.graphxy(
@@ -314,7 +362,7 @@ def plot_calls_per_read(stats_by_lib, pdf_path, bin_width=READ_LEN_BIN_NT, min_r
             continue
         title = libID.replace("_", r"\_")
         g_sig.plot(graph.data.points(pts, x=1, y=2, title=title),
-                  [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                  [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
 
     top_ypos = sig_ypos + sig_h
     n_reads_total = sum(sum(n_reads) for _xs, n_reads, _m in series.values())
@@ -369,7 +417,7 @@ def plot_calls_per_read_cdf(counts_by_lib, pdf_path, min_run_nt=MIN_RUN_NT,
             pts.append((x_max, pts[-1][1]))
         title = r"%s (n=%d)" % (libID.replace("_", r"\_"), n)
         g.plot(graph.data.points(pts, x=1, y=2, title=title),
-              [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+              [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
 
     c.insert(g)
     c.text(panel_w / 2., panel_h + 0.5,
@@ -484,7 +532,7 @@ def plot_call_ribo_metagene(acc_by_lib, pdf_path, window_nt=CALL_WINDOW_NT, min_
     for i, libID in enumerate(libIDs):
         n_calls, _means = series[libID]
         g_dep.plot(graph.data.points(list(zip(xs, n_calls)), x=1, y=2, title=None),
-                  [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                  [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
 
     sig_ypos = dep_h + gap
     g_sig = graph.graphxy(
@@ -500,7 +548,7 @@ def plot_call_ribo_metagene(acc_by_lib, pdf_path, window_nt=CALL_WINDOW_NT, min_
             continue
         title = libID.replace("_", r"\_")
         g_sig.plot(graph.data.points(pts, x=1, y=2, title=title),
-                  [graph.style.line([_libcolor(i), style.linewidth.Thick])])
+                  [graph.style.line([_libcolor(libID, i), style.linewidth.Thick])])
 
     top_ypos = sig_ypos + sig_h
     c.text(panel_w / 2., top_ypos + 0.5,
@@ -516,11 +564,18 @@ def plot_call_ribo_metagene(acc_by_lib, pdf_path, window_nt=CALL_WINDOW_NT, min_
 
 
 def main(args):
-    inFileParquetPath, riboBamListPath, gtfPath, outPrefix = args[:4]
-    shadow_cutoff   = float(args[4]) if len(args) > 4 else SHADOW_CUTOFF
-    min_run_nt      = int(args[5])   if len(args) > 5 else MIN_RUN_NT
-    read_len_bin_nt = int(args[6])   if len(args) > 6 else READ_LEN_BIN_NT
-    window_nt       = int(args[7])   if len(args) > 7 else CALL_WINDOW_NT
+    global COLOR_MAP
+    if len(args) < 5:
+        print("Usage: python3 shadowCallSizeQC.py inFileParquet.txt riboBamList.txt "
+              "gtfFile outPrefix colorMapPath [shadow_cutoff] [min_run_nt] "
+              "[read_len_bin_nt] [window_nt]", file=sys.stderr)
+        sys.exit(1)
+
+    inFileParquetPath, riboBamListPath, gtfPath, outPrefix, colorMapPath = args[:5]
+    shadow_cutoff   = float(args[5]) if len(args) > 5 else SHADOW_CUTOFF
+    min_run_nt      = int(args[6])   if len(args) > 6 else MIN_RUN_NT
+    read_len_bin_nt = int(args[7])   if len(args) > 7 else READ_LEN_BIN_NT
+    window_nt       = int(args[8])   if len(args) > 8 else CALL_WINDOW_NT
 
     out_dir = os.path.dirname(outPrefix)
     if out_dir:
@@ -529,6 +584,15 @@ def main(args):
     libs = load_shadow_parquet_list(inFileParquetPath)
     print(f"{len(libs)} librar(ies) in {inFileParquetPath}: {', '.join(sorted(libs))}",
           file=sys.stderr)
+
+    COLOR_MAP = load_color_map(colorMapPath)
+    print(f"Loaded manuscript colors for {len(COLOR_MAP)} library key(s) from "
+          f"{colorMapPath}.", file=sys.stderr)
+    unmatched = [lib for lib in libs if lib not in COLOR_MAP]
+    if unmatched:
+        print(f"  WARNING: no color found in {colorMapPath} for "
+              f"librar{'y' if len(unmatched) == 1 else 'ies'} {unmatched}; "
+              f"falling back to the default palette.", file=sys.stderr)
 
     genes = parse_gtf(gtfPath)
 

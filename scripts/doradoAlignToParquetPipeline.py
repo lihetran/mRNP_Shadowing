@@ -64,13 +64,28 @@ def shard_reads_bam(reads_bam, shard_size, shard_dir):
 
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                   out_bam=None, coding_only=False, chunk_size=50000,
-                  keep_intermediates=False, barcode_summary=None, shard_size=None,
+                  keep_intermediates=True, barcode_summary=None, shard_size=None,
                   splice_aware=False, use_junc_bed=True, max_intron_length=3000,
                   flag_intron_threshold=2500, threads=3):
     """
     Align reads_bam against ref_fasta (dual A->G/T->C pathway), then convert
     the resulting aligned bam straight into parquet chunks under output_dir.
     Returns (aligned_bam_path, total_reads_written).
+
+    keep_intermediates: True by default -- keeps the per-run intermediate
+    bams (aligned_bam itself, plus everything align_reads produces along
+    the way: mutated bams, per-pathway tmp alignments, pre-sort merged
+    bam; in the sharded path, also each shard's raw and aligned bam) instead
+    of deleting them. This is deliberately the default (not opt-in): a
+    parquet's absolute_indices/aligned_pairs are only as trustworthy as the
+    alignment that produced them, and a bam that's already been deleted by
+    the time something downstream looks wrong (e.g. findLUTICandidateReads.py
+    flagging a spurious transcript-spanning read) can't be pulled back up
+    to check its actual CIGAR against what the parquet claims -- exactly
+    what happened chasing down a fabricated-junction false positive this
+    pipeline's --splice_aware path produced. Pass False to restore the old
+    cleanup behavior (e.g. for very large runs where disk space matters more
+    than being able to re-inspect a specific alignment later).
 
     barcode_summary: optional path to a MinKNOW sequencing_summary.txt with a
     barcode_arrangement column (native barcoding kit runs). When given,
@@ -200,8 +215,12 @@ def main():
                         help='Only write reads assigned to protein-coding genes')
     parser.add_argument('--chunk_size', type=int, default=50000,
                         help='Rows per output parquet chunk (default: 50000)')
-    parser.add_argument('--keep_intermediates', action='store_true',
-                        help='Keep per-run intermediate alignment bams instead of deleting them')
+    parser.add_argument('--remove_intermediates', action='store_true',
+                        help='Delete per-run intermediate alignment bams instead of keeping them '
+                             '(the default is to keep them, so a downstream-looking-wrong '
+                             'parquet can be traced back to the exact bam/CIGAR that produced '
+                             'it -- pass this flag to opt back into the old cleanup behavior, '
+                             'e.g. for very large runs where disk space matters more).')
     parser.add_argument('--barcode_summary', default=None,
                         help='Path to a MinKNOW sequencing_summary.txt with a '
                              'barcode_arrangement column (native barcoding kit runs). '
@@ -246,7 +265,7 @@ def main():
     aligned_bam, total = run_pipeline(
         args.reads_bam, args.ref_fasta, args.gtf, args.output_dir,
         out_bam=args.out_bam, coding_only=args.coding_only, chunk_size=args.chunk_size,
-        keep_intermediates=args.keep_intermediates, barcode_summary=args.barcode_summary,
+        keep_intermediates=not args.remove_intermediates, barcode_summary=args.barcode_summary,
         shard_size=args.shard_size, splice_aware=args.splice_aware,
         use_junc_bed=not args.no_junc_bed, max_intron_length=args.max_intron_length,
         flag_intron_threshold=flag_intron_threshold, threads=args.threads)
