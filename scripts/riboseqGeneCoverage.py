@@ -277,6 +277,42 @@ def ribo_coverage_track(bam_paths, gene, target_lengths=TARGET_LENGTHS,
     return depth
 
 
+def ribo_coverage_and_count_track(bam_paths, gene, target_lengths=TARGET_LENGTHS,
+                                  require_sense=True, require_unique=True):
+    """
+    (depth, n_reads) in ONE fetch pass -- depth is the exact same
+    {gpos: depth} ribo_coverage_track returns, n_reads is the plain COUNT
+    of qualifying reads (same filters, same fetch window) that produced
+    it. Exists so a caller that wants BOTH quantities (e.g.
+    shadowCallSizeQC.py's per-gene read-count normalization) doesn't have
+    to fetch the same BAM region twice -- once via ribo_coverage_track,
+    once via count_ribo_reads_per_gene -- to get them; n_reads is NOT the
+    same as sum(depth.values()) (that sum double-, triple-, etc.-counts a
+    read once per position it covers, inflating it by footprint length --
+    n_reads counts each qualifying read exactly once, regardless of how
+    many positions its blocks span).
+    """
+    depth = collections.Counter()
+    n_reads = 0
+    for bam_path in bam_paths:
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            for read in bam.fetch(gene["chrom"], gene["gene_start"], gene["gene_end"]):
+                if read.is_unmapped:
+                    continue
+                if target_lengths is not None and read.query_length not in target_lengths:
+                    continue
+                if require_unique and read.has_tag("NH") and read.get_tag("NH") != 1:
+                    continue
+                read_is_sense = (read.is_reverse == (gene["strand"] == "-"))
+                if require_sense and not read_is_sense:
+                    continue
+                n_reads += 1
+                for block_start, block_end in read.get_blocks():
+                    for gpos in range(block_start, block_end):
+                        depth[gpos] += 1
+    return depth, n_reads
+
+
 def _padded_cds_segments(gene, flank_5p, flank_3p):
     """
     A copy of gene["cds"] with its first/last (in transcript order)

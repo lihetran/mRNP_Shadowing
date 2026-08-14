@@ -20,6 +20,11 @@ Two complementary views:
           RPF/RNA table, one scatter panel per library -- no statistics
           yet, just the raw points -- only produced if a TE file is
           passed (optional 5th CLI arg) AND a phenol library is present.
+  VIEW 10  nt GAP between consecutive shadow RUNS on the same read (P_B>=
+          GAP_CUTOFF, default 0.7) -> "how far apart are shadow calls?" --
+          one step-CDF line per library, raw-pooled across every read with
+          >=2 shadow calls (not gene-weighted, unlike View 1/2's shape
+          aggregates).
 
 Input parquet columns used per read:
   read_id, shadow_gene, absolute_indices, shadow_gpos, shadow_P_B,
@@ -110,6 +115,30 @@ HIS_CENTER_FRAC = 0.5                          # View 8: a His codon counts as "
                                                # (0.5 = middle half of the run) -- scales with
                                                # run length rather than a fixed nt tolerance, so
                                                # a longer run gets proportionally more slack
+GAP_CUTOFF     = 0.7                          # View 10: P_B cutoff shadow runs are called at
+                                               # before measuring the nt gap between consecutive
+                                               # runs on the same read -- same value as
+                                               # FIXED_CUTOFF, kept as its own name since a
+                                               # caller may want to sweep this independently of
+                                               # View 1/His-codon's cutoff later
+GAP_RANGE      = (0, 500)                     # View 10: nt-gap x-axis range for the CDF plot --
+                                               # wider than SIZE_RANGE/SWEEP_RANGE since this is
+                                               # UNPROTECTED space BETWEEN two shadow calls, not
+                                               # a single footprint's own size
+MIN_GAPS_PER_GENE = 0                         # View 10-paired: drop a gene from the gene-matched
+                                               # gap CDF below this many gap observations in ANY
+                                               # library -- 0 (same default as MIN_RUNS_PER_GENE)
+                                               # since this CDF is raw-pooled, not per-gene
+                                               # weighted, so a gene only needs to be PRESENT in
+                                               # every library to be a fair inclusion, not have
+                                               # enough observations to trust its own shape
+TE_RANGE       = (0.75, 2.75)                 # View 3-TE: x-axis (translation efficiency) crop
+                                               # range for the log2FC-vs-TE scatter -- picked to
+                                               # match where the real Weinberg/Bartel TE_score
+                                               # distribution actually sits, not derived from the
+                                               # data itself like x_max used to be, so a gene
+                                               # outside it is a real outlier worth a stderr
+                                               # warning rather than silently rescaling the axis
 PALETTE        = None                         # list of pyx colors, set after import
 COLOR_MAP      = {}                           # {libraryID: "#RRGGBB"}, set in main() if
                                                # a colorMapPath was given -- takes priority
@@ -232,6 +261,69 @@ def extract_shadow_runs(df, probCutOff, N=N_PAD):
             else:
                 i += 1
     return runs
+
+
+def shadow_run_gaps(runs):
+    """
+    View 10: per-read nucleotide GAP between consecutive shadow runs (i.e.
+    the unprotected stretch separating one shadow call from the next along
+    the same read), pooled across every read with >=2 runs.
+
+    runs: output of extract_shadow_runs at a single cutoff (e.g.
+    GAP_CUTOFF) -- runs are grouped by read_id, sorted by gpos_lo (genomic-
+    ascending, strand-safe the same way extract_shadow_runs' own gpos_lo/
+    gpos_hi already are), and the gap between each adjacent PAIR is
+    gpos_lo(next) - gpos_hi(prev) - 1: the count of nt strictly between the
+    two runs' own spans, in the same genomic-nt space extract_shadow_runs
+    uses for "genomic_nt" (not the padded aligned_len window, which pads
+    outward for a different purpose and would double-count real footprint
+    nt as if it were unprotected gap). A read with N runs contributes N-1
+    gaps.
+
+    Returns a list of {"gene", "read_id", "gap"} dicts.
+    """
+    by_read = collections.defaultdict(list)
+    for r in runs:
+        by_read[r["read_id"]].append(r)
+    gaps = []
+    for read_id, read_runs in by_read.items():
+        if len(read_runs) < 2:
+            continue
+        read_runs.sort(key=lambda r: r["gpos_lo"])
+        for a, b in zip(read_runs, read_runs[1:]):
+            gaps.append({"gene": a["gene"], "read_id": read_id,
+                         "gap": b["gpos_lo"] - a["gpos_hi"] - 1})
+    return gaps
+
+
+def read_gap_eligibility(runs, n_reads_total):
+    """
+    View 10-companion: per-library breakdown of how many reads CAN vs
+    CANNOT contribute a gap to shadow_run_gaps' CDF, at whatever cutoff
+    `runs` was extracted with (GAP_CUTOFF) -- a read needs >=2 shadow runs
+    to have even one gap to measure, so a read with 0 or 1 runs is
+    structurally excluded, not filtered out by any gene-pairing or range
+    choice downstream.
+
+    extract_shadow_runs simply omits a read from `runs` entirely once it
+    has zero qualifying runs (there's nothing to append), so the "zero
+    runs" count can't be read off `runs` directly -- it has to be backed
+    out as n_reads_total minus however many DISTINCT read_ids appear in
+    `runs` at all. n_reads_total must come from the same library's full
+    read count (see extract_library_raw's "n_reads_total", not `len(runs)`
+    or anything else derived only from the already-filtered runs list).
+
+    Returns {"n_reads_total", "n_zero_runs", "n_one_run",
+    "n_two_plus_runs"}: n_zero_runs + n_one_run is the read count EXCLUDED
+    from the gap CDF ("reads where we can't make a gap at all");
+    n_two_plus_runs is the read count that actually contributes >=1 gap.
+    """
+    run_counts_by_read = collections.Counter(r["read_id"] for r in runs)
+    n_one_run  = sum(1 for c in run_counts_by_read.values() if c == 1)
+    n_two_plus = sum(1 for c in run_counts_by_read.values() if c >= 2)
+    n_zero_runs = n_reads_total - len(run_counts_by_read)
+    return {"n_reads_total": n_reads_total, "n_zero_runs": n_zero_runs,
+            "n_one_run": n_one_run, "n_two_plus_runs": n_two_plus}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -988,7 +1080,7 @@ def compute_log2fc_vs_reference(rates_by_lib, reference_lib, pseudo=1e-3):
 
 def plot_shadow_log2fc_vs_te(log2fc_by_lib, te_by_gene, pdf_path,
                              ylabel="log2FC of Shadow Calls against Phenol",
-                             xlabel="Translation Efficiency"):
+                             xlabel="Translation Efficiency", x_range=TE_RANGE):
     """
     One pooled PyX scatter -- every library's genes on the SAME panel
     (not one panel per library), colored by _libcolor(libID, i) -- COLOR_MAP's
@@ -1003,6 +1095,22 @@ def plot_shadow_log2fc_vs_te(log2fc_by_lib, te_by_gene, pdf_path,
     Deliberately no statistics yet (no regression line, no correlation
     annotation, no gene-name labels) -- just the raw per-gene points, to
     look at before deciding what (if anything) is worth annotating.
+
+    Square panel, y-axis cropped to [0, max] rather than the symmetric
+    [-max, max] range a diverging log2FC axis would normally get -- on
+    real data every gene here has come out log2FC>=0 (P_B>=cutoff shadow
+    calls only going up relative to phenol, never down), so the bottom
+    half of a symmetric axis was empty space. Any point that DOES land
+    below 0 still gets a stderr warning rather than silently vanishing
+    off the cropped axis (see n_below_zero below).
+
+    x-axis is likewise cropped to a fixed x_range (TE_RANGE) rather than
+    scaled to whatever this call's own TE_score values happen to span --
+    real TE_scores cluster there, so a fixed window makes different calls
+    of this function (different cutoffs, different libraries) directly
+    comparable panel-to-panel. Genes outside x_range get a stderr warning
+    (see n_outside_range below), same "don't silently crop" treatment as
+    n_below_zero.
     """
     if canvas is None:
         print("pyx not available; skipping plot", file=sys.stderr); return
@@ -1025,18 +1133,26 @@ def plot_shadow_log2fc_vs_te(log2fc_by_lib, te_by_gene, pdf_path,
               "TE_score; skipping.", file=sys.stderr)
         return
 
-    x_max = max(all_te) * 1.05
-    y_abs = max(max(abs(v) for v in all_fc), 0.5) * 1.15
+    x_lo, x_hi = x_range
+    y_max = max(max(all_fc), 0.5) * 1.15
+
+    n_below_zero = sum(1 for v in all_fc if v < 0)
+    if n_below_zero:
+        print(f"  WARNING: {n_below_zero}/{len(all_fc)} points have log2FC<0 "
+              f"and will be cropped off this plot's [0, {y_max:.2g}] y-axis",
+              file=sys.stderr)
+
+    n_outside_range = sum(1 for v in all_te if v < x_lo or v > x_hi)
+    if n_outside_range:
+        print(f"  WARNING: {n_outside_range}/{len(all_te)} points have a "
+              f"TE_score outside [{x_lo}, {x_hi}] and will be cropped off "
+              f"this plot's x-axis", file=sys.stderr)
 
     g = graph.graphxy(
-        width=8, height=6, xpos=0, ypos=0,
-        x=graph.axis.linear(min=0, max=x_max, title=xlabel),
-        y=graph.axis.linear(min=-y_abs, max=y_abs, title=ylabel),
+        width=7, height=7, xpos=0, ypos=0,
+        x=graph.axis.linear(min=x_lo, max=x_hi, title=xlabel),
+        y=graph.axis.linear(min=0, max=y_max, title=ylabel),
         key=graph.key.key(pos="tr", hinside=0))
-
-    g.plot(graph.data.function("y(x)=0", min=0, max=x_max),
-           [graph.style.line([color.gray(0.6), style.linewidth.thin,
-                              style.linestyle.dashed])])
 
     for i, lib in enumerate(libIDs):
         genes = genes_by_lib[lib]
@@ -1144,6 +1260,152 @@ def plot_region_density_grouped_bars(region_density_mean, region_density_n, pdf_
     print(f"Wrote region shadow-density barplot to {pdf_path}.pdf", file=sys.stderr)
 
 
+def _ecdf_step_points(values):
+    """
+    Stepped (x, y) points tracing an empirical CDF: a plain PyX line drawn
+    through these renders as a right-continuous step function (flat, then a
+    vertical jump at each observed value), not the diagonal-interpolation a
+    naive (sorted_value, rank/n) line would give.
+    """
+    vals = sorted(values)
+    n = len(vals)
+    pts = [(vals[0], 0.0)]
+    for i, v in enumerate(vals):
+        y = (i + 1) / n
+        pts.append((v, pts[-1][1]))   # flat to the new x at the old y
+        pts.append((v, y))            # then jump to the new y
+    return pts
+
+
+def plot_shadow_gap_cdf(gaps_by_lib, pdf_path, x_range=GAP_RANGE, cutoff=GAP_CUTOFF):
+    """
+    View 10: one panel, one step-CDF line per library (same _libcolor as
+    every other library-colored figure in this module) of the nt GAP
+    between consecutive shadow runs on the same read (see shadow_run_gaps)
+    -- i.e. how much unprotected sequence typically separates one shadow
+    call from the next, not a single shadow's own size (View 1/2's subject).
+
+    Deliberately raw-pooled per library, NOT gene-weighted like
+    _gene_weighted_freq's size histograms -- an empirical CDF is
+    conventionally the pooled distribution of the actual observations, and
+    this is the direct nt-gap counterpart to View 1's raw-count supplement
+    panel (plot_footprint_sizes' ylabel="count" call), not a shape
+    aggregate meant to give every gene an equal vote.
+
+    gaps_by_lib: {libraryID: [gap dicts]} from shadow_run_gaps, each with a
+    "gap" key. Only reads with >=2 shadow runs contribute (a read with a
+    single shadow, or none, has no gap to measure) -- the per-library n in
+    the key is that gap count, not the read or gene count.
+
+    The x-axis is clipped to x_range for readability; the ECDF itself is
+    still computed over the FULL gap list first (see _ecdf_step_points), so
+    a library's curve reaching y<1 at x_range's right edge means real mass
+    beyond the visible window, not a truncated calculation -- the fraction
+    still off-screen is reported to stderr per library rather than silently
+    dropped.
+    """
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
+
+    libIDs = sorted(gaps_by_lib)
+    x_lo, x_hi = x_range
+
+    g = graph.graphxy(
+        width=7, height=7, xpos=0, ypos=0,
+        x=graph.axis.linear(min=x_lo, max=x_hi,
+                            title=r"Gap between consecutive shadow calls (nt, P$_B\geq$%s)" % cutoff),
+        y=graph.axis.linear(min=0, max=1, title="cumulative fraction of gaps"),
+        key=graph.key.key(pos="tr", hinside=0),
+    )
+    c = canvas.canvas()
+    c.insert(g)
+
+    for i, libID in enumerate(libIDs):
+        gaps = [d["gap"] for d in gaps_by_lib[libID]]
+        if not gaps:
+            print(f"  [{libID}] no reads with >=2 shadow calls; skipping its CDF line",
+                  file=sys.stderr)
+            continue
+        frac_beyond = sum(1 for v in gaps if v > x_hi) / len(gaps)
+        print("    %s: n=%d gaps, median=%.0f nt, %.1f%% beyond the %d-nt axis"
+              % (libID, len(gaps), np.median(gaps), 100 * frac_beyond, x_hi), file=sys.stderr)
+        pts = _ecdf_step_points(gaps)
+        col = _libcolor(libID, i)
+        title = r"%s (n=%d, med %.0f nt)" % (libID.replace("_", r"\_"), len(gaps),
+                                             np.median(gaps))
+        g.plot(graph.data.points(pts, x=1, y=2, title=title),
+               [graph.style.line([col, style.linewidth.Thick])])
+
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote shadow-gap CDF plot to {pdf_path}.pdf", file=sys.stderr)
+
+
+def plot_read_gap_exclusion_bars(eligibility_by_lib, pdf_path,
+                                 title="Reads excluded from the shadow-gap CDF"):
+    """
+    View 10-companion: one bar per library (PyX, _libcolor-colored like
+    every other library plot in this module) of the fraction of reads that
+    CANNOT contribute a gap to shadow_run_gaps' CDF -- reads with 0 or 1
+    shadow runs at GAP_CUTOFF, which structurally have no "next" run to
+    measure a distance to (see read_gap_eligibility). This is a data-
+    quality companion to plot_shadow_gap_cdf, not an alternative view of the
+    same measurement: it answers "how much of each library's reads never
+    even get a chance to show up in that CDF," which the CDF itself can't
+    reveal since excluded reads simply aren't there to begin with.
+
+    eligibility_by_lib: {libraryID: {"n_reads_total", "n_zero_runs",
+    "n_one_run", "n_two_plus_runs"}} from read_gap_eligibility. Each bar's
+    height is (n_zero_runs + n_one_run) / n_reads_total -- the zero-run vs
+    one-run split itself isn't drawn on the bar (kept it uncluttered); it's
+    still in main()'s own stderr breakdown for whoever wants the detail.
+    """
+    if canvas is None:
+        print("pyx not available; skipping plot", file=sys.stderr); return
+
+    libIDs = sorted(eligibility_by_lib)
+    n_libs = len(libIDs)
+
+    fractions = {}
+    for lib in libIDs:
+        e = eligibility_by_lib[lib]
+        n_excluded = e["n_zero_runs"] + e["n_one_run"]
+        fractions[lib] = n_excluded / e["n_reads_total"] if e["n_reads_total"] else 0.0
+
+    g = graph.graphxy(
+        width=7, height=7, xpos=0, ypos=0,
+        x=graph.axis.linear(min=0.3, max=n_libs + 0.7, parter=None),
+        y=graph.axis.linear(min=0, max=max(fractions.values(), default=1.0) * 1.25 or 1.0,
+                            title=r"fraction of reads with $<$2 shadow calls"),
+    )
+    c = canvas.canvas()
+    c.insert(g)
+
+    bar_hw = 0.3
+    for i, lib in enumerate(libIDs):
+        xi  = i + 1
+        e   = eligibility_by_lib[lib]
+        col = _libcolor(lib, i)
+        frac = fractions[lib]
+
+        xa, ya = g.pos(xi - bar_hw, 0.0)
+        xb, yb = g.pos(xi + bar_hw, frac)
+        c.fill(path.rect(xa, ya, xb - xa, yb - ya), [col])
+        c.stroke(path.rect(xa, ya, xb - xa, yb - ya), [style.linewidth.thin, color.gray(0.3)])
+
+        xn0, yn0 = g.pos(xi, 0.0)
+        c.text(xn0, yn0 - 0.2, "%s (n=%d)" % (lib.replace("_", r"\_"), e["n_reads_total"]),
+              [pyx_text.halign.right, pyx_text.size.small, trafo.rotate(30)])
+
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.5, title,
+          [pyx_text.halign.center, pyx_text.size.normalsize])
+    c.text(g.xpos + g.width / 2., g.ypos + g.height + 0.2,
+          "(0 or 1 shadow calls -- no \"next\" call to measure a gap to)",
+          [pyx_text.halign.center, pyx_text.size.scriptsize])
+
+    c.writePDFfile(str(pdf_path))
+    print(f"Wrote shadow-gap read-exclusion barplot to {pdf_path}.pdf", file=sys.stderr)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Driver
 # ─────────────────────────────────────────────────────────────────────────
@@ -1181,7 +1443,12 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
     to "site_counts": a qualifying run is an actual footprint-sized
     (>=MIN_RUN_NT nt) protected stretch, not a bare scored site, so this is
     what "shadow rate" means when the site-level rate isn't specific
-    enough (e.g. for View 3-TE's log2FC-vs-TE scatter).}.
+    enough (e.g. for View 3-TE's log2FC-vs-TE scatter), "n_reads_total":
+    total read count for this library (len(df), one row per read) -- the
+    TRUE denominator for View 10-companion's exclusion fractions, since
+    extract_shadow_runs simply omits a read from its output entirely if
+    that read has zero qualifying runs, so nothing else returned here
+    counts reads that never appear in any runs_by_cut entry at all.}.
     """
     print("Loading %s (%s)..." % (parquetFile, libraryID), file=sys.stderr)
     df = pd.read_parquet(parquetFile)          # native columns, no JSON decode
@@ -1221,7 +1488,8 @@ def extract_library_raw(parquetFile, libraryID, his_gpos_by_gene):
             "region_run_counts": region_run_counts,
             "genes_observed": genes_observed,
             "his_centered_run_counts": his_centered_run_counts,
-            "run_rate_counts": run_rate_counts}
+            "run_rate_counts": run_rate_counts,
+            "n_reads_total": len(df)}
 
 
 def main(args):
@@ -1447,6 +1715,52 @@ def main(args):
             print("    %s shadow density (%s): %d genes, mean=%.6g"
                   % (region, lib, len(vals), region_density_mean[region][lib]), file=sys.stderr)
 
+    # ---- View 10: nt gap between consecutive shadow calls on the same read ----
+    # Reuses the GAP_CUTOFF (== FIXED_CUTOFF) runs already extracted per
+    # library above (runs_by_cut), so no re-extraction is needed here -- just
+    # the per-read consecutive-run gap (see shadow_run_gaps). Not gene-paired
+    # (unlike Views 3/5/6/8): every read with >=2 shadow calls in a library
+    # contributes, library-pooled, same "raw pooled" philosophy as View
+    # 1-supplement's counts panel.
+    gaps_by_lib = {lib: shadow_run_gaps(raw_by_lib[lib]["runs_by_cut"][GAP_CUTOFF])
+                   for lib in libIDs}
+
+    # ---- View 10-paired: same nt-gap CDF, restricted to genes common to all
+    # libraries -- the raw-pooled CDF above isn't gene-matched, so a library
+    # whose reads happen to cover a different set of genes could shift its
+    # curve purely from WHICH genes it includes, not a real difference in
+    # spacing (the same confound _common_genes exists to rule out for every
+    # other cross-library comparison in this module, e.g. View 1/3/5/6/8).
+    gap_counts_by_lib = {lib: _count_by_gene(gaps_by_lib[lib]) for lib in libIDs}
+    common_gap_genes = _common_genes(gap_counts_by_lib, MIN_GAPS_PER_GENE)
+    print("    shadow-gap CDF: %d genes common to all %d libraries (>=%d gap "
+          "observations each)" % (len(common_gap_genes), len(libIDs), MIN_GAPS_PER_GENE),
+          file=sys.stderr)
+    gaps_by_lib_paired = {
+        lib: [d for d in gaps_by_lib[lib] if d["gene"] in common_gap_genes]
+        for lib in libIDs
+    }
+
+    # ---- View 10-companion: reads excluded from the gap CDF entirely ----
+    # A read needs >=2 shadow runs at GAP_CUTOFF to contribute even one gap;
+    # this reports, per library, what fraction of ALL reads (n_reads_total,
+    # not just the ones that made it into runs_by_cut) never clear that bar
+    # -- see read_gap_eligibility for why "zero runs" can't be counted
+    # directly off runs_by_cut.
+    eligibility_by_lib = {
+        lib: read_gap_eligibility(raw_by_lib[lib]["runs_by_cut"][GAP_CUTOFF],
+                                  raw_by_lib[lib]["n_reads_total"])
+        for lib in libIDs
+    }
+    for lib in libIDs:
+        e = eligibility_by_lib[lib]
+        n_excluded = e["n_zero_runs"] + e["n_one_run"]
+        print("    %s: %d/%d reads (%.1f%%) excluded from the gap CDF "
+              "(%d zero-run, %d one-run, %d contribute >=1 gap)"
+              % (lib, n_excluded, e["n_reads_total"],
+                 100 * n_excluded / e["n_reads_total"] if e["n_reads_total"] else 0.0,
+                 e["n_zero_runs"], e["n_one_run"], e["n_two_plus_runs"]), file=sys.stderr)
+
     print("Plotting combined figures across %d libraries..." % len(libIDs), file=sys.stderr)
     # View 1: footprint size, multi-panel over cutoffs (per-gene-then-aggregated freq)
     plot_footprint_sizes(dict(unmerged_by_cut), fp_edges,
@@ -1506,6 +1820,17 @@ def main(args):
                                      "%s.shadow_density_by_region" % outPrefix,
                                      libIDs, region_names=REGION_NAMES,
                                      ylabel="mean shadows / nt / read")
+    # View 10: nt gap between consecutive shadow calls, one step-CDF line per
+    # library, pooled across all reads with >=2 shadow calls (P_B>=GAP_CUTOFF).
+    plot_shadow_gap_cdf(gaps_by_lib, "%s.shadow_gap_cdf" % outPrefix)
+    # View 10-paired: same nt-gap CDF, restricted to genes common to all
+    # libraries -- an apples-to-apples comparison of the SAME genes' spacing
+    # across libraries, rather than whichever genes each library happens to
+    # have shadow calls from.
+    plot_shadow_gap_cdf(gaps_by_lib_paired, "%s.shadow_gap_cdf_paired" % outPrefix)
+    # View 10-companion: fraction of reads excluded from the gap CDF entirely
+    # (0 or 1 shadow calls, no "next" call to measure a distance to).
+    plot_read_gap_exclusion_bars(eligibility_by_lib, "%s.shadow_gap_read_exclusion" % outPrefix)
 
 
 if __name__ == "__main__":

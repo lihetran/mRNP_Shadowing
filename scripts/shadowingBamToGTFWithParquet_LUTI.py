@@ -29,14 +29,22 @@ confirmatory rescue only where warranted):
   2. luti_rescue_hit / luti_rescue_other_transcript_ids -- only attempted
      for reads whose clip5_len clears --min_clip_len (default 50nt;
      shorter fragments are unlikely to seed reliably in minimap2's
-     minimizer index regardless). For those, clip5_seq is realigned
-     against the whole genome with mappy (preset=map-ont) and the hit is
-     checked against the same CDS+/-100nt position map
-     (metaStartStop.parseGTF) findSpannedTranscripts uses, requiring the
-     entire rescued fragment to land upstream of the read's own aligned
-     body (read_start/read_end) -- i.e. the same signature
-     findSpannedTranscripts looks for, recovered here for reads where
-     minimap2 clipped it away instead of chaining through it.
+     minimizer index regardless). For those, clip5_seq is realigned in the
+     same 3nt-space (A->G/T->C mutated-reference) scheme as the rest of
+     this pipeline's alignment step -- see doradoAligner_AtoG.py's module
+     docstring -- rather than against the plain genome: the clipped leader
+     is genuine transcript sequence and may itself carry real editing, so
+     aligning it against an unmutated reference risks the exact
+     false-negative-from-real-edits problem that dual-pathway scheme
+     exists to avoid. mutate_clip_for_rescue prepares the query and picks
+     the matching pathway/aligner (A->G-mutated reference for a '+' gene,
+     T->C-mutated for a '-' gene); the hit is then checked against the
+     same CDS+/-100nt position map (metaStartStop.parseGTF)
+     findSpannedTranscripts uses, requiring the entire rescued fragment to
+     land upstream of the read's own aligned body (read_start/read_end)
+     -- i.e. the same signature findSpannedTranscripts looks for,
+     recovered here for reads where minimap2 clipped it away instead of
+     chaining through it.
 
 First-pass filter, not an exhaustive one: very short or highly divergent
 leaders may still fail to seed even with rescue; hard-clipped bases aren't
@@ -61,6 +69,7 @@ from shadowingBamToParquetWithGTF2 import (
     build_strand_index, get_transcript_info, build_barcode_lookup,
     reverse_complement_str, optimize_dataframe, write_chunk,
 )
+from doradoAligner_AtoG import mutateFastaAG, mutateFastaTC, replaceCharacter
 
 
 def get_clip5_info(read, is_reverse):
@@ -84,33 +93,59 @@ def get_clip5_info(read, is_reverse):
     return clip_len, clip_seq
 
 
-def rescue_upstream_hit(clip_seq, gene_strand, chrom, transcript_id,
-                         read_start, read_end, aligner, gtf_dict, min_mapq):
-    '''Realign a clipped 5' leader (already sense-oriented per
-    get_clip5_info) against the genome and check whether it lands, in its
-    entirety, upstream of the read's own aligned body (read_start/
-    read_end) and inside a *different* transcript's CDS+/-100nt region per
-    gtf_dict (metaStartStop.parseGTF format: {strand:{chr:{absIdx:
-    [(txtID,relStart,relStop)]}}}) -- the same signature
-    findLUTICandidateReads.findSpannedTranscripts requires from an
-    aligned-through read.
+def mutate_clip_for_rescue(clip_seq, gene_strand):
+    '''Prepare clip_seq (sense-oriented 5'->3', per get_clip5_info) for 3nt-
+    space rescue realignment, mirroring doradoAligner_AtoG.py's dual-pathway
+    convention (see its module docstring): a '+' gene's sense sequence
+    already reads forward along the plus-strand genome, so it's A->G
+    mutated as-is for the AG pathway. A '-' gene's sense sequence reads
+    5'->3' along *decreasing* plus-strand coordinate, so it's first
+    reverse-complemented back to plus-strand-forward orientation (the same
+    "raw, not sense-flipped" orientation mutateBamAntisenseTC mutates),
+    then T->C mutated for the TC pathway.
 
-    Expected hit.strand is +1 for a '+' gene_strand and -1 for a '-'
-    gene_strand, since clip_seq was already reverse-complemented to sense
-    for minus-strand genes; a hit in the other orientation is treated as a
-    spurious/opposite-strand match and discarded, same caution this
-    project already applies elsewhere to unconstrained minimap2 hits (see
-    doradoAligner_AtoG.py's -G3000 fix).
+    Both pathways are constructed to produce a *forward* match against
+    their respective mutated reference regardless of gene_strand -- that's
+    the entire point of mutating two references instead of one -- so a
+    correct hit should always come back with hit.strand == 1, never -1.
+
+    Returns (mutated_seq, pathway) where pathway is 'ag' or 'tc', selecting
+    which mutated-reference aligner to use.'''
+    if gene_strand == '+':
+        mutated_seq, _ = replaceCharacter(clip_seq, 'A', 'G')
+        return mutated_seq, 'ag'
+    else:
+        forward_oriented_seq = reverse_complement_str(clip_seq)
+        mutated_seq, _ = replaceCharacter(forward_oriented_seq, 'T', 'C')
+        return mutated_seq, 'tc'
+
+
+def rescue_upstream_hit(clip_seq, gene_strand, chrom, transcript_id,
+                         read_start, read_end, ag_aligner, tc_aligner, gtf_dict, min_mapq):
+    '''Realign a clipped 5' leader (already sense-oriented per
+    get_clip5_info) in 3nt-space -- see mutate_clip_for_rescue -- and check
+    whether it lands, in its entirety, upstream of the read's own aligned
+    body (read_start/read_end) and inside a *different* transcript's
+    CDS+/-100nt region per gtf_dict (metaStartStop.parseGTF format:
+    {strand:{chr:{absIdx:[(txtID,relStart,relStop)]}}}) -- the same
+    signature findLUTICandidateReads.findSpannedTranscripts requires from
+    an aligned-through read.
+
+    A hit in the "wrong" orientation (hit.strand != 1) is treated as
+    spurious and discarded, same caution this project already applies
+    elsewhere to unconstrained minimap2 hits (see doradoAligner_AtoG.py's
+    -G3000 fix).
 
     Returns (other_transcript_ids: set, hit_start, hit_end); empty set and
     None, None if no qualifying hit.'''
-    expected_strand = 1 if gene_strand == '+' else -1
+    mutated_seq, pathway = mutate_clip_for_rescue(clip_seq, gene_strand)
+    aligner = ag_aligner if pathway == 'ag' else tc_aligner
 
     best_hit = None
-    for hit in aligner.map(clip_seq):
+    for hit in aligner.map(mutated_seq):
         if not hit.is_primary or hit.mapq < min_mapq:
             continue
-        if hit.ctg != chrom or hit.strand != expected_strand:
+        if hit.ctg != chrom or hit.strand != 1:
             continue
         if best_hit is None or hit.mlen > best_hit.mlen:
             best_hit = hit
@@ -137,7 +172,7 @@ def rescue_upstream_hit(clip_seq, gene_strand, chrom, transcript_id,
     return other_ids, best_hit.r_st, best_hit.r_en
 
 
-def read_generator(bam_path, chrom, strand_index, gtf_dict, aligner,
+def read_generator(bam_path, chrom, strand_index, gtf_dict, ag_aligner, tc_aligner,
                     min_clip_len=50, min_rescue_mapq=1, coding_only=False,
                     barcode_lookup=None):
     '''Yield one read dict at a time for chrom. barcode_lookup: optional
@@ -155,7 +190,15 @@ def read_generator(bam_path, chrom, strand_index, gtf_dict, aligner,
             read_start = read.reference_start
             read_end   = read.reference_end
 
-            absolute_indices = [p[1] for p in read.get_aligned_pairs()]
+            # list, not tuple: pyarrow can serialize a list-of-lists with None
+            # gaps (from indels) as list<list<int64>>, but chokes on a
+            # list-of-tuples with the same None gaps -- same reasoning as
+            # shadowingBamToParquetWithGTF2.py. Never flipped for minus-strand
+            # reads (stays in CIGAR/genomic order) -- findLUTICandidateReads.py's
+            # realMatchPositions expects that same convention to detect
+            # unbroken matched runs.
+            aligned_pairs    = [list(p) for p in read.get_aligned_pairs()]
+            absolute_indices = [p[1] for p in aligned_pairs]
 
             gene_strand, transcript_id, gene_name, gene_biotype = get_transcript_info(
                 strand_index, chrom, read_start, read_end, read.is_reverse
@@ -181,7 +224,7 @@ def read_generator(bam_path, chrom, strand_index, gtf_dict, aligner,
                 luti_rescue_attempted = True
                 other_ids, hit_start, hit_end = rescue_upstream_hit(
                     clip5_seq, gene_strand, chrom, transcript_id,
-                    read_start, read_end, aligner, gtf_dict, min_rescue_mapq
+                    read_start, read_end, ag_aligner, tc_aligner, gtf_dict, min_rescue_mapq
                 )
                 if other_ids:
                     luti_rescue_hit = True
@@ -201,6 +244,7 @@ def read_generator(bam_path, chrom, strand_index, gtf_dict, aligner,
                 'bar_seq':                            bar_seq,
                 'barcode_arrangement':                (barcode_lookup.get(read.query_name, 'unclassified')
                                                         if barcode_lookup is not None else None),
+                'aligned_pairs':                      aligned_pairs,
                 'absolute_indices':                   absolute_indices,
                 'clip5_len':                          clip5_len,
                 'clip5_seq':                          clip5_seq,
@@ -235,10 +279,19 @@ def generate_parquet(bam_file, ref_fasta, output_dir, gtf_file,
     print(f"Building CDS position map from {gtf_file} (for upstream-overlap checks)...")
     gtf_dict = metaStartStop.parseGTF(gtf_file)
 
-    print(f"Indexing {ref_fasta} for rescue realignment (mappy, preset=map-ont)...")
-    aligner = mp.Aligner(str(ref_fasta), preset='map-ont')
-    if not aligner:
-        raise RuntimeError(f"Failed to build mappy index from {ref_fasta}")
+    print(f"Building/loading A->G and T->C mutated references next to {ref_fasta} "
+          f"(3nt-space rescue realignment, same convention as doradoAligner_AtoG.py)...")
+    mutated_ag_fasta = mutateFastaAG(ref_fasta)
+    mutated_tc_fasta = mutateFastaTC(ref_fasta)
+
+    print(f"Indexing {mutated_ag_fasta} and {mutated_tc_fasta} for rescue realignment "
+          f"(mappy, preset=map-ont)...")
+    ag_aligner = mp.Aligner(str(mutated_ag_fasta), preset='map-ont')
+    tc_aligner = mp.Aligner(str(mutated_tc_fasta), preset='map-ont')
+    if not ag_aligner:
+        raise RuntimeError(f"Failed to build mappy index from {mutated_ag_fasta}")
+    if not tc_aligner:
+        raise RuntimeError(f"Failed to build mappy index from {mutated_tc_fasta}")
 
     with pysam.AlignmentFile(str(bam_file), 'rb') as bam:
         chroms = list(bam.references)
@@ -264,7 +317,8 @@ def generate_parquet(bam_file, ref_fasta, output_dir, gtf_file,
         print(f"Processing chromosome {chrom}...")
         chrom_total = 0
 
-        for record in read_generator(bam_file, chrom, strand_index, gtf_dict, aligner,
+        for record in read_generator(bam_file, chrom, strand_index, gtf_dict,
+                                      ag_aligner, tc_aligner,
                                       min_clip_len=min_clip_len, min_rescue_mapq=min_rescue_mapq,
                                       coding_only=coding_only, barcode_lookup=barcode_lookup):
             key = record['barcode_arrangement'] if barcode_lookup is not None else None
@@ -301,7 +355,10 @@ def main():
     )
     parser.add_argument("bam_file",   type=str, help="Input aligned BAM file")
     parser.add_argument("ref_fasta",  type=str,
-                        help="Reference genome FASTA (same one used for the original alignment)")
+                        help="Reference genome FASTA (same one used for the original alignment). "
+                             "Its A->G/T->C mutated counterparts (built by doradoAligner_AtoG.py's "
+                             "mutateFastaAG/mutateFastaTC, cached next to it) are used for rescue "
+                             "realignment; they're built here if missing/stale.")
     parser.add_argument("output_dir", type=str, help="Output directory for parquet chunks")
     parser.add_argument("--gtf", type=str, required=True,
                         help="GTF annotation file (for strand/transcript assignment and the CDS "

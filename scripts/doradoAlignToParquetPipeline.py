@@ -20,6 +20,7 @@ Usage:
   run_pipeline(reads_bam="...", ref_fasta="...", gtf="...", output_dir="...")
 """
 import argparse
+import subprocess
 import pysam
 from pathlib import Path
 
@@ -62,6 +63,19 @@ def shard_reads_bam(reads_bam, shard_size, shard_dir):
             yield shard_path
 
 
+def merge_shard_bams(shard_aligned_bams, merged_bam):
+    """
+    Merge a list of per-shard sorted+indexed aligned bams (as produced by
+    doradoAligner_AtoG.align_reads, one per shard) into one sorted+indexed
+    bam at merged_bam via `samtools merge`. Returns merged_bam.
+    """
+    cmd = 'samtools merge -f {} {}'.format(merged_bam, ' '.join(shard_aligned_bams))
+    print(cmd)
+    subprocess.call(cmd, shell=True)
+    subprocess.call('samtools index {}'.format(merged_bam), shell=True)
+    return merged_bam
+
+
 def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                   out_bam=None, coding_only=False, chunk_size=50000,
                   keep_intermediates=True, barcode_summary=None, shard_size=None,
@@ -72,20 +86,27 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
     the resulting aligned bam straight into parquet chunks under output_dir.
     Returns (aligned_bam_path, total_reads_written).
 
-    keep_intermediates: True by default -- keeps the per-run intermediate
-    bams (aligned_bam itself, plus everything align_reads produces along
-    the way: mutated bams, per-pathway tmp alignments, pre-sort merged
-    bam; in the sharded path, also each shard's raw and aligned bam) instead
-    of deleting them. This is deliberately the default (not opt-in): a
-    parquet's absolute_indices/aligned_pairs are only as trustworthy as the
-    alignment that produced them, and a bam that's already been deleted by
-    the time something downstream looks wrong (e.g. findLUTICandidateReads.py
-    flagging a spurious transcript-spanning read) can't be pulled back up
-    to check its actual CIGAR against what the parquet claims -- exactly
-    what happened chasing down a fabricated-junction false positive this
-    pipeline's --splice_aware path produced. Pass False to restore the old
-    cleanup behavior (e.g. for very large runs where disk space matters more
-    than being able to re-inspect a specific alignment later).
+    keep_intermediates: True by default -- keeps align_reads' own per-run
+    intermediates (mutated bams, per-pathway tmp alignments, pre-sort merged
+    bam) instead of deleting them. This is deliberately the default (not
+    opt-in): a parquet's absolute_indices/aligned_pairs are only as
+    trustworthy as the alignment that produced them, and a bam that's
+    already been deleted by the time something downstream looks wrong (e.g.
+    findLUTICandidateReads.py flagging a spurious transcript-spanning read)
+    can't be pulled back up to check its actual CIGAR against what the
+    parquet claims -- exactly what happened chasing down a
+    fabricated-junction false positive this pipeline's --splice_aware path
+    produced. Pass False to restore the old cleanup behavior for these (e.g.
+    for very large runs where disk space matters more than being able to
+    re-inspect a specific alignment later).
+
+    In the sharded path specifically, aligned_bam itself is never kept
+    per-shard regardless of this flag: every shard's aligned bam is always
+    merged into one combined, sorted+indexed bam at out_bam (see
+    merge_shard_bams) once all shards are done, and the now-redundant
+    per-shard raw and aligned bams are always deleted right after -- one bam
+    to check instead of hunting through N shard bams is the whole point of
+    keeping an aligned bam around in the first place.
 
     barcode_summary: optional path to a MinKNOW sequencing_summary.txt with a
     barcode_arrangement column (native barcoding kit runs). When given,
@@ -168,7 +189,8 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
 
     shard_dir = output_dir / f"{Path(reads_bam).stem}_shards"
     total = 0
-    last_aligned_bam = None
+    shard_paths = []
+    shard_aligned_bams = []
 
     for i, shard_path in enumerate(shard_reads_bam(reads_bam, shard_size, shard_dir)):
         print(f"\n=== Shard {i}: {shard_path} ===")
@@ -186,18 +208,31 @@ def run_pipeline(reads_bam, ref_fasta, gtf, output_dir,
                                         coding_only=coding_only, chunk_size=chunk_size,
                                         barcode_lookup=barcode_lookup)
         total += shard_total
-        last_aligned_bam = aligned_bam
+        shard_paths.append(shard_path)
+        shard_aligned_bams.append(aligned_bam)
         print(f"  Shard {i} done: {shard_total} reads (running total: {total})")
 
-        if not keep_intermediates:
-            for p in (shard_path, Path(aligned_bam), Path(str(aligned_bam) + ".bai")):
-                if p.exists():
-                    p.unlink()
+    # Concatenate every shard's aligned bam into one combined, sorted+indexed
+    # bam -- the same final path the non-sharded path above would have used
+    # -- then clean up the now-redundant per-shard raw and aligned bams.
+    # This always happens (independent of keep_intermediates, which only
+    # controls align_reads' own internal per-shard intermediates above):
+    # the merged bam is the one artifact worth keeping around afterward,
+    # and having to hunt through N per-shard bams instead of one defeats
+    # the point of keeping intermediates in the first place.
+    if out_bam is None:
+        out_bam = str(output_dir / f"{Path(reads_bam).stem}_aligned.bam")
+    print(f"\n=== Merging {len(shard_aligned_bams)} shard bam(s) into {out_bam} ===")
+    merged_bam = merge_shard_bams(shard_aligned_bams, out_bam)
 
-    if not keep_intermediates and shard_dir.exists() and not any(shard_dir.iterdir()):
+    for p in shard_paths + shard_aligned_bams:
+        for path in (Path(p), Path(str(p) + ".bai")):
+            if path.exists():
+                path.unlink()
+    if shard_dir.exists() and not any(shard_dir.iterdir()):
         shard_dir.rmdir()
 
-    return last_aligned_bam, total
+    return merged_bam, total
 
 
 def main():
