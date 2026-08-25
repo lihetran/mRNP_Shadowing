@@ -19,6 +19,14 @@ Usage:
       --output output_prefix \
       [--min_a_positions 10] \
       [--gene_biotype protein_coding]
+
+  # Or, to load an arbitrary number of libraries (with replicates combined
+  # per sample) from a tab-separated file like
+  # /data16/liam/working/260810_Figures/inFileParquet.txt:
+  #   sample_name<TAB>rep<TAB>parquet_dir
+  python3 editingEfficiencyFromParquet.py \
+      --in_file inFileParquet.txt \
+      --output output_prefix
 '''
 
 import argparse
@@ -69,6 +77,21 @@ def lookup_color(color_map: dict, label: str):
     return color_map.get(label)
 
 
+_TEX_SPECIAL = {
+    "\\": r"\textbackslash{}",
+    "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#",
+    "_": r"\_", "{": r"\{", "}": r"\}",
+    "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+}
+
+
+def tex_escape(s: str) -> str:
+    """Escape LaTeX special characters (e.g. '_' in '+3AT_rep1') so pyx's
+    TeX text engine doesn't choke on library labels pulled from --in_file
+    or --label1/2/3."""
+    return "".join(_TEX_SPECIAL.get(ch, ch) for ch in str(s))
+
+
 def hex_to_pyx_color(hexcol: str):
     from pyx import color
     hexcol = hexcol.lstrip("#")
@@ -84,6 +107,35 @@ def resolve_color(hexcol, fallback_cmyk: tuple):
     if hexcol:
         return hex_to_pyx_color(hexcol)
     return color.cmyk(*fallback_cmyk)
+
+
+def load_infile_libraries(path: str) -> list:
+    """
+    Parse a tab-separated file listing parquet directories, formatted like
+    /data16/liam/working/260810_Figures/inFileParquet.txt:
+        sample_name    rep    parquet_dir
+
+    Each row is kept as its own library (labeled "sample_name_rep") so that
+    replicates are plotted as separate curves rather than combined. Returns
+    an ordered list of (label, [parquet_dir]) tuples in file order.
+    """
+    libs = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 3:
+                continue
+            name         = fields[0].strip()
+            rep          = fields[1].strip()
+            parquet_path = fields[2].strip()
+            if not name or not parquet_path:
+                continue
+            label = f"{name}_{rep}" if rep else name
+            libs.append((label, [parquet_path]))
+    return libs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +154,16 @@ def load_parquet_chunks(parquet_dir: str) -> pd.DataFrame:
     print(f"  Loaded {len(df):,} reads from {len(chunks)} chunk(s).",
           file=sys.stderr)
     return df
+
+
+def load_parquet_chunks_multi(parquet_dirs: list) -> pd.DataFrame:
+    """Load and concatenate parquet chunks across one or more directories
+    (e.g. multiple replicates of the same library)."""
+    dfs = [load_parquet_chunks(d) for d in parquet_dirs]
+    dfs = [d for d in dfs if not d.empty]
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +309,7 @@ def plot_cdf_pyx(libraries: list, output_prefix: str):
     from pyx import canvas, graph, color, style, path, text as pyx_text
 
     panel_w = 8
-    panel_h = 6
+    panel_h = 8
     leg_lw  = 0.8
     leg_dy  = 0.6
 
@@ -269,7 +331,7 @@ def plot_cdf_pyx(libraries: list, output_prefix: str):
         cdf = np.arange(1, len(sf) + 1) / len(sf)
         g.plot(
             graph.data.points(list(zip(sf.tolist(), cdf.tolist())), x=1, y=2),
-            [graph.style.line([col, style.linewidth.normal,
+            [graph.style.line([col, style.linewidth.Thick,
                                style.linestyle.solid])]
         )
 
@@ -286,16 +348,16 @@ def plot_cdf_pyx(libraries: list, output_prefix: str):
     for j, (eff, col, label, stats, numAs) in enumerate(libraries):
         ly = leg_y_top - j * leg_dy
         c.stroke(path.line(leg_x, ly, leg_x + leg_lw, ly),
-                 [col, style.linewidth.normal, style.linestyle.solid])
+                 [col, style.linewidth.Thick, style.linestyle.solid])
         n      = int(stats.get("n_reads", 0))
         median = float(stats.get("median", float("nan")))
         c.text(leg_x + leg_lw + 0.15, ly,
-               f"{label}  (n={n:,}, med={median:.4f})",
+               f"{tex_escape(label)}  (n={n:,}, med={median:.4f})",
                [pyx_text.valign.middle, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_editing_efficiency_cdf_pyx"
-    c.writePDFfile(plot_path)
-    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
+    c.writeSVGfile(plot_path)
+    print(f"  Saved -> {plot_path}.svg", file=sys.stderr)
 
 def plot_numA_cdf_pyx(libraries: list, output_prefix: str):
     """
@@ -305,7 +367,7 @@ def plot_numA_cdf_pyx(libraries: list, output_prefix: str):
     from pyx import canvas, graph, color, style, path, text as pyx_text
 
     panel_w = 8
-    panel_h = 6
+    panel_h = 8
     leg_lw  = 0.8
     leg_dy  = 0.6
 
@@ -327,7 +389,7 @@ def plot_numA_cdf_pyx(libraries: list, output_prefix: str):
         cdf = np.arange(1, len(sf) + 1) / len(sf)
         g.plot(
             graph.data.points(list(zip(sf.tolist(), cdf.tolist())), x=1, y=2),
-            [graph.style.line([col, style.linewidth.normal,
+            [graph.style.line([col, style.linewidth.Thick,
                                style.linestyle.solid])]
         )
 
@@ -344,16 +406,16 @@ def plot_numA_cdf_pyx(libraries: list, output_prefix: str):
     for j, (eff, col, label, stats, numAs) in enumerate(libraries):
         ly = leg_y_top - j * leg_dy
         c.stroke(path.line(leg_x, ly, leg_x + leg_lw, ly),
-                 [col, style.linewidth.normal, style.linestyle.solid])
+                 [col, style.linewidth.Thick, style.linestyle.solid])
         n      = int(stats.get("n_reads", 0))
         # median = float(stats.get("median", float("nan")))
         c.text(leg_x + leg_lw + 0.15, ly,
-               f"{label}  (n={n:,})",
+               f"{tex_escape(label)}  (n={n:,})",
                [pyx_text.valign.middle, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_numA_cdf_pyx"
-    c.writePDFfile(plot_path)
-    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
+    c.writeSVGfile(plot_path)
+    print(f"  Saved -> {plot_path}.svg", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,12 +501,12 @@ def plot_context_barplot_pyx(context_results: list, output_prefix: str):
         c.fill(path.rect(leg_x, ly - 0.12, leg_lw, 0.24), [col])
         c.stroke(path.rect(leg_x, ly - 0.12, leg_lw, 0.24),
                  [style.linewidth.thin, color.gray(0.3)])
-        c.text(leg_x + leg_lw + 0.15, ly, label,
+        c.text(leg_x + leg_lw + 0.15, ly, tex_escape(label),
                [pyx_text.valign.middle, pyx_text.size.small])
 
     plot_path = f"{output_prefix}_context_editing_barplot_pyx"
-    c.writePDFfile(plot_path)
-    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
+    c.writeSVGfile(plot_path)
+    print(f"  Saved -> {plot_path}.svg", file=sys.stderr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,7 +517,13 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Per-read editing efficiency CDF from parquet files."
     )
-    p.add_argument("--parquet1",        required=True,
+    p.add_argument("--in_file",         default=None,
+                   help="Tab-separated file listing libraries: "
+                        "sample_name<TAB>rep<TAB>parquet_dir per line "
+                        "(e.g. inFileParquet.txt). Rows sharing a "
+                        "sample_name (multiple reps) are combined into one "
+                        "library. Takes precedence over --parquet1/2/3.")
+    p.add_argument("--parquet1",        default=None,
                    help="Parquet directory for library 1")
     p.add_argument("--label1",          default="Library1")
     p.add_argument("--parquet2",        default=None,
@@ -475,8 +543,11 @@ def parse_args():
                         "color (columns: name, rep, path, hex_color, no '#'). "
                         "Colors for --label1/--label2/--label3 are looked up "
                         "as 'name_rep' or bare 'name'; unmatched labels fall "
-                        "back to the default black/blue/red scheme.")
-    return p.parse_args()
+                        "back to the default color scheme.")
+    args = p.parse_args()
+    if not args.in_file and not args.parquet1:
+        p.error("must specify either --in_file or --parquet1")
+    return args
 
 
 def main():
@@ -487,35 +558,53 @@ def main():
     print("=== Per-read Editing Efficiency from Parquet ===", file=sys.stderr)
 
     # Default CMYK colours — one per library, used when a label has no
-    # entry in --color_map (or no --color_map was given).
+    # entry in --color_map (or no --color_map was given). Cycles if there
+    # are more libraries than default colors (e.g. many samples via
+    # --in_file).
     default_cmyk = [
         (0, 0, 0, 1),        # black
         (1, 0.5, 0, 0),      # blue
         (0, 1, 1, 0),        # red
+        (1, 0, 1, 0),        # green
+        (0, 0.6, 1, 0),      # orange
+        (1, 1, 0, 0),        # purple
     ]
 
     color_map = load_color_map(args.color_map) if args.color_map else {}
+
+    if args.in_file:
+        infile_libs = load_infile_libraries(args.in_file)
+        if not infile_libs:
+            sys.exit(f"ERROR: no libraries found in {args.in_file}")
+        tasks = [(name, paths) for name, paths in infile_libs]
+        if len(tasks) > len(default_cmyk):
+            print(f"  WARNING: {len(tasks)} libraries but only "
+                  f"{len(default_cmyk)} default colors; colors will repeat "
+                  f"for labels not in --color_map.", file=sys.stderr)
+    else:
+        tasks = [(args.label1, [args.parquet1])]
+        if args.parquet2:
+            tasks.append((args.label2, [args.parquet2]))
+        if args.parquet3:
+            tasks.append((args.label3, [args.parquet3]))
 
     libraries_data = []
     all_stats      = []
     context_data   = []
     context_rows   = []
 
-    for idx, (parquet_dir, label, fallback_cmyk) in enumerate([
-        (args.parquet1, args.label1, default_cmyk[0]),
-        (args.parquet2, args.label2, default_cmyk[1]),
-        (args.parquet3, args.label3, default_cmyk[2]),
-    ]):
-        if parquet_dir is None:
-            continue
+    for idx, (label, parquet_dirs) in enumerate(tasks):
         lbl = label if label is not None else f"Library{idx+1}"
+        fallback_cmyk = default_cmyk[idx % len(default_cmyk)]
         hexcol = lookup_color(color_map, lbl)
         if args.color_map and hexcol is None:
             print(f"  WARNING: no color found for label '{lbl}' in "
                   f"{args.color_map}; using default.", file=sys.stderr)
         col = resolve_color(hexcol, fallback_cmyk)
-        print(f"\nLoading {lbl}...", file=sys.stderr)
-        df  = load_parquet_chunks(parquet_dir)
+        print(f"\nLoading {lbl} ({len(parquet_dirs)} "
+              f"{'rep' if len(parquet_dirs) == 1 else 'reps'})...",
+              file=sys.stderr)
+        df  = load_parquet_chunks_multi(parquet_dirs)
         eff, stats, numAs = summarise(df, lbl, args.min_a_positions,
                                 args.gene_biotype)
         libraries_data.append((eff, col, lbl, stats, numAs))

@@ -45,6 +45,7 @@ from logJosh import Tee
 
 
 HIS_CODONS = {"CAT", "CAC"}
+ACGT_BASES = set("ACGT")
 
 PALETTE   = [None]   # list of pyx colors, set in main() after pyx import
 COLOR_MAP = {}        # {libraryID: "#RRGGBB"}, set in main() if --color_map given
@@ -208,10 +209,48 @@ def find_his_positions(ref_fasta: pysam.FastaFile,
 def _attach_win_seqs(ref_fasta: pysam.FastaFile, sites: list) -> None:
     """Fetch each site's window sequence once, up front -- shared across
     every parquet chunk AND every library, instead of re-fetching the
-    same window once per (site, chunk)."""
+    same window once per (site, chunk).
+
+    Also fetches a 1bp-padded copy (motif_win_seq/motif_win_start) so
+    _site_motif_at_gpos can read the immediate flanking base on either
+    side of every position in the window, including the two positions
+    right at win_start/win_end-1 that "win_seq" alone has no flank for."""
     for site in sites:
+        chrom = site["chrom"]
         site["win_seq"] = ref_fasta.fetch(
-            site["chrom"], site["win_start"], site["win_end"]).upper()
+            chrom, site["win_start"], site["win_end"]).upper()
+        chrom_len = ref_fasta.get_reference_length(chrom)
+        pad_start = max(0, site["win_start"] - 1)
+        pad_end   = min(chrom_len, site["win_end"] + 1)
+        site["motif_win_seq"]   = ref_fasta.fetch(chrom, pad_start, pad_end).upper()
+        site["motif_win_start"] = pad_start
+
+
+def _site_motif_at_gpos(site: dict, gpos: int):
+    """
+    3nt motif (prevNt,'A',nextNt), read 5'->3' along the mRNA, at genomic
+    position gpos within site's (padded) window. Only meaningful when
+    gpos's transcript-sense ref base is 'A' (caller's responsibility --
+    same convention as computeMotifFreqs in calculateProtectionAcrossParquets.py).
+    Returns None if gpos falls outside the padded window or either flank
+    isn't a plain A/C/G/T base.
+    """
+    pad_seq   = site["motif_win_seq"]
+    pad_start = site["motif_win_start"]
+    idx = gpos - pad_start
+    if idx - 1 < 0 or idx + 1 >= len(pad_seq):
+        return None
+    prev_g, next_g = pad_seq[idx - 1], pad_seq[idx + 1]
+    if site["strand"] == "-":
+        # mRNA-sense 5' neighbor is the complement of the genomically-higher
+        # base, and the 3' neighbor is the complement of the genomically-lower
+        # base -- same convention as computeMotifFreqs' minus-strand branch.
+        prevNt, nextNt = complement_base(next_g), complement_base(prev_g)
+    else:
+        prevNt, nextNt = prev_g, next_g
+    if prevNt not in ACGT_BASES or nextNt not in ACGT_BASES:
+        return None
+    return prevNt + "A" + nextNt
 
 
 def _site_key(site: dict):
@@ -307,6 +346,8 @@ def _pos_data_to_records(site: dict, pos_data: dict, min_coverage: int) -> list:
         ag_denom = counts["A"] + counts["G"]
         ag_edit  = counts["G"] / ag_denom \
                    if counts["ref_base"] == "A" and ag_denom > 0 else np.nan
+        motif = _site_motif_at_gpos(site, counts["ref_pos"]) \
+                if counts["ref_base"] == "A" else None
         records.append({
             "site_id":      f"{site['chrom']}:{site['edit_pos']}",
             "transcript":   site["transcript"],
@@ -316,6 +357,7 @@ def _pos_data_to_records(site: dict, pos_data: dict, min_coverage: int) -> list:
             "codon":        site["codon"],
             "rel_pos":      rel_pos,
             "ref_base":     counts["ref_base"],
+            "motif":        motif,
             "in_his_codon": rel_pos in (-1, 0, 1),
             "A":            counts["A"],
             "G":            counts["G"],
@@ -422,6 +464,92 @@ def transcript_normalised_agg(df: pd.DataFrame, pseudo: float = 1e-3) -> pd.Data
                .agg(
                    mean_edit_frac=("tx_mean_edit_frac", "mean"),
                    sem_edit_frac =("tx_mean_edit_frac", lambda x: x.sem()),
+                   n_transcripts =("transcript", "nunique"),
+               )
+               .reset_index()
+    )
+    return agg
+
+
+def load_motif_baseline_csv(path: str) -> dict:
+    """
+    Load an editEfficiencyFromParquet.py *_context_editing.csv (columns:
+    label, context, n_edited, n_total, edit_rate) into
+    {label: {motif: edit_rate}}, keyed literally by that CSV's own label
+    column. editEfficiencyFromParquet.py joins its labels as
+    "sample_name_rep" (underscore) while this script's own libraryIDs are
+    "fileName-rep" (hyphen, see parse_libs_file) -- main() handles that
+    join-character mismatch at lookup time (see motif_baseline_for_label),
+    rather than this loader guessing at label variants.
+    """
+    df = pd.read_csv(path)
+    baseline = collections.defaultdict(dict)
+    for row in df.itertuples(index=False):
+        baseline[row.label][row.context] = float(row.edit_rate)
+    return dict(baseline)
+
+
+def motif_baseline_for_label(baseline_by_label: dict, label: str) -> dict:
+    """
+    Look up label (this script's own "fileName-rep" libraryID) against
+    baseline_by_label's keys, which come from editEfficiencyFromParquet.py
+    and use "fileName_rep" instead. Tries the exact label first, then
+    swaps only the LAST '-' for '_' (recovering the fileName/rep split
+    parse_libs_file itself created, since rep is always the final token
+    joined on) -- safer than a blanket str.replace, which would also
+    mangle any '-' that happens to be part of fileName itself.
+    """
+    if label in baseline_by_label:
+        return baseline_by_label[label]
+    if "-" in label:
+        fileName_part, rep_part = label.rsplit("-", 1)
+        alt_label = f"{fileName_part}_{rep_part}"
+        if alt_label in baseline_by_label:
+            return baseline_by_label[alt_label]
+    return {}
+
+
+def motif_normalized_agg(df: pd.DataFrame, motif_freqs: dict,
+                          pseudo: float = 1e-3) -> pd.DataFrame:
+    """
+    Same two-stage transcript-normalised aggregation as
+    transcript_normalised_agg, but on ag_edit_frac expressed relative to
+    this library's own 3nt-motif baseline editing rate (motif_freqs, loaded
+    from an editEfficiencyFromParquet.py *_context_editing.csv via
+    load_motif_baseline_csv) instead of the raw fraction -- same
+    motif-bias-correction idea as calculateProtectionAcrossParquets.py's
+    weightedEdit/weightedTot, just applied per meta-plot position instead
+    of pooled over UTR5/CDS/UTR3.
+
+    ratio ~1 means that position edits at exactly its own motif's
+    library-wide predicted rate; <1 means more protected than motif
+    composition alone would predict; >1 means less protected. This is
+    what isolates a "distance from His codon" effect from a confound
+    where different rel_pos across transcripts simply have different
+    flanking sequence (and thus different intrinsic editability).
+    """
+    ref_a = df[
+        df["ag_edit_frac"].notna() &
+        (df["ref_base"] == "A") &
+        (~df["in_his_codon"] | df["is_his_A"]) &
+        df["motif"].notna()
+    ].copy()
+    ref_a["motif_freq"] = ref_a["motif"].map(motif_freqs)
+    ref_a = ref_a[ref_a["motif_freq"].notna() & (ref_a["motif_freq"] > 0)]
+    ref_a["motif_norm_ratio"] = (ref_a["ag_edit_frac"] + pseudo) / (ref_a["motif_freq"] + pseudo)
+
+    tx_mean = (
+        ref_a.groupby(["transcript", "rel_pos"])["motif_norm_ratio"]
+             .mean()
+             .reset_index()
+             .rename(columns={"motif_norm_ratio": "tx_mean_ratio"})
+    )
+
+    agg = (
+        tx_mean.groupby(["rel_pos"])
+               .agg(
+                   mean_ratio    =("tx_mean_ratio", "mean"),
+                   sem_ratio     =("tx_mean_ratio", lambda x: x.sem()),
                    n_transcripts =("transcript", "nunique"),
                )
                .reset_index()
@@ -547,6 +675,80 @@ def plot_meta_all_libraries_pyx(rel_agg_by_lib: dict, window: int, output_prefix
     print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
 
 
+def plot_meta_all_libraries_motif_normalized_pyx(rel_agg_by_lib: dict, window: int,
+                                                  output_prefix: str,
+                                                  y_title="Edit / Motif Baseline",
+                                                  x_title="Relative Position",
+                                                  panel_w=10, panel_h=6):
+    """
+    Same layout as plot_meta_all_libraries_pyx, but for motif_normalized_agg's
+    output: a ratio of observed A->G editing to this library's own 3nt-motif
+    baseline rate, so the reference line that matters here is a horizontal
+    y=1 (ratio of 1 = edits exactly at the motif-predicted rate) rather than
+    y=0.
+    """
+    from pyx import canvas, graph, color, style, text as pyx_text
+
+    libIDs = sorted(rel_agg_by_lib)
+
+    y_max = 1.2
+    y_min = 0.0
+    for lib in libIDs:
+        rel_agg = rel_agg_by_lib[lib]
+        if rel_agg.empty:
+            continue
+        ratio = rel_agg["mean_ratio"].values
+        sem   = rel_agg["sem_ratio"].values
+        if len(ratio) > 0:
+            y_max = max(y_max, float(np.nanmax(ratio + sem)) * 1.15)
+            y_min = min(y_min, float(np.nanmin(ratio - sem)) * 0.9)
+
+    g = graph.graphxy(
+        width=panel_w, height=panel_h, xpos=0, ypos=0,
+        x=graph.axis.linear(min=-window, max=window, title=x_title),
+        y=graph.axis.linear(min=y_min, max=y_max, title=y_title),
+        key=graph.key.key(pos="tr", hinside=0),
+    )
+
+    g.plot(graph.data.function("x(y)=-1", min=y_min, max=y_max, title=None),
+           [graph.style.line([color.gray(0.8), style.linewidth.thin])])
+    g.plot(graph.data.function("x(y)=1", min=y_min, max=y_max, title=None),
+           [graph.style.line([color.gray(0.8), style.linewidth.thin])])
+    g.plot(graph.data.function("x(y)=0", min=y_min, max=y_max, title=None),
+           [graph.style.line([color.gray(0.5), style.linewidth.thick,
+                              style.linestyle.dashed])])
+    g.plot(graph.data.function("y(x)=1", min=-window, max=window, title=None),
+           [graph.style.line([color.gray(0.5), style.linewidth.thick,
+                              style.linestyle.dashed])])
+
+    for i, lib in enumerate(libIDs):
+        rel_agg = rel_agg_by_lib[lib]
+        if rel_agg.empty:
+            continue
+        pos   = rel_agg["rel_pos"].values
+        ratio = rel_agg["mean_ratio"].values
+        sem   = rel_agg["sem_ratio"].values
+        col   = _libcolor(lib, i)
+        n_tx  = int(rel_agg["n_transcripts"].max())
+
+        for pts in [list(zip(pos.tolist(), (ratio - sem).tolist())),
+                    list(zip(pos.tolist(), (ratio + sem).tolist()))]:
+            g.plot(graph.data.points(pts, x=1, y=2, title=None),
+                   [graph.style.line([col, style.linewidth.thin,
+                                      style.linestyle.dotted])])
+
+        title = r"%s (n=%d tx)" % (tex_escape(lib), n_tx)
+        g.plot(graph.data.points(list(zip(pos.tolist(), ratio.tolist())), x=1, y=2,
+                                 title=title),
+               [graph.style.line([col, style.linewidth.Thick])])
+
+    c = canvas.canvas()
+    c.insert(g)
+    plot_path = f"{output_prefix}_meta_all_libraries_motifNorm_pyx"
+    c.writePDFfile(plot_path)
+    print(f"  Saved -> {plot_path}.pdf", file=sys.stderr)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -571,6 +773,14 @@ def parse_args():
                         "Colors are looked up per library as 'name_rep'/"
                         "'name-rep' or bare 'name'; unmatched libraries fall "
                         "back to a built-in palette.")
+    p.add_argument("--motif_baseline_csv", default=None,
+                   help="A *_context_editing.csv produced by "
+                        "editEfficiencyFromParquet.py for these same "
+                        "libraries (columns: label, context, n_edited, "
+                        "n_total, edit_rate). Used as each library's own "
+                        "3nt-motif baseline editing rate for the second, "
+                        "motif-normalized meta plot. If omitted, that "
+                        "second plot is skipped.")
     return p.parse_args()
 
 
@@ -607,13 +817,26 @@ def main():
                   f"librar{'y' if len(unmatched)==1 else 'ies'} {unmatched}; "
                   f"falling back to the default palette.", file=sys.stderr)
 
+    motif_baseline_by_label = load_motif_baseline_csv(args.motif_baseline_csv) \
+                              if args.motif_baseline_csv else None
+    if args.motif_baseline_csv:
+        unmatched = [lib for lib, _ in libs
+                     if not motif_baseline_for_label(motif_baseline_by_label, lib)]
+        if unmatched:
+            print(f"  WARNING: no motif baseline found in "
+                  f"{args.motif_baseline_csv} for "
+                  f"librar{'y' if len(unmatched)==1 else 'ies'} {unmatched}; "
+                  f"the motif-normalized plot will skip {'it' if len(unmatched)==1 else 'them'}.",
+                  file=sys.stderr)
+
     print("\nParsing GTF and finding His codon sites...", file=sys.stderr)
     ref_fasta    = pysam.FastaFile(args.ref)
     cds_by_chrom = parse_gtf_cds(args.gtf)
     sites        = find_his_positions(ref_fasta, cds_by_chrom, args.window)
     _attach_win_seqs(ref_fasta, sites)
 
-    rel_agg_by_lib = {}
+    rel_agg_by_lib       = {}
+    rel_agg_motif_by_lib = {}
     for label, parquet_dir in libs:
         print(f"\nStreaming {parquet_dir} ({label})...", file=sys.stderr)
         result = process_library_streaming(parquet_dir, sites, args.min_coverage,
@@ -631,13 +854,27 @@ def main():
         rel_agg_by_lib[label] = transcript_normalised_agg(agg_df) \
                                 if not agg_df.empty else pd.DataFrame()
 
-    print("\nGenerating plot...", file=sys.stderr)
+        if motif_baseline_by_label is not None:
+            motif_freqs = motif_baseline_for_label(motif_baseline_by_label, label)
+            rel_agg_motif_by_lib[label] = motif_normalized_agg(agg_df, motif_freqs) \
+                                          if motif_freqs and not agg_df.empty \
+                                          else pd.DataFrame()
+
+    print("\nGenerating plots...", file=sys.stderr)
     try:
         plot_meta_all_libraries_pyx(rel_agg_by_lib, args.window, out)
     except Exception as e:
         print(f"  WARNING: pyx plotting failed: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
+
+    if motif_baseline_by_label is not None:
+        try:
+            plot_meta_all_libraries_motif_normalized_pyx(rel_agg_motif_by_lib, args.window, out)
+        except Exception as e:
+            print(f"  WARNING: motif-normalized pyx plotting failed: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
     ref_fasta.close()
     print("\nDone.", file=sys.stderr)
